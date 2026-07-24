@@ -1061,6 +1061,49 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   }
 
   /**
+   * Permanently delete a user. Resolves the DN from the identifier, then
+   * issues an LDAP delete bound as the operator (write-as-user). AD returns
+   * unwillingToPerform (53) when the account carries the "protect from
+   * accidental deletion" deny ACE — surfaced as permission_denied so the
+   * route can tell the operator to clear that flag in ADUC.
+   */
+  async deleteUser(
+    userId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return withFailover(this.clientConfig, async (client) => {
+      try {
+        await client.bind(ctx.actorUsername, ctx.actorPassword);
+      } catch {
+        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
+      }
+      try {
+        const target = await this.findUserEntry(client, userId);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
+        const before = normalizeUser(target);
+        await client.del(before.distinguishedName);
+        return {
+          ok: true,
+          before: {
+            distinguishedName: before.distinguishedName,
+            samAccountName: before.samAccountName,
+          },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'del failed';
+        const isAuthz = /unwilling|access denied|insufficient|no write|insuff/i.test(message);
+        return {
+          ok: false,
+          reason: isAuthz ? 'permission_denied' : 'directory_error',
+          errorMessage: message,
+        };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  /**
    * Create an organizationalUnit directly under `parentDn`. Same write-as-
    * user pattern as the other writes — the operator's bind owns the new
    * object's ACL trail. Returns the resulting OU so the cache can be

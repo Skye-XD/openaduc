@@ -373,6 +373,10 @@ export const api = {
         body: JSON.stringify(body),
       });
     },
+    // Permanently delete a user. Admin-only + step-up server-side.
+    remove(id: string): Promise<{ ok: boolean }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    },
     search(query: Partial<UserSearchQuery> = {}): Promise<UserSearchResponse> {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) {

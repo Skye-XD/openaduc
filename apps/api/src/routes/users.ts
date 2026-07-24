@@ -901,6 +901,66 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
+  // ---- DELETE /api/users/:id (permanently delete the account) ----------
+  // Admin-only (write:user.delete) + step-up. Soft-deletes the cache row on
+  // success so the account drops out of the UI immediately.
+  app.delete('/api/users/:id', {
+    preHandler: [app.requireCapability('write:user.delete'), app.requireStepUp],
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
+      if (!beforeRefresh) throw NotFound('user not found');
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.delete',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetId: beforeRefresh.user.objectGuid,
+          targetDn: beforeRefresh.user.distinguishedName,
+          metadata: { samAccountName: beforeRefresh.user.samAccountName },
+        },
+        async () => {
+          const r = await provider.deleteUser({ kind: 'objectGuid', value: id }, ctx(actor, req));
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden(
+            'directory rejected the delete (insufficient rights, or the account is protected from accidental deletion)',
+          );
+        }
+        if (result.errorCode === 'not_found') throw NotFound('user not found');
+        throw app.httpErrors.badGateway(`delete failed: ${result.errorCode ?? 'unknown'}`);
+      }
+
+      // Soft-delete the cache row so the account disappears from search / the
+      // OU browser at once (the full sync's prune is the backstop).
+      await app.db
+        .updateTable('user_cache_records')
+        .set({ deleted_at: new Date().toISOString() })
+        .where('provider_id', '=', provider.id)
+        .where('object_guid', '=', id)
+        .execute();
+
+      return { ok: true };
+    },
+  });
+
   // ---- POST /api/users/:id/unlock --------------------------------------
   app.post('/api/users/:id/unlock', {
     preHandler: [app.requireCapability('write:user.unlock'), app.requireStepUp],

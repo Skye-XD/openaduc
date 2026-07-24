@@ -21,6 +21,7 @@ import type { OuContentsResponse } from '@openaduc/shared';
 const store = useOldSchool();
 const auth = useAuthStore();
 const toast = useToast();
+const canDeleteUser = computed(() => auth.hasCapability('write:user.delete'));
 
 function showToastSuccess(summary: string): void {
   toast.add({ severity: 'success', summary, life: 2500 });
@@ -265,10 +266,32 @@ function userItems(r: Row): CtxItem[] {
         store.openDialog({ kind: 'move', objectKind: 'user', id: r.id, label: r.name }),
     },
     { kind: 'separator' },
-    {
-      label: 'Delete',
-      disabled: true,
-    },
+    canDeleteUser.value
+      ? {
+          label: 'Delete',
+          onSelect: () =>
+            auth.requireEdit(
+              () =>
+                store.openDialog({
+                  kind: 'confirm',
+                  title: 'Delete user',
+                  message: `Permanently delete ${r.name}? This removes the account from Active Directory and cannot be undone.`,
+                  okLabel: 'Delete',
+                  destructive: true,
+                  onOk: async () => {
+                    try {
+                      await api.users.remove(r.id);
+                      showToastSuccess(`${r.name} deleted.`);
+                      store.bumpData();
+                    } catch (err) {
+                      showToastError(err);
+                    }
+                  },
+                }),
+              'Deleting a user account requires step-up authentication.',
+            ),
+        }
+      : { label: 'Delete', disabled: true },
     {
       label: 'Rename',
       disabled: true,

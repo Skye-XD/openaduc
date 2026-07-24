@@ -444,6 +444,10 @@ export interface DirectoryProvider {
     input: UserCreateInput,
     ctx: WriteContext,
   ): Promise<MutationResult & { user?: DirectoryUser }>;
+  // Permanently delete a user (LDAP delete of the account entry). AD refuses
+  // if the object is protected from accidental deletion (a deny ACE) —
+  // surfaced as permission_denied so the route can explain it.
+  deleteUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
   // Create a new OU as a direct child of `parentDn`. Returns the resulting
   // DirectoryOu so the route can update its cache row in place rather than
   // waiting for the next sync.

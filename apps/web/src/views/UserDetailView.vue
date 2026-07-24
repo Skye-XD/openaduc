@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { onBeforeRouteLeave } from 'vue-router';
+import { onBeforeRouteLeave, useRouter } from 'vue-router';
 import Button from 'primevue/button';
 import Password from 'primevue/password';
 import Dialog from 'primevue/dialog';
@@ -292,6 +292,7 @@ function arrayFieldsForSection(s: SectionKey): ArrayField[] {
 const props = defineProps<{ id: string }>();
 const auth = useAuthStore();
 const toast = useToast();
+const router = useRouter();
 
 const user = ref<UserDetail | null>(null);
 const loading = ref(false);
@@ -318,6 +319,7 @@ const canEnableDisable = computed(() => auth.hasCapability('write:user.enableDis
 const canResetPassword = computed(() => auth.hasCapability('write:user.resetPassword'));
 const canManageGroups = computed(() => auth.hasCapability('write:group.membership'));
 const canMove = computed(() => auth.hasCapability('write:user.move'));
+const canDeleteUser = computed(() => auth.hasCapability('write:user.delete'));
 // Raw LDAP tab is admin-only — gated by view:raw_attributes (admin role
 // gets all caps, operator/auditor explicitly do not).
 const canViewRaw = computed(() => auth.hasCapability('view:raw_attributes'));
@@ -881,6 +883,46 @@ async function confirmRemoveGroup(): Promise<void> {
   }
 }
 
+// ---- Delete user ---------------------------------------------------------
+
+const deleteConfirmOpen = ref(false);
+const deleting = ref(false);
+
+function openDeleteDialog(): void {
+  deleteConfirmOpen.value = true;
+}
+
+async function confirmDelete(): Promise<void> {
+  if (!user.value || deleting.value) return;
+  deleting.value = true;
+  try {
+    const label = user.value.displayName || user.value.samAccountName;
+    await api.users.remove(user.value.id);
+    toast.add({
+      severity: 'success',
+      summary: 'User deleted',
+      detail: `${label} was removed from Active Directory.`,
+      life: 5000,
+    });
+    deleteConfirmOpen.value = false;
+    // The account is gone — leave the (now-stale) detail page for the list.
+    router.push('/users');
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = confirmDelete;
+      return;
+    }
+    toast.add({
+      severity: 'error',
+      summary: 'Delete failed',
+      detail: err instanceof ApiError ? err.message : String(err),
+      life: 6000,
+    });
+  } finally {
+    deleting.value = false;
+  }
+}
+
 const addGroupOpen = ref(false);
 const groupSearchQuery = ref('');
 const groupSearchResults = ref<GroupSummary[]>([]);
@@ -1077,6 +1119,15 @@ const actionItems = computed<MenuItem[]>(() => {
       icon: 'pi pi-folder-open',
       disabled: busy,
       command: () => auth.requireEdit(openMoveDialog),
+    });
+  }
+  if (canDeleteUser.value) {
+    items.push({
+      label: 'Delete account…',
+      icon: 'pi pi-trash',
+      class: 'menu-item-danger',
+      disabled: busy,
+      command: () => auth.requireEdit(openDeleteDialog),
     });
   }
   return items;
@@ -2248,6 +2299,19 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
       @update:visible="(v) => !v && cancelRemoveGroup()"
       @cancel="cancelRemoveGroup"
       @confirm="confirmRemoveGroup"
+    />
+
+    <ConfirmDialog
+      :visible="deleteConfirmOpen"
+      title="Delete this user?"
+      :message="`Permanently delete ${user?.displayName || user?.samAccountName || 'this user'} from Active Directory?`"
+      detail="This removes the account from AD and is recorded in the audit log. It cannot be undone from here."
+      confirm-label="Delete"
+      severity="danger"
+      :busy="deleting"
+      @update:visible="(v) => !v && (deleteConfirmOpen = false)"
+      @cancel="deleteConfirmOpen = false"
+      @confirm="confirmDelete"
     />
 
     <SignInEventDetailDialog

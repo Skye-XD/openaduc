@@ -15,6 +15,7 @@ export const CAPABILITIES = [
   'write:user.move',
   'write:user.restore',
   'write:user.create',
+  'write:user.delete',
   'write:group.membership',
   'write:ou.create',
   'write:ou.update',
