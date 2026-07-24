@@ -4,6 +4,7 @@ import { sql } from 'kysely';
 import {
   groupMembershipChangeSchema,
   resetPasswordRequestSchema,
+  userCreateRequestSchema,
   userDetailSchema,
   userMoveRequestSchema,
   userSearchQuerySchema,
@@ -796,6 +797,106 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         ok: true,
         before: result.before,
         after: result.after,
+      };
+    },
+  });
+
+  // ---- POST /api/users (provision a new, disabled account) -------------
+  // Creates the account DISABLED with no password (a single LDAP add). The
+  // operator sets a password and enables it afterwards via the reset-password
+  // and enable routes. Admin-only (write:user.create) + step-up.
+  app.post('/api/users', {
+    preHandler: [app.requireCapability('write:user.create'), app.requireStepUp],
+    handler: async (req) => {
+      const body = userCreateRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      // The target OU must exist in our cache for this provider. AD would
+      // reject an unknown parent too, but this yields a clean 400.
+      const parent = await app.db
+        .selectFrom('directory_ous')
+        .where('provider_id', '=', provider.id)
+        .where('deleted_at', 'is', null)
+        .where(sql<string>`lower(distinguished_name)`, '=', body.parentDn.toLowerCase())
+        .select(['distinguished_name'])
+        .executeTakeFirst();
+      if (!parent) {
+        throw app.httpErrors.badRequest('target OU not found in directory cache');
+      }
+
+      const displayName =
+        body.displayName?.trim() ||
+        [body.givenName?.trim(), body.surname?.trim()].filter(Boolean).join(' ').trim() ||
+        body.samAccountName;
+      // For the audit trail only — the provider computes and escapes the
+      // real RDN. Unescaped here is fine; it's metadata, not a wire DN.
+      const candidateDn = `CN=${displayName},${parent.distinguished_name}`;
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.create',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetDn: candidateDn,
+          metadata: {
+            samAccountName: body.samAccountName,
+            parentDn: parent.distinguished_name,
+            ...(body.userPrincipalName ? { userPrincipalName: body.userPrincipalName } : {}),
+          },
+        },
+        async () => {
+          const r = await provider.createUser(
+            {
+              parentDn: parent.distinguished_name,
+              samAccountName: body.samAccountName,
+              userPrincipalName: body.userPrincipalName,
+              givenName: body.givenName,
+              surname: body.surname,
+              displayName: body.displayName,
+              email: body.email,
+            },
+            ctx(actor, req),
+          );
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+            user: r.user ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden('directory rejected the create (insufficient rights)');
+        }
+        if (result.errorCode === 'policy_violation') {
+          throw app.httpErrors.conflict('a user with that name already exists at that location');
+        }
+        throw app.httpErrors.badGateway(`create failed: ${result.errorCode ?? 'unknown'}`);
+      }
+
+      const user = result.user;
+      if (!user) {
+        throw app.httpErrors.badGateway('provider returned no user after create');
+      }
+
+      // Seed the cache so search / the OU browser show the account
+      // immediately rather than waiting for the next sync. Best-effort —
+      // the scheduled sync is the backstop.
+      await app.services.userLiveRefresh.refresh(provider, user.objectGuid).catch(() => undefined);
+
+      return {
+        ok: true,
+        id: user.objectGuid,
+        distinguishedName: user.distinguishedName,
+        samAccountName: user.samAccountName ?? body.samAccountName,
       };
     },
   });

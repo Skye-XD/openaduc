@@ -28,6 +28,7 @@ import type {
   RestoreUserInput,
   SyncInput,
   UserAttributePatch,
+  UserCreateInput,
   WriteContext,
 } from '../types.js';
 import { StepUpBindFailedError } from '../types.js';
@@ -954,6 +955,103 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         return {
           ok: false,
           reason: isAuthz ? 'permission_denied' : 'directory_error',
+          errorMessage: message,
+        };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * Provision a new user as a direct child of `input.parentDn`. Same
+   * write-as-operator model as the other writes — the operator's bind owns
+   * the new object's ACL trail.
+   *
+   * The account is created DISABLED with no password via a single LDAP
+   * `add` (userAccountControl = NORMAL_ACCOUNT | ACCOUNTDISABLE |
+   * PASSWD_NOTREQD = 546) — the same state ADUC's "New User" wizard leaves
+   * an account in before its password page. The operator sets a password
+   * and enables the account afterwards via resetPassword + enableUser. The
+   * CN (RDN) is derived from displayName → "given surname" → samAccountName
+   * and RFC-escaped.
+   *
+   * Returns the created DirectoryUser (read back after the add) so the
+   * route can seed the cache without waiting for the next sync.
+   */
+  async createUser(
+    input: UserCreateInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult & { user?: DirectoryUser }> {
+    const sam = input.samAccountName.trim();
+    if (!sam) {
+      return { ok: false, reason: 'directory_error', errorMessage: 'empty sAMAccountName' };
+    }
+    const cleanParent = input.parentDn.trim();
+    if (!cleanParent) {
+      return { ok: false, reason: 'directory_error', errorMessage: 'empty parent DN' };
+    }
+    const given = input.givenName?.trim() || undefined;
+    const surname = input.surname?.trim() || undefined;
+    const displayName =
+      input.displayName?.trim() || [given, surname].filter(Boolean).join(' ').trim() || sam;
+    const cn = displayName;
+    const upn = input.userPrincipalName?.trim() || undefined;
+    const mail = input.email?.trim() || undefined;
+    const newDn = `CN=${escapeRdnValue(cn)},${cleanParent}`;
+
+    // 546 = NORMAL_ACCOUNT (0x200) | ACCOUNTDISABLE (0x2) | PASSWD_NOTREQD
+    // (0x20). Disabled + no-password-required so the bare add succeeds even
+    // under a strict domain password policy; the operator enables it after
+    // setting a password.
+    const uac = UAC.NORMAL_ACCOUNT | UAC.ACCOUNTDISABLE | UAC.PASSWD_NOTREQD;
+
+    return withFailover(this.clientConfig, async (client) => {
+      try {
+        await client.bind(ctx.actorUsername, ctx.actorPassword);
+      } catch {
+        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
+      }
+      try {
+        const attrs: Record<string, string | string[]> = {
+          objectClass: ['top', 'person', 'organizationalPerson', 'user'],
+          cn,
+          sAMAccountName: sam,
+          userAccountControl: String(uac),
+        };
+        if (upn) attrs.userPrincipalName = upn;
+        if (given) attrs.givenName = given;
+        if (surname) attrs.sn = surname;
+        if (displayName) attrs.displayName = displayName;
+        if (mail) attrs.mail = mail;
+
+        await client.add(newDn, attrs);
+
+        // Read the created entry back so we return a real objectGuid + the
+        // DN AD actually assigned.
+        const entry = await this.findUserEntry(client, { kind: 'samAccountName', value: sam });
+        const user = entry ? normalizeUser(entry) : undefined;
+        return {
+          ok: true,
+          after: {
+            distinguishedName: user?.distinguishedName ?? newDn,
+            samAccountName: sam,
+            enabled: false,
+          },
+          // Only present when the read-back succeeded — under
+          // exactOptionalPropertyTypes we can't assign an explicit
+          // `undefined` to the optional `user` field.
+          ...(user ? { user } : {}),
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'add failed';
+        // 68 = entryAlreadyExists (DN collision). insuff/access = the
+        // operator's bind lacks create rights on the target OU.
+        const isExists = /already exists|entryAlreadyExists/i.test(message);
+        const isAuthz = /no write|insuff|access/i.test(message);
+        return {
+          ok: false,
+          reason: isExists ? 'policy_violation' : isAuthz ? 'permission_denied' : 'directory_error',
           errorMessage: message,
         };
       } finally {

@@ -34,6 +34,8 @@ import type {
   SignInEventDetail,
   SignInEventsResponse,
   StepUpRequest,
+  UserCreateRequest,
+  UserCreateResponse,
   UserDetail,
   UserMoveRequest,
   UserSearchQuery,
@@ -363,6 +365,14 @@ export const api = {
     },
   },
   users: {
+    // Provision a new (disabled, password-less) account. Admin-only +
+    // step-up server-side.
+    create(body: UserCreateRequest): Promise<UserCreateResponse> {
+      return apiFetch('/users', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
     search(query: Partial<UserSearchQuery> = {}): Promise<UserSearchResponse> {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) {

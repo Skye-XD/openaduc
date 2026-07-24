@@ -31,10 +31,24 @@ import AddToGroupDialog from './dialogs/AddToGroupDialog.vue';
 import ConfirmDialog from './dialogs/ConfirmDialog.vue';
 import AboutDialog from './dialogs/AboutDialog.vue';
 import FindDialog from './dialogs/FindDialog.vue';
+import NewUserDialog from './dialogs/NewUserDialog.vue';
+import { useAuthStore } from '../stores/auth.js';
 
 const theme = useThemeStore();
 const store = useOldSchool();
+const auth = useAuthStore();
 const router = useRouter();
+
+// "New User" is admin-only (write:user.create). The account is created into
+// the currently-selected OU; other container kinds (domain root, the built-in
+// CN=Users container) aren't in the OU cache the server validates against, so
+// we only enable creation when an OU is selected.
+const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
+function openNewUser(): void {
+  const node = store.selectedNode;
+  const parentDn = node.kind === 'ou' ? node.dn : null;
+  store.openDialog({ kind: 'new-user', parentDn, parentLabel: node.label });
+}
 
 // --- Menu state -------------------------------------------------------
 type MenuId = 'file' | 'action' | 'view' | 'help' | null;
@@ -299,7 +313,13 @@ function exitOldSchool(): void {
         >
           <WinIcon name="find" :size="14" />
         </button>
-        <button class="os-tool-btn" type="button" title="New User" disabled>
+        <button
+          class="os-tool-btn"
+          type="button"
+          title="New User"
+          :disabled="!canCreateUser"
+          @click="openNewUser"
+        >
           <WinIcon name="newuser" :size="14" />
         </button>
         <button class="os-tool-btn" type="button" title="New Group" disabled>
@@ -390,6 +410,13 @@ function exitOldSchool(): void {
       <AboutDialog
         v-else-if="w.dialog.kind === 'about'"
         :window-id="w.id"
+        @close="store.closeWindow(w.id)"
+      />
+      <NewUserDialog
+        v-else-if="w.dialog.kind === 'new-user'"
+        :window-id="w.id"
+        :parent-dn="w.dialog.parentDn"
+        :parent-label="w.dialog.parentLabel"
         @close="store.closeWindow(w.id)"
       />
     </template>

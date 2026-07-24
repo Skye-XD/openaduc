@@ -267,6 +267,60 @@ export const groupMembershipChangeSchema = z.object({
 });
 export type GroupMembershipChangeRequest = z.infer<typeof groupMembershipChangeSchema>;
 
+// ---- Create user --------------------------------------------------------
+//
+// Provisions a brand-new AD account. Per the deployment's chosen policy the
+// account is created DISABLED with no password (a single LDAP `add`); the
+// operator sets a password and enables it afterwards via the existing
+// reset-password / enable actions. So there is no password field here.
+//
+// sAMAccountName is the hard constraint: AD caps it at 20 chars and rejects a
+// set of reserved characters (" [ ] : ; | = + * ? < > / \ , and whitespace).
+// The other fields are free-form; the CN (RDN) is derived server-side from
+// displayName → "given surname" → sAMAccountName and LDAP-escaped there.
+const samAccountNameSchema = z
+  .string()
+  .trim()
+  .min(1, 'logon name is required')
+  .max(20, 'logon name must be 20 characters or fewer')
+  .regex(/^[^\s"[\]:;|=+*?<>/\\,]+$/, 'logon name contains a reserved character');
+
+export const userCreateRequestSchema = z.object({
+  // Target OU DN. The server validates it against the cached directory_ous
+  // table for the active provider before issuing the add.
+  parentDn: z.string().min(1).max(1024),
+  samAccountName: samAccountNameSchema,
+  // UPN is optional but recommended; when present it must look like a@b.
+  userPrincipalName: z
+    .string()
+    .trim()
+    .max(256)
+    .regex(/^[^@\s]+@[^@\s]+$/, 'UPN must be in the form user@domain')
+    .optional()
+    .or(z.literal('').transform(() => undefined)),
+  givenName: z.string().trim().max(64).optional(),
+  surname: z.string().trim().max(64).optional(),
+  displayName: z.string().trim().max(256).optional(),
+  email: z
+    .string()
+    .trim()
+    .email()
+    .max(256)
+    .optional()
+    .or(z.literal('').transform(() => undefined)),
+});
+export type UserCreateRequest = z.infer<typeof userCreateRequestSchema>;
+
+export const userCreateResponseSchema = z.object({
+  ok: z.boolean(),
+  // objectGUID of the freshly created account, so the client can navigate
+  // straight to its detail page (to set a password / enable it).
+  id: z.string(),
+  distinguishedName: z.string(),
+  samAccountName: z.string(),
+});
+export type UserCreateResponse = z.infer<typeof userCreateResponseSchema>;
+
 // User attribute patch — keys match the camelCase fields on UserDetail.
 // Each field is optional; null clears the attribute; a non-empty string
 // replaces it. The route validates max length per field.

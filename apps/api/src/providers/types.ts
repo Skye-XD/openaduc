@@ -320,6 +320,20 @@ export interface ResetPasswordInput {
   forceChangeAtNextLogin: boolean;
 }
 
+// Input for provisioning a new account. The account is created disabled with
+// no password (a single LDAP `add`); password + enable happen afterwards via
+// resetPassword/enableUser. The CN (RDN) is derived by the implementation
+// from displayName → "givenName surname" → samAccountName.
+export interface UserCreateInput {
+  parentDn: string;
+  samAccountName: string;
+  userPrincipalName?: string | undefined;
+  givenName?: string | undefined;
+  surname?: string | undefined;
+  displayName?: string | undefined;
+  email?: string | undefined;
+}
+
 export interface SyncInput {
   pageSize?: number;
   modifiedSince?: Date;
@@ -422,6 +436,14 @@ export interface DirectoryProvider {
     targetOuDn: string,
     ctx: WriteContext,
   ): Promise<MutationResult>;
+  // Create a new (disabled, password-less) user under `input.parentDn`.
+  // Same write-as-operator model as the other writes. Returns the resulting
+  // DirectoryUser so the route can seed its cache row without waiting for
+  // the next sync.
+  createUser(
+    input: UserCreateInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult & { user?: DirectoryUser }>;
   // Create a new OU as a direct child of `parentDn`. Returns the resulting
   // DirectoryOu so the route can update its cache row in place rather than
   // waiting for the next sync.

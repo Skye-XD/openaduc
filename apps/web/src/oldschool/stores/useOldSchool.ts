@@ -35,7 +35,11 @@ export type DialogSpec =
       onOk: () => void | Promise<void>;
     }
   | { kind: 'about' }
-  | { kind: 'find' };
+  | { kind: 'find' }
+  // New-user wizard. `parentDn` is the OU the account will be created in
+  // (the currently-selected container, or null when none is selected —
+  // the dialog then asks the operator to pick one from the tree first).
+  | { kind: 'new-user'; parentDn: string | null; parentLabel: string };
 
 /** Backwards-compatible alias for the original union name. */
 export type OpenDialog = DialogSpec | null;
@@ -81,6 +85,8 @@ function defaultSizeFor(kind: DialogSpec['kind']): { width: number; height: numb
       return { width: 420, height: 220 };
     case 'about':
       return { width: 460, height: 260 };
+    case 'new-user':
+      return { width: 520, height: 560 };
   }
 }
 
