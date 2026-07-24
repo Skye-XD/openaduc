@@ -27,6 +27,7 @@ const toast = useToast();
 const canCreateOu = computed(() => auth.hasCapability('write:ou.create'));
 const canUpdateOu = computed(() => auth.hasCapability('write:ou.update'));
 const canDeleteOu = computed(() => auth.hasCapability('write:ou.delete'));
+const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
 
 // ---- OU tree -------------------------------------------------------------
 
@@ -236,6 +237,14 @@ const ctxItems = computed<MenuItem[]>(() => {
       tooltip: 'Create a new organizational unit under this one.',
     });
   }
+  if (canCreateUser.value) {
+    items.push({
+      label: 'New user here',
+      icon: 'pi pi-user-plus',
+      command: () => auth.requireEdit(() => openCreateUserDialog(ou)),
+      tooltip: 'Create a new (disabled) user account in this OU.',
+    });
+  }
   if (canDeleteOu.value) {
     const counts = ctxCounts.value;
     const childTip = counts
@@ -276,7 +285,8 @@ const ctxItems = computed<MenuItem[]>(() => {
 });
 
 async function onTreeNodeContext(event: MouseEvent, node: TreeNode): Promise<void> {
-  if (!canCreateOu.value && !canUpdateOu.value && !canDeleteOu.value) return;
+  if (!canCreateOu.value && !canUpdateOu.value && !canDeleteOu.value && !canCreateUser.value)
+    return;
   event.preventDefault();
   event.stopPropagation();
   const dn = node.data?.dn as string | undefined;
@@ -369,6 +379,109 @@ async function onCreateSubmit(): Promise<void> {
     createError.value = err instanceof ApiError ? err.message : 'create failed';
   } finally {
     createSubmitting.value = false;
+  }
+}
+
+// ---- Create user dialog --------------------------------------------------
+//
+// Creates the account DISABLED with no password (server policy) into the
+// selected OU; the operator sets a password + enables it afterwards from the
+// user's page. Same step-up handling as the OU dialogs.
+
+const createUserDialogOpen = ref(false);
+const createUserParent = ref<DirectoryOu | null>(null);
+const createUserDraft = ref({
+  givenName: '',
+  surname: '',
+  displayName: '',
+  samAccountName: '',
+  userPrincipalName: '',
+  email: '',
+});
+const createUserSubmitting = ref(false);
+const createUserError = ref<string | null>(null);
+
+// Mirror the server-side sAMAccountName rule: 1..20 chars, none of the AD
+// reserved characters or whitespace.
+const SAM_RE = /^[^\s"[\]:;|=+*?<>/\\,]+$/;
+
+function openCreateUserDialog(parent: DirectoryOu): void {
+  createUserParent.value = parent;
+  createUserDraft.value = {
+    givenName: '',
+    surname: '',
+    displayName: '',
+    samAccountName: '',
+    userPrincipalName: '',
+    email: '',
+  };
+  createUserError.value = null;
+  createUserDialogOpen.value = true;
+}
+
+// Header button ("New user" on the right pane) — opens the dialog for the
+// currently-selected OU, gating on step-up first like the context-menu items.
+function openNewUserFromHeader(): void {
+  const ou = selectedOu.value;
+  if (ou) auth.requireEdit(() => openCreateUserDialog(ou));
+}
+
+const createUserSamValid = computed(() => {
+  const s = createUserDraft.value.samAccountName.trim();
+  return s.length >= 1 && s.length <= 20 && SAM_RE.test(s);
+});
+
+const createUserPreviewDn = computed(() => {
+  const parent = createUserParent.value;
+  if (!parent) return '';
+  const d = createUserDraft.value;
+  const cn =
+    d.displayName.trim() ||
+    [d.givenName.trim(), d.surname.trim()].filter(Boolean).join(' ').trim() ||
+    d.samAccountName.trim();
+  if (!cn) return '';
+  return `CN=${cn},${parent.distinguishedName}`;
+});
+
+async function onCreateUserSubmit(): Promise<void> {
+  if (!createUserParent.value) return;
+  if (!createUserSamValid.value) {
+    createUserError.value =
+      createUserDraft.value.samAccountName.trim().length > 20
+        ? 'Logon name must be 20 characters or fewer.'
+        : 'Logon name is required and cannot contain spaces or any of " [ ] : ; | = + * ? < > / \\ ,';
+    return;
+  }
+  createUserError.value = null;
+  createUserSubmitting.value = true;
+  try {
+    const d = createUserDraft.value;
+    const res = await api.users.create({
+      parentDn: createUserParent.value.distinguishedName,
+      samAccountName: d.samAccountName.trim(),
+      userPrincipalName: d.userPrincipalName.trim() || undefined,
+      givenName: d.givenName.trim() || undefined,
+      surname: d.surname.trim() || undefined,
+      displayName: d.displayName.trim() || undefined,
+      email: d.email.trim() || undefined,
+    });
+    toast.add({
+      severity: 'success',
+      summary: 'User created',
+      detail: `${res.samAccountName} created (disabled). Set a password and enable it to activate.`,
+      life: 6000,
+    });
+    createUserDialogOpen.value = false;
+    // Refresh the OU contents so the new (disabled) account shows up.
+    if (selectedDn.value) await loadContents(selectedDn.value);
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = onCreateUserSubmit;
+      return;
+    }
+    createUserError.value = err instanceof ApiError ? err.message : 'create failed';
+  } finally {
+    createUserSubmitting.value = false;
   }
 }
 
@@ -552,6 +665,19 @@ async function onDeleteSubmit(): Promise<void> {
             <h3 class="pane-h">{{ selectedOu?.name ?? 'Select an OU' }}</h3>
           </div>
           <code v-if="selectedOu" class="dn-line">{{ selectedOu.distinguishedName }}</code>
+        </template>
+        <!-- Pinned to the right of the card head via the Card's actions slot,
+             so it stays put regardless of the OU name / DN length. -->
+        <template #actions>
+          <Button
+            v-if="selectedOu && canCreateUser"
+            label="New user"
+            icon="pi pi-user-plus"
+            size="small"
+            severity="secondary"
+            outlined
+            @click="openNewUserFromHeader"
+          />
         </template>
         <div class="pane-body">
           <EmptyState
@@ -1050,6 +1176,91 @@ async function onDeleteSubmit(): Promise<void> {
           severity="danger"
           :loading="deleteSubmitting"
           @click="onDeleteSubmit"
+        />
+      </template>
+    </Dialog>
+
+    <!-- New user dialog. The account is created disabled with no password;
+         the operator sets a password + enables it from the user's page. -->
+    <Dialog
+      :visible="createUserDialogOpen"
+      modal
+      header="New user"
+      :style="{ width: '34rem' }"
+      :closable="!createUserSubmitting"
+      @update:visible="(v) => !v && (createUserDialogOpen = false)"
+    >
+      <p class="dialog-prose primary">
+        Create a new account in <strong>{{ createUserParent?.name }}</strong
+        >.
+      </p>
+      <p class="dialog-prose secondary">
+        The account is created <strong>disabled with no password</strong>. Set a password and enable
+        it afterwards from the user’s page.
+      </p>
+      <div class="create-form">
+        <div class="form-row">
+          <label class="fld-label">First name</label>
+          <InputText v-model="createUserDraft.givenName" fluid :disabled="createUserSubmitting" />
+        </div>
+        <div class="form-row">
+          <label class="fld-label">Last name</label>
+          <InputText v-model="createUserDraft.surname" fluid :disabled="createUserSubmitting" />
+        </div>
+        <div class="form-row">
+          <label class="fld-label">Display name (optional)</label>
+          <InputText
+            v-model="createUserDraft.displayName"
+            placeholder="defaults to First Last"
+            fluid
+            :disabled="createUserSubmitting"
+          />
+        </div>
+        <div class="form-row">
+          <label class="fld-label">User logon name (sAMAccountName)</label>
+          <InputText
+            v-model="createUserDraft.samAccountName"
+            autofocus
+            fluid
+            :disabled="createUserSubmitting"
+            @keyup.enter="onCreateUserSubmit"
+          />
+        </div>
+        <div class="form-row">
+          <label class="fld-label">User principal name (optional)</label>
+          <InputText
+            v-model="createUserDraft.userPrincipalName"
+            placeholder="user@domain"
+            fluid
+            :disabled="createUserSubmitting"
+          />
+        </div>
+        <div class="form-row">
+          <label class="fld-label">Email (optional)</label>
+          <InputText v-model="createUserDraft.email" fluid :disabled="createUserSubmitting" />
+        </div>
+        <div v-if="createUserPreviewDn" class="preview-row">
+          <span class="muted">DN:</span>
+          <code class="dn-line">{{ createUserPreviewDn }}</code>
+        </div>
+        <Message v-if="createUserError" severity="error" :closable="false">{{
+          createUserError
+        }}</Message>
+      </div>
+      <template #footer>
+        <Button
+          label="Cancel"
+          text
+          severity="secondary"
+          :disabled="createUserSubmitting"
+          @click="createUserDialogOpen = false"
+        />
+        <Button
+          label="Create user"
+          icon="pi pi-user-plus"
+          :loading="createUserSubmitting"
+          :disabled="!createUserSamValid"
+          @click="onCreateUserSubmit"
         />
       </template>
     </Dialog>
