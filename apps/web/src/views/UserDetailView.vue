@@ -892,6 +892,15 @@ function openDeleteDialog(): void {
   deleteConfirmOpen.value = true;
 }
 
+// Enter edit mode from the actions menu — a discoverable alternative to the
+// global edit-mode FAB. Lands on the Organization tab (where the editable
+// attribute grid lives) and elevates via requireEdit; that flips editMode on,
+// turning the fields into inputs and revealing the Save bar.
+function startEditDetails(): void {
+  activeTab.value = 'organization';
+  auth.requireEdit(() => {});
+}
+
 async function confirmDelete(): Promise<void> {
   if (!user.value || deleting.value) return;
   deleting.value = true;
@@ -1078,6 +1087,14 @@ const actionItems = computed<MenuItem[]>(() => {
   // action after they authenticate. The only disable case is "an action of
   // this kind is already running" so the operator can't double-fire.
   const busy = actionRunning.value !== null;
+
+  if (canEdit.value) {
+    items.push({
+      label: 'Edit details…',
+      icon: 'pi pi-pencil',
+      command: startEditDetails,
+    });
+  }
 
   if (canUnlock.value && u.locked) {
     items.push({
