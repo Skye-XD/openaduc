@@ -53,3 +53,6 @@ docs/superpowers/
 *.claude
 *.vscode
 
+
+# operational backups (never commit — may contain secrets)
+*.bak-*
