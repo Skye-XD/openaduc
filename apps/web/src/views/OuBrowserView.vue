@@ -4,6 +4,7 @@ import { computed, onMounted, ref, watch } from 'vue';
 import { RouterLink } from 'vue-router';
 import Tree from 'primevue/tree';
 import Button from 'primevue/button';
+import Checkbox from 'primevue/checkbox';
 import ContextMenu from 'primevue/contextmenu';
 import Dialog from 'primevue/dialog';
 import InputText from 'primevue/inputtext';
@@ -17,6 +18,7 @@ import Card from '../design/primitives/Card.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import PageHeader from '../design/primitives/PageHeader.vue';
 import SyncButton from '../design/primitives/SyncButton.vue';
+import UserBulkBar from '../design/primitives/UserBulkBar.vue';
 import { api } from '../api/index.js';
 import { ApiError } from '../api/client.js';
 import { useAuthStore } from '../stores/auth.js';
@@ -192,9 +194,47 @@ async function loadContents(dn: string): Promise<void> {
 }
 
 watch(selectedDn, (dn) => {
+  // Switching OUs drops any user selection carried over from the previous one.
+  ouUserSelectedIds.value = new Set();
   if (dn) loadContents(dn);
   else contents.value = { ...emptyContents };
 });
+
+// ---- Bulk user selection (OU contents) -----------------------------------
+const ouUserSelectedIds = ref<Set<string>>(new Set());
+const allOuUsersSelected = computed(
+  () =>
+    contents.value.users.length > 0 &&
+    contents.value.users.every((u) => ouUserSelectedIds.value.has(u.id)),
+);
+const someOuUsersSelected = computed(() =>
+  contents.value.users.some((u) => ouUserSelectedIds.value.has(u.id)),
+);
+function toggleOuUser(id: string): void {
+  const next = new Set(ouUserSelectedIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  ouUserSelectedIds.value = next;
+}
+function toggleSelectAllOuUsers(): void {
+  ouUserSelectedIds.value = allOuUsersSelected.value
+    ? new Set()
+    : new Set(contents.value.users.map((u) => u.id));
+}
+function onOuBulkDone(): void {
+  if (selectedDn.value) loadContents(selectedDn.value);
+}
+// Selection is "off" until the first pick, so the list stays clean. Row
+// checkboxes fade in on hover; Ctrl/⌘+click a user starts a selection without
+// navigating. Once anything is selected, checkboxes + "Select all" show for
+// the whole list.
+const ouSelectionActive = computed(() => ouUserSelectedIds.value.size > 0);
+function onOuUserRowClick(e: MouseEvent, id: string): void {
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    toggleOuUser(id);
+  }
+}
 
 onMounted(loadTree);
 
@@ -700,6 +740,12 @@ async function onDeleteSubmit(): Promise<void> {
           <div v-else-if="loadingContents" class="hint">Loading contents…</div>
           <div v-else-if="contentsError" class="hint error">{{ contentsError }}</div>
           <div v-else class="contents-tabs">
+            <UserBulkBar
+              :selected-ids="ouUserSelectedIds"
+              :all-ids="contents.users.map((u) => u.id)"
+              @update:selected-ids="(v) => (ouUserSelectedIds = v)"
+              @done="onOuBulkDone"
+            />
             <!-- Tab nav. Counts on every tab so the operator can scan
                  distribution without clicking through. The "All" tab is
                  first so opening an OU still shows everything at once,
@@ -779,9 +825,26 @@ async function onDeleteSubmit(): Promise<void> {
               </div>
               <section v-if="contents.users.length > 0" class="contents-section">
                 <h2 class="section-h">Users</h2>
-                <ul class="row-list">
-                  <li v-for="u in contents.users" :key="u.id" class="row">
-                    <RouterLink :to="`/users/${u.id}`" class="row-link">
+                <ul class="row-list" :class="{ selecting: ouSelectionActive }">
+                  <li
+                    v-for="u in contents.users"
+                    :key="u.id"
+                    class="row urow"
+                    :class="{ 'is-selected': ouUserSelectedIds.has(u.id) }"
+                  >
+                    <Checkbox
+                      class="urow-check"
+                      :model-value="ouUserSelectedIds.has(u.id)"
+                      binary
+                      :aria-label="`Select ${u.displayName ?? u.samAccountName}`"
+                      @update:model-value="() => toggleOuUser(u.id)"
+                      @click.stop
+                    />
+                    <RouterLink
+                      :to="`/users/${u.id}`"
+                      class="row-link"
+                      @click="onOuUserRowClick($event, u.id)"
+                    >
                       <i class="pi pi-user row-icon" />
                       <span class="row-main">
                         <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
@@ -885,24 +948,43 @@ async function onDeleteSubmit(): Promise<void> {
               <div v-if="contents.users.length === 0" class="hint">
                 No users live directly in this OU.
               </div>
-              <ul v-else class="row-list">
-                <li v-for="u in contents.users" :key="u.id" class="row">
-                  <RouterLink :to="`/users/${u.id}`" class="row-link">
-                    <i class="pi pi-user row-icon" />
-                    <span class="row-main">
-                      <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
-                      <span class="row-sub">
-                        {{ u.samAccountName }}
-                        <span v-if="u.email"> · {{ u.email }}</span>
+              <template v-else>
+                <ul class="row-list" :class="{ selecting: ouSelectionActive }">
+                  <li
+                    v-for="u in contents.users"
+                    :key="u.id"
+                    class="row urow"
+                    :class="{ 'is-selected': ouUserSelectedIds.has(u.id) }"
+                  >
+                    <Checkbox
+                      class="urow-check"
+                      :model-value="ouUserSelectedIds.has(u.id)"
+                      binary
+                      :aria-label="`Select ${u.displayName ?? u.samAccountName}`"
+                      @update:model-value="() => toggleOuUser(u.id)"
+                      @click.stop
+                    />
+                    <RouterLink
+                      :to="`/users/${u.id}`"
+                      class="row-link"
+                      @click="onOuUserRowClick($event, u.id)"
+                    >
+                      <i class="pi pi-user row-icon" />
+                      <span class="row-main">
+                        <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
+                        <span class="row-sub">
+                          {{ u.samAccountName }}
+                          <span v-if="u.email"> · {{ u.email }}</span>
+                        </span>
                       </span>
-                    </span>
-                    <span class="row-flags">
-                      <span v-if="!u.enabled" class="flag flag-muted">disabled</span>
-                      <span v-if="u.locked" class="flag flag-warn">locked</span>
-                    </span>
-                  </RouterLink>
-                </li>
-              </ul>
+                      <span class="row-flags">
+                        <span v-if="!u.enabled" class="flag flag-muted">disabled</span>
+                        <span v-if="u.locked" class="flag flag-warn">locked</span>
+                      </span>
+                    </RouterLink>
+                  </li>
+                </ul>
+              </template>
             </div>
 
             <!-- Groups -->
@@ -1634,6 +1716,41 @@ async function onDeleteSubmit(): Promise<void> {
 }
 .mt-3 {
   margin-top: 12px;
+}
+
+/* Bulk user selection in the OU contents. Checkboxes stay hidden until you
+   hover a row or a selection is active, so the list reads clean by default. */
+.usel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  padding: 2px 8px 8px 10px;
+}
+.urow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+}
+.urow.is-selected {
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+}
+.urow .row-link {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.urow-check {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.urow:hover .urow-check,
+.urow.is-selected .urow-check,
+.row-list.selecting .urow-check {
+  opacity: 1;
 }
 
 /* Description row in the context menu — informational, not clickable. */

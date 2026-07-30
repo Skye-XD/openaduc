@@ -20,6 +20,7 @@ import type { UserSummary } from '@openaduc/shared';
 import { useAuthStore } from '../stores/auth.js';
 import PageHeader from '../design/primitives/PageHeader.vue';
 import SyncButton from '../design/primitives/SyncButton.vue';
+import UserBulkBar from '../design/primitives/UserBulkBar.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 import StatusBadge from '../design/primitives/StatusBadge.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
@@ -384,74 +385,10 @@ function exportCsv(): void {
   });
 }
 
-// ---- Bulk actions ---------------------------------------------------------
-type BulkAction = 'disable' | 'enable' | 'unlock';
-const pendingBulkAction = ref<BulkAction | null>(null);
-const bulkRunning = ref(false);
-const bulkProgress = ref<{
-  done: number;
-  total: number;
-  failures: { id: string; error: string }[];
-}>({
-  done: 0,
-  total: 0,
-  failures: [],
-});
-const canBulkDisable = computed(() => auth.hasCapability('write:user.enableDisable'));
-const canBulkUnlock = computed(() => auth.hasCapability('write:user.unlock'));
-
-async function startBulk(action: BulkAction): Promise<void> {
-  if (selectedIds.value.size === 0) return;
-  pendingBulkAction.value = action;
-  const ids = Array.from(selectedIds.value);
-  bulkRunning.value = true;
-  bulkProgress.value = { done: 0, total: ids.length, failures: [] };
-  try {
-    for (const id of ids) {
-      try {
-        if (action === 'disable') await api.users.disable(id);
-        else if (action === 'enable') await api.users.enable(id);
-        else if (action === 'unlock') await api.users.unlock(id);
-      } catch (err) {
-        bulkProgress.value.failures.push({
-          id,
-          error: err instanceof ApiError ? err.message : String(err),
-        });
-      } finally {
-        bulkProgress.value = { ...bulkProgress.value, done: bulkProgress.value.done + 1 };
-      }
-    }
-    const succeeded = bulkProgress.value.total - bulkProgress.value.failures.length;
-    if (bulkProgress.value.failures.length === 0) {
-      const verb = action === 'disable' ? 'Disabled' : action === 'enable' ? 'Enabled' : 'Unlocked';
-      toast.add({
-        severity: 'success',
-        summary: `${verb} ${succeeded} ${succeeded === 1 ? 'account' : 'accounts'}`,
-        life: 4000,
-      });
-    } else {
-      toast.add({
-        severity: 'warn',
-        summary: `${succeeded} succeeded, ${bulkProgress.value.failures.length} failed`,
-        detail: bulkProgress.value.failures
-          .slice(0, 3)
-          .map((f) => f.error)
-          .join('; '),
-        life: 8000,
-      });
-    }
-    clearSelection();
-    await load();
-  } finally {
-    bulkRunning.value = false;
-    pendingBulkAction.value = null;
-  }
-}
-
-const bulkBusyMessage = computed(() => {
-  if (!bulkRunning.value) return null;
-  return `${bulkProgress.value.done} of ${bulkProgress.value.total} done`;
-});
+// Bulk actions now live in the shared <UserBulkBar> component (rendered at the
+// top of the page); selection state above drives the table checkboxes and is
+// passed to it. `clearSelection`/`selectedCount` are still exported for the
+// checkbox header + potential callers.
 
 // ---- Display helpers ------------------------------------------------------
 type PwdTone = 'red' | 'amber' | 'violet' | 'muted';
@@ -547,6 +484,12 @@ onMounted(() => {
       </button>
       <button type="button" class="filter-chip clear-all" @click="clearAll">Clear all</button>
     </div>
+
+    <UserBulkBar
+      :selected-ids="selectedIds"
+      @update:selected-ids="(v) => (selectedIds = v)"
+      @done="load"
+    />
 
     <DataTable
       v-model:filters="filters"
@@ -665,57 +608,6 @@ onMounted(() => {
         </template>
       </Column>
     </DataTable>
-
-    <transition name="bulk-fade">
-      <div v-if="selectedCount > 0" class="bulkbar" role="region" aria-label="Bulk actions">
-        <span class="bulkbar-count mono">
-          <strong>{{ selectedCount }}</strong> selected
-        </span>
-        <span class="bulkbar-divider" />
-        <div class="bulkbar-actions">
-          <Button
-            v-if="canBulkUnlock"
-            label="Unlock"
-            icon="pi pi-unlock"
-            severity="warn"
-            size="small"
-            :loading="bulkRunning && pendingBulkAction === 'unlock'"
-            :disabled="bulkRunning"
-            @click="auth.requireEdit(() => startBulk('unlock'))"
-          />
-          <Button
-            v-if="canBulkDisable"
-            label="Disable"
-            icon="pi pi-ban"
-            severity="danger"
-            size="small"
-            :loading="bulkRunning && pendingBulkAction === 'disable'"
-            :disabled="bulkRunning"
-            @click="auth.requireEdit(() => startBulk('disable'))"
-          />
-          <Button
-            v-if="canBulkDisable"
-            label="Enable"
-            icon="pi pi-check"
-            severity="secondary"
-            size="small"
-            :loading="bulkRunning && pendingBulkAction === 'enable'"
-            :disabled="bulkRunning"
-            @click="auth.requireEdit(() => startBulk('enable'))"
-          />
-          <Button
-            label="Clear"
-            icon="pi pi-times"
-            text
-            severity="secondary"
-            size="small"
-            :disabled="bulkRunning"
-            @click="clearSelection"
-          />
-        </div>
-        <span v-if="bulkBusyMessage" class="bulkbar-progress mono">{{ bulkBusyMessage }}</span>
-      </div>
-    </transition>
 
     <Drawer
       v-model:visible="drawerOpen"
