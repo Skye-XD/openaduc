@@ -15,6 +15,7 @@ import { FilterMatchMode, type FilterMatchModeValue } from '../design/lib/filter
 import { api } from '../api/index.js';
 import type { GroupSummary } from '@openaduc/shared';
 import PageHeader from '../design/primitives/PageHeader.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 
@@ -168,6 +169,7 @@ onMounted(load);
           :outlined="activeCount === 0"
           @click="drawerOpen = true"
         />
+        <SyncButton :task-keys="['groups.full']" @done="load" />
         <Button
           label="Refresh"
           icon="pi pi-refresh"

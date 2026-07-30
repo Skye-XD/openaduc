@@ -16,6 +16,7 @@ import type { MenuItem } from 'primevue/menuitem';
 import Card from '../design/primitives/Card.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import PageHeader from '../design/primitives/PageHeader.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import { api } from '../api/index.js';
 import { ApiError } from '../api/client.js';
 import { useAuthStore } from '../stores/auth.js';
@@ -196,6 +197,12 @@ watch(selectedDn, (dn) => {
 });
 
 onMounted(loadTree);
+
+// After an LDAP sync of OUs, reload the tree (and the open OU's contents).
+function onSynced(): void {
+  loadTree();
+  if (selectedDn.value) loadContents(selectedDn.value);
+}
 
 // ---- Context menu --------------------------------------------------------
 
@@ -589,7 +596,11 @@ async function onDeleteSubmit(): Promise<void> {
 
 <template>
   <div class="page-inner page-fill ou-browser">
-    <PageHeader title="Directory structure" />
+    <PageHeader title="Directory structure">
+      <template #actions>
+        <SyncButton :task-keys="['ous.full']" @done="onSynced" />
+      </template>
+    </PageHeader>
 
     <div class="ou-grid">
       <!-- Left: OU tree. Right-click anywhere inside the pane is intercepted

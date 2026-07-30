@@ -15,6 +15,7 @@ import { FilterMatchMode, type FilterMatchModeValue } from '../design/lib/filter
 import { api } from '../api/index.js';
 import type { ComputerSummary } from '@openaduc/shared';
 import PageHeader from '../design/primitives/PageHeader.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 import { fmtRelative } from '../design/lib/format.js';
@@ -168,6 +169,7 @@ onMounted(load);
           outlined
           @click="router.push({ name: 'deleted-computers' })"
         />
+        <SyncButton :task-keys="['computers.full']" @done="load" />
         <Button
           label="Refresh"
           icon="pi pi-refresh"

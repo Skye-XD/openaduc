@@ -19,6 +19,7 @@ import { ApiError } from '../api/client.js';
 import type { UserSummary } from '@openaduc/shared';
 import { useAuthStore } from '../stores/auth.js';
 import PageHeader from '../design/primitives/PageHeader.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 import StatusBadge from '../design/primitives/StatusBadge.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
@@ -519,6 +520,7 @@ onMounted(() => {
           outlined
           @click="router.push({ name: 'deleted-users' })"
         />
+        <SyncButton :task-keys="['users.full']" @done="load" />
         <Button
           label="Refresh"
           icon="pi pi-refresh"

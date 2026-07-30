@@ -3,6 +3,7 @@
 import { computed } from 'vue';
 import { useRoute } from 'vue-router';
 import ThemeToggle from '../primitives/ThemeToggle.vue';
+import SyncButton from '../primitives/SyncButton.vue';
 import GlobalSearch from './GlobalSearch.vue';
 
 const route = useRoute();
@@ -85,6 +86,13 @@ const parentCrumbs = computed(() => crumbs.value.slice(0, -1));
     <GlobalSearch class="tb-search" />
 
     <div class="tb-actions">
+      <SyncButton
+        :task-keys="['ous.full', 'users.full', 'groups.full', 'computers.full', 'policies.full']"
+        :poll="false"
+        icon-only
+        label="Full sync from AD"
+        title="Full sync — pull everything from Active Directory"
+      />
       <ThemeToggle />
       <button
         type="button"
