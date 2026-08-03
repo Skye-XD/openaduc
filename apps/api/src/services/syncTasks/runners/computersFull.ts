@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BUSL-1.1
-import { markComputersStale, upsertComputer } from '../../computerCache.js';
+import { pruneComputers, upsertComputer } from '../../computerCache.js';
 import type { RunnerContext, RunnerResult } from '../types.js';
 
 /**
@@ -31,10 +31,10 @@ export async function runComputersFull(ctx: RunnerContext): Promise<RunnerResult
     throw new Error(`computers.full: 0 of ${total} entries written — ${message}`);
   }
 
-  await markComputersStale(ctx.db, ctx.providerId, seen);
+  const pruned = await pruneComputers(ctx.db, ctx.providerId, seen);
 
   return {
     cursor: new Date().toISOString(),
-    stats: { computersSeen: total, computersUpserted: seen.size },
+    stats: { computersSeen: total, computersUpserted: seen.size, computersPruned: pruned },
   };
 }

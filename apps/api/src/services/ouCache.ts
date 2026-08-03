@@ -54,6 +54,41 @@ export async function markOusStale(
 }
 
 /**
+ * Soft-delete OUs absent from a completed full crawl. A finished crawl is
+ * authoritative, so any cached OU we didn't see no longer exists under the
+ * base DN (deleted in AD, or moved out of scope) — drop it from the tree.
+ * `upsertOu` clears `deleted_at` again if the OU reappears, so this self-heals.
+ *
+ * Guard: never prune when the crawl returned zero OUs — that's almost always
+ * a failed/empty crawl, and we must not wipe the whole tree. In that case fall
+ * back to the non-destructive stale-flagging. Returns the number pruned.
+ */
+export async function pruneOus(
+  db: Kysely<DB>,
+  providerId: number,
+  seenDnsLower: Set<string>,
+): Promise<number> {
+  const now = new Date().toISOString();
+  if (seenDnsLower.size === 0) {
+    await markOusStale(db, providerId, seenDnsLower);
+    return 0;
+  }
+  const res = await sql<{ count: string }>`
+    WITH pruned AS (
+      UPDATE directory_ous
+      SET deleted_at = ${now}, stale_at = ${now}
+      WHERE provider_id = ${providerId}
+        AND deleted_at IS NULL
+        AND lower(distinguished_name) NOT IN (${sql.join(Array.from(seenDnsLower))})
+      RETURNING 1
+    )
+    SELECT COUNT(*)::text AS count FROM pruned
+  `.execute(db);
+  const row = res.rows[0];
+  return row ? Number(row.count) : 0;
+}
+
+/**
  * Wipe and rebuild the user_group_memberships join table from
  * `memberOf` arrays in user cache rows. Volumes here are small enough
  * (low tens of thousands) that this is simpler than incremental

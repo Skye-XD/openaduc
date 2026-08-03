@@ -94,3 +94,29 @@ export async function markComputersStale(
     .where('object_guid', 'not in', Array.from(seenGuids))
     .execute();
 }
+
+/**
+ * Soft-delete computers absent from a completed full crawl (deleted in AD or
+ * moved out of scope). `upsertComputer` clears `deleted_at` if a computer
+ * reappears, so this self-heals. Guard: never prune on a zero-result crawl —
+ * fall back to the non-destructive stale-flagging. Returns the number pruned.
+ */
+export async function pruneComputers(
+  db: Kysely<DB>,
+  providerId: number,
+  seenGuids: Set<string>,
+): Promise<number> {
+  const now = new Date().toISOString();
+  if (seenGuids.size === 0) {
+    await markComputersStale(db, providerId, seenGuids);
+    return 0;
+  }
+  const res = await db
+    .updateTable('computer_cache_records')
+    .set({ deleted_at: now, stale_at: now })
+    .where('provider_id', '=', providerId)
+    .where('deleted_at', 'is', null)
+    .where('object_guid', 'not in', Array.from(seenGuids))
+    .executeTakeFirst();
+  return Number(res?.numUpdatedRows ?? 0n);
+}

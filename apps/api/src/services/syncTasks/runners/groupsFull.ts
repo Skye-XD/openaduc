@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: BUSL-1.1
-import { markGroupsStale, upsertGroup } from '../../groupCache.js';
+import { pruneGroups, upsertGroup } from '../../groupCache.js';
 import type { RunnerContext, RunnerResult } from '../types.js';
 
 /**
- * Full group crawl + stale-mark for unseen rows. Daily reconciliation.
+ * Full group crawl. Daily reconciliation; prunes groups no longer in AD
+ * (deleted / moved out of scope) rather than only flagging them stale.
  */
 export async function runGroupsFull(ctx: RunnerContext): Promise<RunnerResult> {
   const seen = new Set<string>();
@@ -19,11 +20,11 @@ export async function runGroupsFull(ctx: RunnerContext): Promise<RunnerResult> {
     }
   }
 
-  await markGroupsStale(ctx.db, ctx.providerId, seen);
+  const pruned = await pruneGroups(ctx.db, ctx.providerId, seen);
 
   return {
     cursor: new Date().toISOString(),
-    stats: { groupsSeen: count },
+    stats: { groupsSeen: count, groupsPruned: pruned },
     triggers: ['memberships.rebuild'],
   };
 }

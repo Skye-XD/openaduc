@@ -76,3 +76,29 @@ export async function markGroupsStale(
     .where('object_guid', 'not in', Array.from(seenGuids))
     .execute();
 }
+
+/**
+ * Soft-delete groups absent from a completed full crawl (deleted in AD or
+ * moved out of scope). `upsertGroup` clears `deleted_at` if a group reappears,
+ * so this self-heals. Guard: never prune on a zero-result crawl — fall back to
+ * the non-destructive stale-flagging. Returns the number pruned.
+ */
+export async function pruneGroups(
+  db: Kysely<DB>,
+  providerId: number,
+  seenGuids: Set<string>,
+): Promise<number> {
+  const now = new Date().toISOString();
+  if (seenGuids.size === 0) {
+    await markGroupsStale(db, providerId, seenGuids);
+    return 0;
+  }
+  const res = await db
+    .updateTable('group_cache_records')
+    .set({ deleted_at: now, stale_at: now })
+    .where('provider_id', '=', providerId)
+    .where('deleted_at', 'is', null)
+    .where('object_guid', 'not in', Array.from(seenGuids))
+    .executeTakeFirst();
+  return Number(res?.numUpdatedRows ?? 0n);
+}
