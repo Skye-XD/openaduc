@@ -10,6 +10,9 @@ import InputText from 'primevue/inputtext';
 import InputNumber from 'primevue/inputnumber';
 import MultiSelect from 'primevue/multiselect';
 import Select from 'primevue/select';
+import Checkbox from 'primevue/checkbox';
+import TreeSelect from 'primevue/treeselect';
+import type { TreeNode } from 'primevue/treenode';
 import Message from 'primevue/message';
 import Toast from 'primevue/toast';
 import { useToast } from 'primevue/usetoast';
@@ -139,6 +142,49 @@ function decorate(u: UserSummary): UserRow {
   };
 }
 
+// ---- OU filter (server-side: re-queries with ?ou=<dn>&includeSubOus) ------
+// Unlike the other filters (which run client-side over the loaded rows), the
+// summary rows don't carry a DN, so OU membership is resolved by the server.
+const ouNodes = ref<TreeNode[]>([]);
+const ouNameByDn = ref<Map<string, string>>(new Map());
+const ouTreeSelection = ref<Record<string, boolean>>({});
+const includeSubOus = ref(true);
+const selectedOuDn = computed<string | null>(
+  () => Object.keys(ouTreeSelection.value).find((k) => ouTreeSelection.value[k]) ?? null,
+);
+
+async function loadOus(): Promise<void> {
+  try {
+    const resp = await api.ous.list();
+    const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
+    const nameMap = new Map<string, string>();
+    for (const o of resp.ous) {
+      byDn.set(o.distinguishedName.toLowerCase(), {
+        key: o.distinguishedName,
+        label: o.name,
+        children: [],
+      });
+      nameMap.set(o.distinguishedName, o.name);
+    }
+    const roots: TreeNode[] = [];
+    for (const o of resp.ous) {
+      const node = byDn.get(o.distinguishedName.toLowerCase())!;
+      const parent = o.parentDn ? byDn.get(o.parentDn.toLowerCase()) : undefined;
+      if (parent) parent.children!.push(node);
+      else roots.push(node);
+    }
+    const sortRec = (nodes: TreeNode[]): void => {
+      nodes.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? ''));
+      for (const n of nodes) if (n.children) sortRec(n.children);
+    };
+    sortRec(roots);
+    ouNodes.value = roots;
+    ouNameByDn.value = nameMap;
+  } catch {
+    // Non-fatal — the OU filter just won't have options.
+  }
+}
+
 async function load(): Promise<void> {
   loading.value = true;
   error.value = null;
@@ -147,6 +193,9 @@ async function load(): Promise<void> {
       pageSize: 50_000,
       sort: 'displayName',
       sortDir: 'asc',
+      ...(selectedOuDn.value
+        ? { ou: selectedOuDn.value, includeSubOus: includeSubOus.value }
+        : {}),
     });
     rows.value = resp.rows.map(decorate);
     filteredRows.value = rows.value;
@@ -157,6 +206,12 @@ async function load(): Promise<void> {
     loading.value = false;
   }
 }
+
+// Re-fetch when the OU filter changes (server-side filter).
+watch(selectedOuDn, () => void load());
+watch(includeSubOus, () => {
+  if (selectedOuDn.value) void load();
+});
 
 // ---- Selection (for bulk actions) -----------------------------------------
 // Selected ids are kept in a Set so toggles are O(1) and the count
@@ -215,7 +270,7 @@ function isActive(value: unknown): boolean {
 }
 
 interface Chip {
-  key: FilterKey;
+  key: FilterKey | 'ou';
   label: string;
 }
 
@@ -257,12 +312,20 @@ const activeChips = computed<Chip[]>(() => {
   if (isActive(f.title.value)) {
     out.push({ key: 'title', label: `Title: "${f.title.value}"` });
   }
+  if (selectedOuDn.value) {
+    const name = ouNameByDn.value.get(selectedOuDn.value) ?? selectedOuDn.value;
+    out.push({ key: 'ou', label: `OU: ${name}${includeSubOus.value ? ' (+sub)' : ''}` });
+  }
   return out;
 });
 
 const activeCount = computed(() => activeChips.value.length);
 
-function clearFilter(key: FilterKey): void {
+function clearFilter(key: FilterKey | 'ou'): void {
+  if (key === 'ou') {
+    ouTreeSelection.value = {};
+    return;
+  }
   filters.value[key].value = null;
 }
 
@@ -270,6 +333,8 @@ function clearAll(): void {
   for (const k of Object.keys(filters.value) as FilterKey[]) {
     filters.value[k].value = null;
   }
+  ouTreeSelection.value = {};
+  includeSubOus.value = true;
 }
 
 // ---- Deep-link / URL sync -------------------------------------------------
@@ -423,6 +488,7 @@ onMounted(() => {
   applyQuery(route.query);
   suppressSync = false;
   void load();
+  void loadOus();
   if (!isActive(filters.value._searchBlob.value)) {
     searchInput.value?.focus();
   }
@@ -624,6 +690,23 @@ onMounted(() => {
             placeholder="Name, username, UPN, email…"
             class="filter-input"
           />
+        </div>
+
+        <div class="filter-field">
+          <label class="filter-label">Organizational unit</label>
+          <TreeSelect
+            v-model="ouTreeSelection"
+            :options="ouNodes"
+            selection-mode="single"
+            placeholder="Any OU"
+            class="filter-input"
+            fluid
+            filter
+          />
+          <label class="filter-check">
+            <Checkbox v-model="includeSubOus" binary :disabled="!selectedOuDn" />
+            Include sub-OUs
+          </label>
         </div>
 
         <div v-if="showStatusFilter" class="filter-field">
@@ -909,6 +992,16 @@ onMounted(() => {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-3);
+}
+
+.filter-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
 }
 
 .filter-input {
