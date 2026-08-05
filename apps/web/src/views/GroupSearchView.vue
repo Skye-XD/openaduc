@@ -11,8 +11,15 @@ import InputNumber from 'primevue/inputnumber';
 import MultiSelect from 'primevue/multiselect';
 import Select from 'primevue/select';
 import Message from 'primevue/message';
+import Dialog from 'primevue/dialog';
+import TreeSelect from 'primevue/treeselect';
+import type { TreeNode } from 'primevue/treenode';
+import Toast from 'primevue/toast';
+import { useToast } from 'primevue/usetoast';
 import { FilterMatchMode, type FilterMatchModeValue } from '../design/lib/filterMatchMode.js';
 import { api } from '../api/index.js';
+import { ApiError } from '../api/client.js';
+import { useAuthStore } from '../stores/auth.js';
 import type { GroupSummary } from '@openaduc/shared';
 import PageHeader from '../design/primitives/PageHeader.vue';
 import SyncButton from '../design/primitives/SyncButton.vue';
@@ -20,6 +27,8 @@ import EmptyState from '../design/primitives/EmptyState.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 
 const router = useRouter();
+const auth = useAuthStore();
+const toast = useToast();
 
 type GroupType = GroupSummary['groupType'];
 type GroupScope = GroupSummary['groupScope'];
@@ -155,13 +164,146 @@ function clearAll(): void {
   }
 }
 
-onMounted(load);
+// ---- Create group ---------------------------------------------------------
+const canCreateGroup = computed(() => auth.hasCapability('write:group.create'));
+const ouNodes = ref<TreeNode[]>([]);
+
+async function loadOus(): Promise<void> {
+  try {
+    const resp = await api.ous.list();
+    const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
+    for (const o of resp.ous) {
+      byDn.set(o.distinguishedName.toLowerCase(), {
+        key: o.distinguishedName,
+        label: o.name,
+        children: [],
+      });
+    }
+    const roots: TreeNode[] = [];
+    for (const o of resp.ous) {
+      const node = byDn.get(o.distinguishedName.toLowerCase())!;
+      const parent = o.parentDn ? byDn.get(o.parentDn.toLowerCase()) : undefined;
+      if (parent) parent.children!.push(node);
+      else roots.push(node);
+    }
+    const sortRec = (nodes: TreeNode[]): void => {
+      nodes.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? ''));
+      for (const n of nodes) if (n.children) sortRec(n.children);
+    };
+    sortRec(roots);
+    ouNodes.value = roots;
+  } catch {
+    // Non-fatal — the OU picker just won't have options.
+  }
+}
+
+const newGroupOpen = ref(false);
+const newGroupSubmitting = ref(false);
+const newGroupError = ref<string | null>(null);
+const newGroupOuSel = ref<Record<string, boolean>>({});
+const newGroupParentDn = computed<string | null>(
+  () => Object.keys(newGroupOuSel.value).find((k) => newGroupOuSel.value[k]) ?? null,
+);
+const newGroupDraft = ref({
+  name: '',
+  samAccountName: '',
+  description: '',
+  scope: 'global' as 'global' | 'domainLocal' | 'universal',
+  category: 'security' as 'security' | 'distribution',
+});
+const newGroupScopeOptions = [
+  { label: 'Global', value: 'global' },
+  { label: 'Domain local', value: 'domainLocal' },
+  { label: 'Universal', value: 'universal' },
+];
+const newGroupCategoryOptions = [
+  { label: 'Security', value: 'security' },
+  { label: 'Distribution', value: 'distribution' },
+];
+const NAME_RE = /^[^,=+<>#;\\"]+$/;
+const GROUP_SAM_RE = /^[^\s"[\]:;|=+*?<>/\\,]+$/;
+const newGroupValid = computed(() => {
+  const d = newGroupDraft.value;
+  const name = d.name.trim();
+  const sam = d.samAccountName.trim();
+  return (
+    !!newGroupParentDn.value &&
+    name.length >= 1 &&
+    name.length <= 64 &&
+    NAME_RE.test(name) &&
+    sam.length >= 1 &&
+    sam.length <= 64 &&
+    GROUP_SAM_RE.test(sam)
+  );
+});
+
+function openNewGroup(): void {
+  newGroupDraft.value = {
+    name: '',
+    samAccountName: '',
+    description: '',
+    scope: 'global',
+    category: 'security',
+  };
+  newGroupOuSel.value = {};
+  newGroupError.value = null;
+  newGroupOpen.value = true;
+}
+
+async function submitNewGroup(): Promise<void> {
+  if (!newGroupValid.value) {
+    newGroupError.value = 'Fill in a valid name, logon name, and target OU.';
+    return;
+  }
+  newGroupError.value = null;
+  newGroupSubmitting.value = true;
+  try {
+    const d = newGroupDraft.value;
+    const res = await api.groups.create({
+      parentDn: newGroupParentDn.value!,
+      name: d.name.trim(),
+      samAccountName: d.samAccountName.trim(),
+      description: d.description.trim() || undefined,
+      scope: d.scope,
+      category: d.category,
+    });
+    toast.add({
+      severity: 'success',
+      summary: 'Group created',
+      detail: `${res.samAccountName} created.`,
+      life: 5000,
+    });
+    newGroupOpen.value = false;
+    await load();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = submitNewGroup;
+      return;
+    }
+    newGroupError.value = err instanceof ApiError ? err.message : String(err);
+  } finally {
+    newGroupSubmitting.value = false;
+  }
+}
+
+onMounted(() => {
+  void load();
+  void loadOus();
+});
 </script>
 
 <template>
   <div class="page-inner page-fill groups-page">
     <PageHeader :title="`Groups (${total.toLocaleString()})`">
       <template #actions>
+        <Button
+          v-if="canCreateGroup"
+          label="New group"
+          icon="pi pi-plus"
+          severity="secondary"
+          outlined
+          @click="auth.requireEdit(openNewGroup)"
+        />
         <Button
           :label="activeCount > 0 ? `Filter (${activeCount})` : 'Filter'"
           icon="pi pi-filter"
@@ -376,6 +518,83 @@ onMounted(load);
         </div>
       </template>
     </Drawer>
+
+    <!-- New group dialog -->
+    <Dialog
+      :visible="newGroupOpen"
+      modal
+      header="New group"
+      :style="{ width: '34rem' }"
+      :closable="!newGroupSubmitting"
+      @update:visible="(v) => !v && (newGroupOpen = false)"
+    >
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px">
+        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
+          <span style="font-size: 12px; color: var(--text-3)">Target OU</span>
+          <TreeSelect
+            v-model="newGroupOuSel"
+            :options="ouNodes"
+            selection-mode="single"
+            placeholder="Select an OU"
+            fluid
+            filter
+          />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Name</span>
+          <InputText v-model="newGroupDraft.name" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Logon name (sAMAccountName)</span>
+          <InputText v-model="newGroupDraft.samAccountName" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Scope</span>
+          <Select
+            v-model="newGroupDraft.scope"
+            :options="newGroupScopeOptions"
+            option-label="label"
+            option-value="value"
+            fluid
+          />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Category</span>
+          <Select
+            v-model="newGroupDraft.category"
+            :options="newGroupCategoryOptions"
+            option-label="label"
+            option-value="value"
+            fluid
+          />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
+          <span style="font-size: 12px; color: var(--text-3)">Description (optional)</span>
+          <InputText v-model="newGroupDraft.description" fluid />
+        </div>
+      </div>
+      <Message v-if="newGroupError" severity="error" :closable="false" class="mt-2">{{
+        newGroupError
+      }}</Message>
+      <template #footer>
+        <Button
+          label="Cancel"
+          text
+          severity="secondary"
+          :disabled="newGroupSubmitting"
+          @click="newGroupOpen = false"
+        />
+        <Button
+          label="Create group"
+          icon="pi pi-plus"
+          :loading="newGroupSubmitting"
+          :disabled="!newGroupValid"
+          @click="submitNewGroup"
+        />
+      </template>
+    </Dialog>
+
+    <Toast position="top-right" />
   </div>
 </template>
 

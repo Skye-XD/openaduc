@@ -334,6 +334,17 @@ export interface UserCreateInput {
   email?: string | undefined;
 }
 
+// Input for creating a group. `scope` + `category` map to the AD `groupType`
+// bitmask; the CN (RDN) is the group name.
+export interface GroupCreateInput {
+  parentDn: string;
+  name: string;
+  samAccountName: string;
+  description?: string | undefined;
+  scope: 'global' | 'domainLocal' | 'universal';
+  category: 'security' | 'distribution';
+}
+
 export interface SyncInput {
   pageSize?: number;
   modifiedSince?: Date;
@@ -448,6 +459,12 @@ export interface DirectoryProvider {
   // if the object is protected from accidental deletion (a deny ACE) —
   // surfaced as permission_denied so the route can explain it.
   deleteUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
+  // Create a group under `input.parentDn`. Returns the created DirectoryGroup
+  // (read back) so the route can seed the cache without waiting for a sync.
+  createGroup(
+    input: GroupCreateInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult & { group?: DirectoryGroup }>;
   // Create a new OU as a direct child of `parentDn`. Returns the resulting
   // DirectoryOu so the route can update its cache row in place rather than
   // waiting for the next sync.

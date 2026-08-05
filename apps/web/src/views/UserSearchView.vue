@@ -11,6 +11,7 @@ import InputNumber from 'primevue/inputnumber';
 import MultiSelect from 'primevue/multiselect';
 import Select from 'primevue/select';
 import Checkbox from 'primevue/checkbox';
+import Dialog from 'primevue/dialog';
 import TreeSelect from 'primevue/treeselect';
 import type { TreeNode } from 'primevue/treenode';
 import Message from 'primevue/message';
@@ -212,6 +213,85 @@ watch(selectedOuDn, () => void load());
 watch(includeSubOus, () => {
   if (selectedOuDn.value) void load();
 });
+
+// ---- Create user ----------------------------------------------------------
+// Reuses the OU tree loaded for the filter (ouNodes) as the target-OU picker.
+const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
+const newUserOpen = ref(false);
+const newUserSubmitting = ref(false);
+const newUserError = ref<string | null>(null);
+const newUserOuSel = ref<Record<string, boolean>>({});
+const newUserParentDn = computed<string | null>(
+  () => Object.keys(newUserOuSel.value).find((k) => newUserOuSel.value[k]) ?? null,
+);
+const newUserDraft = ref({
+  givenName: '',
+  surname: '',
+  displayName: '',
+  samAccountName: '',
+  userPrincipalName: '',
+  email: '',
+});
+const newUserSamValid = computed(() => {
+  const s = newUserDraft.value.samAccountName.trim();
+  return s.length >= 1 && s.length <= 20 && /^[^\s"[\]:;|=+*?<>/\\,]+$/.test(s);
+});
+
+function openNewUser(): void {
+  newUserDraft.value = {
+    givenName: '',
+    surname: '',
+    displayName: '',
+    samAccountName: '',
+    userPrincipalName: '',
+    email: '',
+  };
+  newUserOuSel.value = {};
+  newUserError.value = null;
+  newUserOpen.value = true;
+}
+
+async function submitNewUser(): Promise<void> {
+  if (!newUserParentDn.value) {
+    newUserError.value = 'Pick a target OU.';
+    return;
+  }
+  if (!newUserSamValid.value) {
+    newUserError.value =
+      'Logon name is required, ≤20 chars, no spaces or reserved characters.';
+    return;
+  }
+  newUserError.value = null;
+  newUserSubmitting.value = true;
+  try {
+    const d = newUserDraft.value;
+    const res = await api.users.create({
+      parentDn: newUserParentDn.value,
+      samAccountName: d.samAccountName.trim(),
+      userPrincipalName: d.userPrincipalName.trim() || undefined,
+      givenName: d.givenName.trim() || undefined,
+      surname: d.surname.trim() || undefined,
+      displayName: d.displayName.trim() || undefined,
+      email: d.email.trim() || undefined,
+    });
+    toast.add({
+      severity: 'success',
+      summary: 'User created',
+      detail: `${res.samAccountName} created (disabled). Set a password and enable it to activate.`,
+      life: 6000,
+    });
+    newUserOpen.value = false;
+    await load();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = submitNewUser;
+      return;
+    }
+    newUserError.value = err instanceof ApiError ? err.message : String(err);
+  } finally {
+    newUserSubmitting.value = false;
+  }
+}
 
 // ---- Selection (for bulk actions) -----------------------------------------
 // Selected ids are kept in a Set so toggles are O(1) and the count
@@ -501,6 +581,14 @@ onMounted(() => {
     <PageHeader :title="`Users (${total.toLocaleString()})`">
       <template #actions>
         <Button
+          v-if="canCreateUser"
+          label="New user"
+          icon="pi pi-user-plus"
+          severity="secondary"
+          outlined
+          @click="auth.requireEdit(openNewUser)"
+        />
+        <Button
           :label="activeCount > 0 ? `Filter (${activeCount})` : 'Filter'"
           icon="pi pi-filter"
           :severity="activeCount > 0 ? 'primary' : 'secondary'"
@@ -674,6 +762,82 @@ onMounted(() => {
         </template>
       </Column>
     </DataTable>
+
+    <!-- New user dialog. Created disabled with no password; set a password
+         and enable it afterwards from the user's page. -->
+    <Dialog
+      :visible="newUserOpen"
+      modal
+      header="New user"
+      :style="{ width: '34rem' }"
+      :closable="!newUserSubmitting"
+      @update:visible="(v) => !v && (newUserOpen = false)"
+    >
+      <p style="font-size: 13px; color: var(--text-3); margin: 0 0 14px">
+        The account is created <strong>disabled with no password</strong>. Set a password and
+        enable it afterwards from the user's page.
+      </p>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px">
+        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
+          <span style="font-size: 12px; color: var(--text-3)">Target OU</span>
+          <TreeSelect
+            v-model="newUserOuSel"
+            :options="ouNodes"
+            selection-mode="single"
+            placeholder="Select an OU"
+            fluid
+            filter
+          />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">First name</span>
+          <InputText v-model="newUserDraft.givenName" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Last name</span>
+          <InputText v-model="newUserDraft.surname" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
+          <span style="font-size: 12px; color: var(--text-3)">Display name (optional)</span>
+          <InputText
+            v-model="newUserDraft.displayName"
+            placeholder="defaults to First Last"
+            fluid
+          />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">User logon name (sAMAccountName)</span>
+          <InputText v-model="newUserDraft.samAccountName" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">User principal name (optional)</span>
+          <InputText v-model="newUserDraft.userPrincipalName" placeholder="user@domain" fluid />
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
+          <span style="font-size: 12px; color: var(--text-3)">Email (optional)</span>
+          <InputText v-model="newUserDraft.email" fluid />
+        </div>
+      </div>
+      <Message v-if="newUserError" severity="error" :closable="false" class="mt-2">{{
+        newUserError
+      }}</Message>
+      <template #footer>
+        <Button
+          label="Cancel"
+          text
+          severity="secondary"
+          :disabled="newUserSubmitting"
+          @click="newUserOpen = false"
+        />
+        <Button
+          label="Create user"
+          icon="pi pi-user-plus"
+          :loading="newUserSubmitting"
+          :disabled="!newUserParentDn || !newUserSamValid"
+          @click="submitNewUser"
+        />
+      </template>
+    </Dialog>
 
     <Drawer
       v-model:visible="drawerOpen"

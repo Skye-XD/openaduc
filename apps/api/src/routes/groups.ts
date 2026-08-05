@@ -3,16 +3,32 @@ import type { FastifyInstance } from 'fastify';
 import { sql } from 'kysely';
 import { z } from 'zod';
 import {
+  groupCreateRequestSchema,
   groupDetailSchema,
   groupSearchQuerySchema,
   groupSearchResponseSchema,
   type GroupDetail,
   type GroupSearchResponse,
 } from '@openaduc/shared';
-import { NotFound } from '../plugins/errorHandler.js';
-import { auditContextFromRequest } from '../services/auditContext.js';
+import { NotFound, Unauthorized } from '../plugins/errorHandler.js';
+import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
+import { upsertGroup } from '../services/groupCache.js';
 
 const idParamSchema = z.object({ id: z.string().uuid() });
+
+// Build the WriteContext the provider expects from the request actor and the
+// cached step-up password. Mirrors the helpers in routes/users.ts & ous.ts.
+function ctx(
+  actor: NonNullable<import('fastify').FastifyRequest['actor']>,
+  req: import('fastify').FastifyRequest,
+): { actorUserId: string; actorUsername: string; actorPassword: string; correlationId: string } {
+  return {
+    actorUserId: actor.session.actorUserId,
+    actorUsername: actor.session.actorUsername!,
+    actorPassword: actor.elevatedPassword!,
+    correlationId: req.correlationId,
+  };
+}
 
 export async function registerGroupRoutes(app: FastifyInstance): Promise<void> {
   // ---- GET /api/groups (cache search) ----------------------------------
@@ -142,6 +158,94 @@ export async function registerGroupRoutes(app: FastifyInstance): Promise<void> {
   // the sync rebuilds from each user's `memberOf`). For very large groups
   // (thousands of members) we defer paging to a follow-up; for now the cap
   // is the sync's pageSize.
+  // ---- POST /api/groups (create a group) -------------------------------
+  // Admin-only (write:group.create) + step-up. Seeds the cache on success so
+  // the group shows up immediately.
+  app.post('/api/groups', {
+    preHandler: [app.requireCapability('write:group.create'), app.requireStepUp],
+    handler: async (req) => {
+      const body = groupCreateRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      // Target OU must exist in our cache for this provider.
+      const parent = await app.db
+        .selectFrom('directory_ous')
+        .where('provider_id', '=', provider.id)
+        .where('deleted_at', 'is', null)
+        .where(sql<string>`lower(distinguished_name)`, '=', body.parentDn.toLowerCase())
+        .select(['distinguished_name'])
+        .executeTakeFirst();
+      if (!parent) {
+        throw app.httpErrors.badRequest('target OU not found in directory cache');
+      }
+
+      const candidateDn = `CN=${body.name},${parent.distinguished_name}`;
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'group.create',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'group',
+          targetDn: candidateDn,
+          metadata: {
+            samAccountName: body.samAccountName,
+            parentDn: parent.distinguished_name,
+            scope: body.scope,
+            category: body.category,
+          },
+        },
+        async () => {
+          const r = await provider.createGroup(
+            {
+              parentDn: parent.distinguished_name,
+              name: body.name,
+              samAccountName: body.samAccountName,
+              description: body.description,
+              scope: body.scope,
+              category: body.category,
+            },
+            ctx(actor, req),
+          );
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+            group: r.group ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden('directory rejected the create (insufficient rights)');
+        }
+        if (result.errorCode === 'policy_violation') {
+          throw app.httpErrors.conflict('a group with that name already exists at that location');
+        }
+        throw app.httpErrors.badGateway(`create failed: ${result.errorCode ?? 'unknown'}`);
+      }
+
+      const group = result.group;
+      if (!group) throw app.httpErrors.badGateway('provider returned no group after create');
+
+      // Seed the cache so the group shows up right away.
+      await upsertGroup(app.db, provider.id, group).catch(() => undefined);
+
+      return {
+        ok: true,
+        id: group.objectGuid,
+        distinguishedName: group.distinguishedName,
+        samAccountName: group.samAccountName ?? body.samAccountName,
+      };
+    },
+  });
+
   app.get('/api/groups/:id', {
     preHandler: app.requireCapability('read:group'),
     handler: async (req): Promise<{ group: GroupDetail }> => {

@@ -13,6 +13,8 @@ import type {
   DeletedUserSearchQuery,
   DeletedUserSearchResponse,
   DirectoryOu,
+  GroupCreateRequest,
+  GroupCreateResponse,
   GroupDetail,
   GroupPolicyDetail,
   GroupPolicyListResponse,
@@ -486,6 +488,12 @@ export const api = {
     },
   },
   groups: {
+    create(body: GroupCreateRequest): Promise<GroupCreateResponse> {
+      return apiFetch('/groups', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
     search(query: Partial<GroupSearchQuery> = {}): Promise<GroupSearchResponse> {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) {

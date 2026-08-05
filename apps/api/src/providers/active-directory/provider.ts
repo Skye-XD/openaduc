@@ -29,6 +29,7 @@ import type {
   SyncInput,
   UserAttributePatch,
   UserCreateInput,
+  GroupCreateInput,
   WriteContext,
 } from '../types.js';
 import { StepUpBindFailedError } from '../types.js';
@@ -1113,6 +1114,74 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
    * is responsible for validating that `parentDn` exists in our cache; we
    * trust it here.
    */
+  /**
+   * Create a group under `input.parentDn`. `scope` + `category` map to the AD
+   * `groupType` bitmask (security groups carry the 0x80000000 bit, which makes
+   * the 32-bit value negative). Same write-as-operator model as the other
+   * writes; reads the entry back so the route gets a real objectGuid.
+   */
+  async createGroup(
+    input: GroupCreateInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult & { group?: DirectoryGroup }> {
+    const cleanName = input.name.trim();
+    const cleanParent = input.parentDn.trim();
+    const sam = input.samAccountName.trim();
+    if (!cleanName || !cleanParent || !sam) {
+      return { ok: false, reason: 'directory_error', errorMessage: 'missing name, parent, or logon name' };
+    }
+    // groupType as the signed 32-bit string AD/LDAP expects.
+    const GROUP_TYPES: Record<string, string> = {
+      'security:global': '-2147483646',
+      'security:domainLocal': '-2147483644',
+      'security:universal': '-2147483640',
+      'distribution:global': '2',
+      'distribution:domainLocal': '4',
+      'distribution:universal': '8',
+    };
+    const groupType = GROUP_TYPES[`${input.category}:${input.scope}`] ?? '-2147483646';
+    const newDn = `CN=${escapeRdnValue(cleanName)},${cleanParent}`;
+
+    return withFailover(this.clientConfig, async (client) => {
+      try {
+        await client.bind(ctx.actorUsername, ctx.actorPassword);
+      } catch {
+        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
+      }
+      try {
+        const attrs: Record<string, string | string[]> = {
+          objectClass: ['top', 'group'],
+          cn: cleanName,
+          sAMAccountName: sam,
+          groupType,
+        };
+        if (input.description && input.description.trim()) {
+          attrs.description = input.description.trim();
+        }
+        await client.add(newDn, attrs);
+
+        const entry = await this.findGroupEntry(client, { kind: 'samAccountName', value: sam });
+        const group = entry ? normalizeGroup(entry) : undefined;
+        return {
+          ok: true,
+          after: { distinguishedName: group?.distinguishedName ?? newDn, samAccountName: sam },
+          ...(group ? { group } : {}),
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'add failed';
+        const isExists = /already exists|entryAlreadyExists/i.test(message);
+        const isAuthz = /no write|insuff|access/i.test(message);
+        return {
+          ok: false,
+          reason: isExists ? 'policy_violation' : isAuthz ? 'permission_denied' : 'directory_error',
+          errorMessage: message,
+        };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
   async createOu(
     parentDn: string,
     name: string,

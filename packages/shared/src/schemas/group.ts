@@ -58,3 +58,40 @@ export const groupDetailSchema = groupSummarySchema.extend({
   }),
 });
 export type GroupDetail = z.infer<typeof groupDetailSchema>;
+
+// ---- Create group --------------------------------------------------------
+export const groupCreateRequestSchema = z.object({
+  // Target OU DN; validated against the cached directory_ous table server-side.
+  parentDn: z.string().min(1).max(1024),
+  // The group's name (CN / RDN). Reject DN-reserved characters.
+  name: z
+    .string()
+    .trim()
+    .min(1, 'name is required')
+    .max(64, 'name is too long')
+    .regex(/^[^,=+<>#;\\"]+$/, 'name contains a reserved character'),
+  // sAMAccountName — no whitespace or AD-reserved characters.
+  samAccountName: z
+    .string()
+    .trim()
+    .min(1, 'logon name is required')
+    .max(64, 'logon name is too long')
+    .regex(/^[^\s"[\]:;|=+*?<>/\\,]+$/, 'logon name contains a reserved character'),
+  description: z
+    .string()
+    .trim()
+    .max(1024)
+    .optional()
+    .or(z.literal('').transform(() => undefined)),
+  scope: z.enum(['global', 'domainLocal', 'universal']).default('global'),
+  category: z.enum(['security', 'distribution']).default('security'),
+});
+export type GroupCreateRequest = z.infer<typeof groupCreateRequestSchema>;
+
+export const groupCreateResponseSchema = z.object({
+  ok: z.boolean(),
+  id: z.string(),
+  distinguishedName: z.string(),
+  samAccountName: z.string(),
+});
+export type GroupCreateResponse = z.infer<typeof groupCreateResponseSchema>;
