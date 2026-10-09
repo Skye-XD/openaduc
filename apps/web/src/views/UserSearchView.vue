@@ -747,6 +747,11 @@ onMounted(() => {
           <span class="cell-muted">{{ data.title ?? '—' }}</span>
         </template>
       </Column>
+      <Column field="mobile" header="Mobile" sortable :style="{ width: '150px' }">
+        <template #body="{ data }">
+          <span class="cell-muted">{{ data.mobile ?? '—' }}</span>
+        </template>
+      </Column>
       <Column header="Last logon" field="lastLogonAt" sortable :style="{ width: '140px' }">
         <template #body="{ data }">
           <span class="cell-mono">{{

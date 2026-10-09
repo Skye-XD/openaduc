@@ -22,6 +22,7 @@ export const userSummarySchema = z.object({
   email: z.string().nullable(),
   department: z.string().nullable(),
   title: z.string().nullable(),
+  mobile: z.string().nullable(),
   enabled: z.boolean(),
   locked: z.boolean(),
   passwordNeverExpires: z.boolean(),

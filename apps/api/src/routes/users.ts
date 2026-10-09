@@ -485,6 +485,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
           email: r.email,
           department: r.department,
           title: r.title,
+          mobile: r.mobile,
           enabled: r.enabled,
           locked: r.locked,
           passwordNeverExpires: r.password_never_expires,
