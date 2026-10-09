@@ -436,6 +436,21 @@ export const api = {
         body: JSON.stringify(body),
       });
     },
+    setPasswordNeverExpires(
+      id: string,
+      neverExpires: boolean,
+    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/password-never-expires`, {
+        method: 'POST',
+        body: JSON.stringify({ neverExpires }),
+      });
+    },
+    expirePassword(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/expire-password`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    },
     addGroup(id: string, body: { groupId: string }): Promise<{ ok: boolean }> {
       return apiFetch(`/users/${encodeURIComponent(id)}/groups`, {
         method: 'POST',

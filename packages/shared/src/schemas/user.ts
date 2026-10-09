@@ -260,8 +260,23 @@ export const confirmPasswordSchema = z.object({}).strict();
 export const resetPasswordRequestSchema = z.object({
   newPassword: z.string().min(8).max(1024),
   forceChangeAtNextLogin: z.boolean().default(true),
+  // Optionally set the "password never expires" flag as part of the reset.
+  // Omitted → leave the flag untouched (legacy callers). Mutually exclusive
+  // with forceChangeAtNextLogin (AD can't do both) — when true, the server
+  // ignores the force-change request.
+  passwordNeverExpires: z.boolean().optional(),
 });
 export type ResetPasswordRequest = z.infer<typeof resetPasswordRequestSchema>;
+
+// Toggle the per-user DONT_EXPIRE_PASSWORD flag (userAccountControl bit
+// 0x10000). `true` makes the password never expire regardless of domain
+// policy; `false` puts it back under the normal max-password-age policy.
+// "Expire now (must change at next logon)" takes no body — it just sets
+// pwdLastSet=0 — so it needs no request schema here.
+export const passwordNeverExpiresRequestSchema = z.object({
+  neverExpires: z.boolean(),
+});
+export type PasswordNeverExpiresRequest = z.infer<typeof passwordNeverExpiresRequestSchema>;
 
 export const groupMembershipChangeSchema = z.object({
   groupId: z.string().uuid(),

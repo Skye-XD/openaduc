@@ -612,13 +612,45 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
             }),
           }),
         ];
-        if (input.forceChangeAtNextLogin) {
+        // "Must change at next logon" (pwdLastSet=0) and "never expires" are
+        // mutually exclusive in AD; never-expires wins, matching ADUC (which
+        // greys out force-change when never-expires is ticked).
+        const neverExpires = input.passwordNeverExpires === true;
+        if (input.forceChangeAtNextLogin && !neverExpires) {
           changes.push(
             new Change({
               operation: 'replace',
               modification: new Attribute({ type: 'pwdLastSet', values: ['0'] }),
             }),
           );
+        }
+
+        // Optionally set/clear DONT_EXPIRE_PASSWORD in the same modify. Read
+        // the live UAC first so other flags are preserved (same shape as
+        // toggleAccountDisable / setPasswordNeverExpires).
+        if (input.passwordNeverExpires !== undefined) {
+          const currentUacRaw = (target as { userAccountControl?: string | string[] })
+            .userAccountControl;
+          const currentUac = Array.isArray(currentUacRaw)
+            ? currentUacRaw[currentUacRaw.length - 1]
+            : currentUacRaw;
+          const uacNum = currentUac ? Number.parseInt(String(currentUac), 10) : 0;
+          if (Number.isFinite(uacNum)) {
+            const nextUac = neverExpires
+              ? uacNum | UAC.DONT_EXPIRE_PASSWORD
+              : uacNum & ~UAC.DONT_EXPIRE_PASSWORD;
+            if (nextUac !== uacNum) {
+              changes.push(
+                new Change({
+                  operation: 'replace',
+                  modification: new Attribute({
+                    type: 'userAccountControl',
+                    values: [String(nextUac)],
+                  }),
+                }),
+              );
+            }
+          }
         }
 
         await client.modify(before.distinguishedName, changes);
@@ -631,10 +663,12 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
           // audit row carries the "what" without the "how".
           before: {
             passwordLastSetAt: before.passwordLastSetAt?.toISOString() ?? null,
+            passwordNeverExpires: before.passwordNeverExpires,
           },
           after: {
             passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null,
-            forceChangeAtNextLogin: input.forceChangeAtNextLogin,
+            forceChangeAtNextLogin: input.forceChangeAtNextLogin && !neverExpires,
+            passwordNeverExpires: after?.passwordNeverExpires ?? neverExpires,
           },
         };
       } catch (err) {
@@ -736,6 +770,150 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
       }
     });
   }
+
+  /**
+   * Flip the DONT_EXPIRE_PASSWORD bit (0x10000) of `userAccountControl`.
+   * Reads the current UAC from the live entry first so the other flags
+   * (ACCOUNTDISABLE, etc.) are preserved — same read-modify-write shape as
+   * `toggleAccountDisable`. This is the only per-user control over password
+   * expiry: when set, the account's password ignores the domain max-age policy.
+   */
+  async setPasswordNeverExpires(
+    userId: DirectoryObjectIdentifier,
+    neverExpires: boolean,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return withFailover(this.clientConfig, async (client) => {
+      try {
+        await client.bind(ctx.actorUsername, ctx.actorPassword);
+      } catch {
+        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
+      }
+      try {
+        const target = await this.findUserEntry(client, userId);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
+        const before = normalizeUser(target);
+        const currentUacRaw = (target as { userAccountControl?: string | string[] })
+          .userAccountControl;
+        const currentUac = Array.isArray(currentUacRaw)
+          ? currentUacRaw[currentUacRaw.length - 1]
+          : currentUacRaw;
+        const uacNum = currentUac ? Number.parseInt(String(currentUac), 10) : 0;
+        if (!Number.isFinite(uacNum)) {
+          return {
+            ok: false,
+            reason: 'directory_error',
+            errorMessage: 'unparseable userAccountControl',
+          };
+        }
+        const nextUac = neverExpires
+          ? uacNum | UAC.DONT_EXPIRE_PASSWORD
+          : uacNum & ~UAC.DONT_EXPIRE_PASSWORD;
+        if (nextUac === uacNum) {
+          // Idempotent no-op.
+          return {
+            ok: true,
+            before: { passwordNeverExpires: before.passwordNeverExpires },
+            after: { passwordNeverExpires: neverExpires },
+          };
+        }
+
+        await client.modify(
+          before.distinguishedName,
+          new Change({
+            operation: 'replace',
+            modification: new Attribute({
+              type: 'userAccountControl',
+              values: [String(nextUac)],
+            }),
+          }),
+        );
+
+        const afterEntry = await this.findUserEntry(client, userId);
+        const after = afterEntry ? normalizeUser(afterEntry) : null;
+        return {
+          ok: true,
+          before: { passwordNeverExpires: before.passwordNeverExpires },
+          after: { passwordNeverExpires: after?.passwordNeverExpires ?? neverExpires },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'modify failed';
+        const isAuthz = /no write|insuff/i.test(message);
+        return {
+          ok: false,
+          reason: isAuthz ? 'permission_denied' : 'directory_error',
+          errorMessage: message,
+        };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * Expire the password immediately by setting `pwdLastSet=0`. AD reads that
+   * as "password expired — user must change it at next sign-in". (Same effect
+   * as the Reset Password dialog's "must change at next logon", but standalone
+   * and without setting a new password.) There is no per-user "expires on
+   * date" in AD, so this is the closest thing to forcing expiry now.
+   */
+  async expirePasswordNow(
+    userId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return withFailover(this.clientConfig, async (client) => {
+      try {
+        await client.bind(ctx.actorUsername, ctx.actorPassword);
+      } catch {
+        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
+      }
+      try {
+        const target = await this.findUserEntry(client, userId);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
+        const before = normalizeUser(target);
+        // A password that never expires can't be "expired now" in a meaningful
+        // way — AD would just set pwdLastSet=0, but the flag still wins. Surface
+        // that as a policy error so the UI can tell the operator why.
+        if (before.passwordNeverExpires) {
+          return {
+            ok: false,
+            reason: 'policy_violation',
+            errorMessage: 'password is set to never expire; clear that flag first',
+          };
+        }
+
+        await client.modify(
+          before.distinguishedName,
+          new Change({
+            operation: 'replace',
+            modification: new Attribute({ type: 'pwdLastSet', values: ['0'] }),
+          }),
+        );
+
+        const afterEntry = await this.findUserEntry(client, userId);
+        const after = afterEntry ? normalizeUser(afterEntry) : null;
+        return {
+          ok: true,
+          before: { passwordLastSetAt: before.passwordLastSetAt?.toISOString() ?? null },
+          after: {
+            passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null,
+            forceChangeAtNextLogin: true,
+          },
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : 'modify failed';
+        const isAuthz = /no write|insuff/i.test(message);
+        return {
+          ok: false,
+          reason: isAuthz ? 'permission_denied' : 'directory_error',
+          errorMessage: message,
+        };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
   /**
    * Replace a small allowlist of mutable user attributes. Follows the same
    * write-as-user model as `unlockUser`: bind as the operator, resolve the

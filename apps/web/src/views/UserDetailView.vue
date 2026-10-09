@@ -695,14 +695,38 @@ async function doToggleEnabled(disable: boolean): Promise<void> {
 // ---- Reset password dialog ------------------------------------------------
 
 const resetDialogOpen = ref(false);
-const resetDraft = ref({ newPassword: '', forceChangeAtNextLogin: true });
+const resetDraft = ref({
+  newPassword: '',
+  forceChangeAtNextLogin: true,
+  passwordNeverExpires: false,
+});
 const resetSubmitting = ref(false);
 const resetError = ref<string | null>(null);
 
 function openResetDialog(): void {
-  resetDraft.value = { newPassword: '', forceChangeAtNextLogin: true };
+  // Both options start unchecked. An unticked "never expires" leaves the flag
+  // as-is (see onResetSubmit) rather than clearing it, so a routine password
+  // reset never silently changes an account's expiry policy.
+  resetDraft.value = {
+    newPassword: '',
+    forceChangeAtNextLogin: false,
+    passwordNeverExpires: false,
+  };
   resetError.value = null;
   resetDialogOpen.value = true;
+}
+
+// "Never expires" and "force change at next sign-in" can't both apply (AD
+// rule), so checking either one clears the other — both directions.
+function onResetNeverExpiresToggle(): void {
+  if (resetDraft.value.passwordNeverExpires) {
+    resetDraft.value.forceChangeAtNextLogin = false;
+  }
+}
+function onResetForceChangeToggle(): void {
+  if (resetDraft.value.forceChangeAtNextLogin) {
+    resetDraft.value.passwordNeverExpires = false;
+  }
 }
 
 async function onResetSubmit(): Promise<void> {
@@ -717,6 +741,9 @@ async function onResetSubmit(): Promise<void> {
     await api.users.resetPassword(user.value.id, {
       newPassword: resetDraft.value.newPassword,
       forceChangeAtNextLogin: resetDraft.value.forceChangeAtNextLogin,
+      // Only send the flag when the operator ticked it; an unticked box means
+      // "leave expiry policy alone", not "clear never-expires".
+      ...(resetDraft.value.passwordNeverExpires ? { passwordNeverExpires: true } : {}),
     });
     toast.add({
       severity: 'success',
@@ -975,6 +1002,77 @@ async function saveExpiry(): Promise<void> {
   }
 }
 
+// ---- Password expiration --------------------------------------------------
+// AD has no per-user "password expires on <date>" attribute — expiry is domain
+// policy (maxPwdAge) applied to pwdLastSet. The two per-user handles are:
+//   • "Password never expires" flag (DONT_EXPIRE_PASSWORD) — the toggle below.
+//   • "Expire now" → pwdLastSet=0, i.e. must change at next sign-in.
+const pwdExpiryOpen = ref(false);
+const pwdNever = ref(false);
+const pwdSaving = ref(false);
+const pwdExpiringNow = ref(false);
+const pwdExpiryError = ref<string | null>(null);
+
+function openPwdExpiryDialog(): void {
+  pwdNever.value = user.value?.passwordNeverExpires ?? false;
+  pwdExpiryError.value = null;
+  pwdExpiryOpen.value = true;
+}
+
+const pwdNeverDirty = computed(() => pwdNever.value !== (user.value?.passwordNeverExpires ?? false));
+
+async function savePwdNeverExpires(): Promise<void> {
+  if (!user.value || !pwdNeverDirty.value) return;
+  pwdExpiryError.value = null;
+  pwdSaving.value = true;
+  try {
+    await api.users.setPasswordNeverExpires(user.value.id, pwdNever.value);
+    toast.add({
+      severity: 'success',
+      summary: 'Password expiration updated',
+      detail: pwdNever.value
+        ? 'Password set to never expire.'
+        : 'Password now follows the domain expiry policy.',
+      life: 4000,
+    });
+    pwdExpiryOpen.value = false;
+    await load();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = savePwdNeverExpires;
+      return;
+    }
+    pwdExpiryError.value = err instanceof ApiError ? err.message : String(err);
+  } finally {
+    pwdSaving.value = false;
+  }
+}
+
+async function expirePasswordNow(): Promise<void> {
+  if (!user.value) return;
+  pwdExpiryError.value = null;
+  pwdExpiringNow.value = true;
+  try {
+    await api.users.expirePassword(user.value.id);
+    toast.add({
+      severity: 'success',
+      summary: 'Password expired',
+      detail: 'The user must change their password at next sign-in.',
+      life: 4000,
+    });
+    pwdExpiryOpen.value = false;
+    await load();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = expirePasswordNow;
+      return;
+    }
+    pwdExpiryError.value = err instanceof ApiError ? err.message : String(err);
+  } finally {
+    pwdExpiringNow.value = false;
+  }
+}
+
 async function confirmDelete(): Promise<void> {
   if (!user.value || deleting.value) return;
   deleting.value = true;
@@ -1174,6 +1272,11 @@ const actionItems = computed<MenuItem[]>(() => {
       label: 'Set account expiration…',
       icon: 'pi pi-calendar',
       command: () => auth.requireEdit(openExpiryDialog),
+    });
+    items.push({
+      label: 'Password expiration…',
+      icon: 'pi pi-clock',
+      command: () => auth.requireEdit(openPwdExpiryDialog),
     });
   }
 
@@ -2255,8 +2358,18 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
             v-model="resetDraft.forceChangeAtNextLogin"
             type="checkbox"
             :disabled="resetSubmitting"
+            @change="onResetForceChangeToggle"
           />
           <span>Force change at next sign-in</span>
+        </label>
+        <label class="check-row">
+          <input
+            v-model="resetDraft.passwordNeverExpires"
+            type="checkbox"
+            :disabled="resetSubmitting"
+            @change="onResetNeverExpiresToggle"
+          />
+          <span>Password never expires</span>
         </label>
         <Message v-if="resetError" severity="error" :closable="false">{{ resetError }}</Message>
       </div>
@@ -2459,6 +2572,80 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
           :loading="expirySaving"
           :disabled="!expiryNever && !expiryDate"
           @click="saveExpiry"
+        />
+      </template>
+    </Dialog>
+
+    <!-- Password expiration: never-expires flag + "expire now". AD has no
+         per-user password-expiry date, so there's no date picker here. -->
+    <Dialog
+      :visible="pwdExpiryOpen"
+      modal
+      header="Password expiration"
+      :style="{ width: '27rem' }"
+      :closable="!pwdSaving && !pwdExpiringNow"
+      @update:visible="(v) => !v && (pwdExpiryOpen = false)"
+    >
+      <div style="display: flex; flex-direction: column; gap: 14px">
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
+          <Checkbox v-model="pwdNever" binary :disabled="pwdSaving" />
+          Password never expires
+        </label>
+        <div style="font-size: 12px; color: var(--text-3)">
+          Currently expires:
+          <strong style="color: var(--text-2)">{{
+            user?.passwordNeverExpires
+              ? 'never'
+              : user?.passwordExpiresAt
+                ? fmtAbsolute(user.passwordExpiresAt)
+                : 'per domain policy'
+          }}</strong>
+        </div>
+
+        <div
+          v-if="canResetPassword"
+          style="
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            border-top: 1px solid var(--border-1);
+            padding-top: 12px;
+          "
+        >
+          <span style="font-size: 12px; color: var(--text-3)">
+            Expire the password now — the user must set a new one at next sign-in.
+          </span>
+          <Button
+            label="Expire now"
+            icon="pi pi-clock"
+            severity="warn"
+            outlined
+            size="small"
+            :loading="pwdExpiringNow"
+            :disabled="pwdNever || pwdSaving"
+            style="align-self: flex-start"
+            @click="expirePasswordNow"
+          />
+        </div>
+
+        <Message v-if="pwdExpiryError" severity="error" :closable="false">{{
+          pwdExpiryError
+        }}</Message>
+      </div>
+      <template #footer>
+        <Button
+          label="Cancel"
+          text
+          severity="secondary"
+          :disabled="pwdSaving || pwdExpiringNow"
+          @click="pwdExpiryOpen = false"
+        />
+        <Button
+          label="Save"
+          icon="pi pi-check"
+          :loading="pwdSaving"
+          :disabled="!pwdNeverDirty || pwdExpiringNow"
+          @click="savePwdNeverExpires"
         />
       </template>
     </Dialog>

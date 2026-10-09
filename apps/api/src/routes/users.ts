@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { sql } from 'kysely';
 import {
   groupMembershipChangeSchema,
+  passwordNeverExpiresRequestSchema,
   resetPasswordRequestSchema,
   userCreateRequestSchema,
   userDetailSchema,
@@ -1050,7 +1051,10 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
           targetType: 'user',
           targetId: beforeRefresh.user.objectGuid,
           targetDn: beforeRefresh.user.distinguishedName,
-          metadata: { forceChangeAtNextLogin: body.forceChangeAtNextLogin },
+          metadata: {
+            forceChangeAtNextLogin: body.forceChangeAtNextLogin,
+            passwordNeverExpires: body.passwordNeverExpires,
+          },
         },
         async () => {
           const r = await provider.resetPassword(
@@ -1058,6 +1062,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
             {
               newPassword: body.newPassword,
               forceChangeAtNextLogin: body.forceChangeAtNextLogin,
+              passwordNeverExpires: body.passwordNeverExpires,
             },
             ctx(actor, req),
           );
@@ -1084,6 +1089,117 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
 
       await app.services.userLiveRefresh.refresh(provider, id);
       return { ok: true };
+    },
+  });
+
+  // ---- POST /api/users/:id/password-never-expires ----------------------
+  // Body: { neverExpires: boolean }. Flips the per-user DONT_EXPIRE_PASSWORD
+  // flag. This is the only per-user handle on password expiry (the expiry
+  // date itself is domain policy), so it lives under write:user.attributes.
+  app.post('/api/users/:id/password-never-expires', {
+    preHandler: [app.requireCapability('write:user.attributes'), app.requireStepUp],
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const { neverExpires } = passwordNeverExpiresRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
+      if (!beforeRefresh) throw NotFound('user not found');
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.password.neverExpires',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetId: beforeRefresh.user.objectGuid,
+          targetDn: beforeRefresh.user.distinguishedName,
+          metadata: { neverExpires },
+        },
+        async () => {
+          const r = await provider.setPasswordNeverExpires(
+            { kind: 'objectGuid', value: id },
+            neverExpires,
+            ctx(actor, req),
+          );
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden('directory rejected the change');
+        }
+        throw app.httpErrors.badGateway(
+          `set password-never-expires failed: ${result.errorCode ?? 'unknown'}`,
+        );
+      }
+      await app.services.userLiveRefresh.refresh(provider, id);
+      return { ok: true, before: result.before, after: result.after };
+    },
+  });
+
+  // ---- POST /api/users/:id/expire-password -----------------------------
+  // No body. Sets pwdLastSet=0 → "must change password at next logon".
+  // Password lifecycle, so gated by write:user.resetPassword.
+  app.post('/api/users/:id/expire-password', {
+    preHandler: [app.requireCapability('write:user.resetPassword'), app.requireStepUp],
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
+      if (!beforeRefresh) throw NotFound('user not found');
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.password.expire',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetId: beforeRefresh.user.objectGuid,
+          targetDn: beforeRefresh.user.distinguishedName,
+        },
+        async () => {
+          const r = await provider.expirePasswordNow(
+            { kind: 'objectGuid', value: id },
+            ctx(actor, req),
+          );
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden('directory rejected the change');
+        }
+        if (result.errorCode === 'policy_violation') {
+          throw app.httpErrors.badRequest(
+            'password is set to never expire; turn that off before expiring it',
+          );
+        }
+        throw app.httpErrors.badGateway(`expire password failed: ${result.errorCode ?? 'unknown'}`);
+      }
+      await app.services.userLiveRefresh.refresh(provider, id);
+      return { ok: true, before: result.before, after: result.after };
     },
   });
 

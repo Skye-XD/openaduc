@@ -320,6 +320,10 @@ export interface UserAttributePatch {
 export interface ResetPasswordInput {
   newPassword: string;
   forceChangeAtNextLogin: boolean;
+  // When set, also flip the DONT_EXPIRE_PASSWORD flag in the same operation.
+  // undefined leaves the flag untouched; true/false sets/clears it. true wins
+  // over forceChangeAtNextLogin (the two are mutually exclusive in AD).
+  passwordNeverExpires?: boolean | undefined;
 }
 
 // Input for provisioning a new account. The account is created disabled with
@@ -427,6 +431,14 @@ export interface DirectoryProvider {
   ): Promise<MutationResult>;
   enableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
   disableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
+  // Flip the per-user "password never expires" flag (DONT_EXPIRE_PASSWORD).
+  setPasswordNeverExpires(
+    userId: DirectoryObjectIdentifier,
+    neverExpires: boolean,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  // Expire the password immediately (pwdLastSet=0 → must change at next logon).
+  expirePasswordNow(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
   updateUserAttributes(
     userId: DirectoryObjectIdentifier,
     patch: UserAttributePatch,
