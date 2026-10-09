@@ -308,7 +308,9 @@ export interface UserAttributePatch {
   st?: string | null | undefined;
   postalCode?: string | null | undefined;
   managerDn?: string | null | undefined;
-  accountExpiresAt?: Date | null | undefined;
+  // Date or ISO string sets the expiry; null clears it (never expires). The
+  // AD provider converts to an `accountExpires` FILETIME.
+  accountExpiresAt?: Date | string | null | undefined;
   // Multi-valued attributes — null or empty array clears, non-empty replaces.
   otherMailbox?: string[] | null | undefined;
   otherHomePhone?: string[] | null | undefined;

@@ -4,6 +4,8 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { onBeforeRouteLeave, useRouter } from 'vue-router';
 import Button from 'primevue/button';
 import Password from 'primevue/password';
+import DatePicker from 'primevue/datepicker';
+import Checkbox from 'primevue/checkbox';
 import Dialog from 'primevue/dialog';
 import InputText from 'primevue/inputtext';
 import Menu from 'primevue/menu';
@@ -389,7 +391,15 @@ function arraysEqual(a: string[], b: string[]): boolean {
   return true;
 }
 
+// Per-user edit engagement. Global edit mode (the elevation timer) only means
+// "you *may* edit" — the attribute fields on a given user's page go editable
+// only after the operator engages via the ⋯ → "Edit details" action. That way
+// an open timer doesn't silently treat every user page as being edited.
+const editingUser = ref(false);
+const editActive = computed(() => auth.editMode && editingUser.value);
+
 function resetForm(): void {
+  editingUser.value = false;
   if (!user.value) return;
   for (const f of SCALAR_FIELDS) {
     form[f.key] = user.value[f.key] ?? '';
@@ -603,6 +613,18 @@ async function saveAttributes(): Promise<void> {
 
 function discardAttributes(): void {
   resetForm();
+}
+
+// Exit editing for this user (from the Cancel button). Reverts any pending
+// edits and drops out of edit mode; a toast confirms what happened.
+function cancelEditing(): void {
+  const hadChanges = isDirty.value;
+  resetForm(); // reverts fields and sets editingUser = false
+  toast.add({
+    severity: 'info',
+    summary: hadChanges ? 'Changes discarded' : 'Stopped editing',
+    life: 2500,
+  });
 }
 
 // ---- Hero actions (unlock / enable / disable) ----------------------------
@@ -897,8 +919,60 @@ function openDeleteDialog(): void {
 // attribute grid lives) and elevates via requireEdit; that flips editMode on,
 // turning the fields into inputs and revealing the Save bar.
 function startEditDetails(): void {
-  activeTab.value = 'organization';
-  auth.requireEdit(() => {});
+  // Elevate if needed, then engage editing for THIS user and jump to the
+  // attribute grid. Editing stays off until this runs.
+  auth.requireEdit(() => {
+    editingUser.value = true;
+    activeTab.value = 'organization';
+  });
+}
+
+// ---- Account expiration ---------------------------------------------------
+const expiryOpen = ref(false);
+const expiryNever = ref(true);
+const expiryDate = ref<Date | null>(null);
+const expirySaving = ref(false);
+const expiryError = ref<string | null>(null);
+
+function openExpiryDialog(): void {
+  const cur = user.value?.accountExpiresAt ?? null;
+  expiryNever.value = !cur;
+  expiryDate.value = cur ? new Date(cur) : null;
+  expiryError.value = null;
+  expiryOpen.value = true;
+}
+
+async function saveExpiry(): Promise<void> {
+  if (!user.value) return;
+  if (!expiryNever.value && !expiryDate.value) {
+    expiryError.value = 'Pick a date, or choose “Never expires”.';
+    return;
+  }
+  expiryError.value = null;
+  expirySaving.value = true;
+  try {
+    await api.users.update(user.value.id, {
+      patch: { accountExpiresAt: expiryNever.value ? null : expiryDate.value!.toISOString() },
+    });
+    toast.add({
+      severity: 'success',
+      summary: 'Account expiration updated',
+      detail: expiryNever.value
+        ? 'Set to never expire.'
+        : `Expires ${fmtAbsolute(expiryDate.value!.toISOString())}.`,
+      life: 4000,
+    });
+    expiryOpen.value = false;
+    await load();
+  } catch (err) {
+    if (err instanceof ApiError && err.code === 'step_up_required') {
+      auth.stepUpPendingAction = saveExpiry;
+      return;
+    }
+    expiryError.value = err instanceof ApiError ? err.message : String(err);
+  } finally {
+    expirySaving.value = false;
+  }
 }
 
 async function confirmDelete(): Promise<void> {
@@ -1089,10 +1163,17 @@ const actionItems = computed<MenuItem[]>(() => {
   const busy = actionRunning.value !== null;
 
   if (canEdit.value) {
+    if (!editingUser.value) {
+      items.push({
+        label: 'Edit details…',
+        icon: 'pi pi-pencil',
+        command: startEditDetails,
+      });
+    }
     items.push({
-      label: 'Edit details…',
-      icon: 'pi pi-pencil',
-      command: startEditDetails,
+      label: 'Set account expiration…',
+      icon: 'pi pi-calendar',
+      command: () => auth.requireEdit(openExpiryDialog),
     });
   }
 
@@ -1615,7 +1696,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 ></span>
               </div>
               <Textarea
-                v-if="auth.editMode && canEdit && f.multiline"
+                v-if="editActive && canEdit && f.multiline"
                 v-model="form[f.key]"
                 :placeholder="f.label"
                 :disabled="saving"
@@ -1624,7 +1705,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 :class="['attr-input', { mono: f.mono }]"
               />
               <InputText
-                v-else-if="auth.editMode && canEdit"
+                v-else-if="editActive && canEdit"
                 v-model="form[f.key]"
                 :type="f.type ?? 'text'"
                 :class="['attr-input', { mono: f.mono }]"
@@ -1703,7 +1784,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 ></span>
               </div>
               <Textarea
-                v-if="auth.editMode && canEdit && f.multiline"
+                v-if="editActive && canEdit && f.multiline"
                 v-model="form[f.key]"
                 :placeholder="f.label"
                 :disabled="saving"
@@ -1712,7 +1793,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 :class="['attr-input', { mono: f.mono }]"
               />
               <InputText
-                v-else-if="auth.editMode && canEdit"
+                v-else-if="editActive && canEdit"
                 v-model="form[f.key]"
                 :type="f.type ?? 'text'"
                 :class="['attr-input', { mono: f.mono }]"
@@ -1750,7 +1831,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 ></span>
               </div>
               <Textarea
-                v-if="auth.editMode && canEdit"
+                v-if="editActive && canEdit"
                 v-model="form[f.key]"
                 :placeholder="f.placeholder"
                 :disabled="saving"
@@ -2095,31 +2176,35 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
            the viewport while scrolling so it's always reachable on tall
            attribute lists. -->
       <transition name="save-bar">
-        <div v-if="auth.editMode && canEdit && isDirty" class="save-bar save-bar-floating">
+        <div v-if="editActive && canEdit" class="save-bar save-bar-floating">
           <span class="save-bar-summary">
             <i class="pi pi-pencil" />
-            <strong>{{ dirtyFields.length }}</strong>
-            unsaved change{{ dirtyFields.length === 1 ? '' : 's' }}
+            <template v-if="isDirty">
+              Editing · <strong>{{ dirtyFields.length }}</strong>
+              unsaved change{{ dirtyFields.length === 1 ? '' : 's' }}
+            </template>
+            <template v-else>Editing · no changes yet</template>
           </span>
-          <span class="save-bar-fields">
+          <span v-if="isDirty" class="save-bar-fields">
             <span v-for="d in dirtyFields" :key="d.key" class="dirty-chip">
               {{ d.key }}
             </span>
           </span>
           <span class="save-bar-actions">
             <Button
-              label="Discard"
+              label="Cancel"
               text
               severity="secondary"
               size="small"
               :disabled="saving"
-              @click="discardAttributes"
+              @click="cancelEditing"
             />
             <Button
               label="Save changes"
               icon="pi pi-check"
               size="small"
               :loading="saving"
+              :disabled="!isDirty"
               @click="saveAttributes"
             />
           </span>
@@ -2330,6 +2415,53 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
       @cancel="deleteConfirmOpen = false"
       @confirm="confirmDelete"
     />
+
+    <!-- Set account expiration -->
+    <Dialog
+      :visible="expiryOpen"
+      modal
+      header="Account expiration"
+      :style="{ width: '26rem' }"
+      :closable="!expirySaving"
+      @update:visible="(v) => !v && (expiryOpen = false)"
+    >
+      <div style="display: flex; flex-direction: column; gap: 12px">
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
+          <Checkbox v-model="expiryNever" binary />
+          Never expires
+        </label>
+        <div style="display: flex; flex-direction: column; gap: 4px">
+          <span style="font-size: 12px; color: var(--text-3)">Expires on</span>
+          <DatePicker
+            v-model="expiryDate"
+            :disabled="expiryNever"
+            show-time
+            hour-format="24"
+            show-icon
+            date-format="yy-mm-dd"
+            placeholder="Select a date"
+            fluid
+          />
+        </div>
+        <Message v-if="expiryError" severity="error" :closable="false">{{ expiryError }}</Message>
+      </div>
+      <template #footer>
+        <Button
+          label="Cancel"
+          text
+          severity="secondary"
+          :disabled="expirySaving"
+          @click="expiryOpen = false"
+        />
+        <Button
+          label="Save"
+          icon="pi pi-check"
+          :loading="expirySaving"
+          :disabled="!expiryNever && !expiryDate"
+          @click="saveExpiry"
+        />
+      </template>
+    </Dialog>
 
     <SignInEventDetailDialog
       v-if="auth.actor?.directoryId"

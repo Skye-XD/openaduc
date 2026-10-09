@@ -366,6 +366,9 @@ export const userUpdateRequestSchema = z.object({
       l: editableStringField.optional(),
       st: editableStringField.optional(),
       postalCode: editableStringField.optional(),
+      // Account expiration: an ISO datetime sets the expiry; null clears it
+      // (never expires). Omit to leave unchanged.
+      accountExpiresAt: z.string().datetime({ offset: true }).nullable().optional(),
       otherMailbox: editableArrayField.optional(),
       otherHomePhone: editableArrayField.optional(),
       otherMobile: editableArrayField.optional(),

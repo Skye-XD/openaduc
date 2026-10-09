@@ -2239,9 +2239,31 @@ function buildAttributeChanges(patch: UserAttributePatch): Change[] {
       );
     }
   }
-  // managerDn / accountExpiresAt are typed on UserAttributePatch but not in the
-  // MVP edit allowlist — they need extra validation (cycle check for manager;
-  // FILETIME conversion for account expiry). Excluded here intentionally.
+  // Account expiration. `null` clears it (never expires); a Date/ISO string is
+  // converted to an AD `accountExpires` FILETIME (100-ns ticks since 1601 UTC),
+  // which needs BigInt to stay exact. `0` reads back as "never".
+  if ('accountExpiresAt' in patch) {
+    const v = patch.accountExpiresAt;
+    let filetime: string | null = null;
+    if (v === null) {
+      filetime = '0';
+    } else if (v !== undefined) {
+      const d = v instanceof Date ? v : new Date(v);
+      if (!Number.isNaN(d.getTime())) {
+        filetime = ((BigInt(d.getTime()) + 11644473600000n) * 10000n).toString();
+      }
+    }
+    if (filetime !== null) {
+      changes.push(
+        new Change({
+          operation: 'replace',
+          modification: new Attribute({ type: 'accountExpires', values: [filetime] }),
+        }),
+      );
+    }
+  }
+  // managerDn is typed on UserAttributePatch but not yet handled here — it
+  // needs a cycle check before write. Excluded intentionally.
   return changes;
 }
 
