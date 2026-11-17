@@ -3,6 +3,8 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { sql, type RawBuilder, type Selectable } from 'kysely';
 import {
   accountExpiryRequestSchema,
+  passwordMustChangeRequestSchema,
+  passwordNeverExpiresRequestSchema,
   bulkAccountPreviewRequestSchema,
   bulkAccountPreviewSchema,
   bulkGroupMembershipPreviewRequestSchema,
@@ -57,6 +59,11 @@ import {
   DISABLE_USER,
   ENABLE_USER,
   expireAccountAt,
+  type AccountWrite,
+  CLEAR_PASSWORD_MUST_CHANGE,
+  CLEAR_PASSWORD_NEVER_EXPIRES,
+  REQUIRE_PASSWORD_CHANGE,
+  SET_PASSWORD_NEVER_EXPIRES,
   moveUserTo,
   UNLOCK_USER,
   writeUserAccount,
@@ -985,6 +992,62 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       return { ok: true, before: result.before, after: result.after };
     },
   });
+
+  // ---- POST /api/users/:id/password-never-expires / password-must-change --
+  // The account's own password settings, one user at a time (bulk jobs offer
+  // the same writes). Both are written and audited like the other account writes.
+  const passwordSetting = (
+    path: string,
+    capability: 'write:user.enableDisable' | 'write:user.resetPassword',
+    pick: (body: unknown) => AccountWrite,
+    what: string,
+  ) =>
+    app.post(path, {
+      config: { policy: { capability, stepUp: true, directory: 'caller' } },
+      handler: async (req) => {
+        const { id } = idParamSchema.parse(req.params);
+        const write = pick(req.body);
+        const actor = req.actor!;
+        if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+        const provider = await app.services.providers.buildForRequest(req);
+        const written = await writeUserAccount(
+          app.services,
+          provider,
+          write,
+          id,
+          ctx(actor, req),
+          auditContextFromRequest(req),
+        );
+        if (!written) throw NotFound('user not found');
+        const { result } = written;
+        if (!result.ok) {
+          if (result.errorCode === 'permission_denied') {
+            throw app.httpErrors.forbidden('directory rejected the change');
+          }
+          throw app.httpErrors.badGateway(`${what} failed: ${result.errorCode ?? 'unknown'}`);
+        }
+        return { ok: true, before: result.before, after: result.after };
+      },
+    });
+
+  passwordSetting(
+    '/api/users/:id/password-never-expires',
+    'write:user.enableDisable',
+    (body) =>
+      passwordNeverExpiresRequestSchema.parse(body).neverExpires
+        ? SET_PASSWORD_NEVER_EXPIRES
+        : CLEAR_PASSWORD_NEVER_EXPIRES,
+    'changing password expiry',
+  );
+  passwordSetting(
+    '/api/users/:id/password-must-change',
+    'write:user.resetPassword',
+    (body) =>
+      passwordMustChangeRequestSchema.parse(body).mustChange
+        ? REQUIRE_PASSWORD_CHANGE
+        : CLEAR_PASSWORD_MUST_CHANGE,
+    'changing must-change-password',
+  );
 
   // ---- POST /api/users/:id/reset-password ------------------------------
   app.post('/api/users/:id/reset-password', {

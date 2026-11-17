@@ -57,6 +57,11 @@ import { useMoveDialog } from './_detail/useMoveDialog';
 import { useExpiryDialog } from './_detail/useExpiryDialog';
 import { useConfirm } from '../design/composables/useConfirm.js';
 import { useAccountActions, type AccountAction } from '../design/composables/useAccountActions.js';
+import {
+  passwordSettingFailedSummary,
+  passwordSettingSummary,
+  usePasswordSettings,
+} from '../design/composables/usePasswordSettings.js';
 import { useReassignReports } from '../design/composables/useReassignReports.js';
 import {
   USER_ACTIONS,
@@ -512,6 +517,28 @@ function runOnUser(action: AccountAction): void {
   if (user.value) accountActions.run(action, user.value);
 }
 
+// ---- Password settings (never expires / must change at next sign-in) --------
+
+const passwordSettings = usePasswordSettings<UserDetail>({
+  onDone: async (op, offer) => {
+    toast.add(
+      undoable({ severity: 'success', summary: passwordSettingSummary(op), life: 4000 }, offer),
+    );
+    await load();
+  },
+  onFailed: (failure) => {
+    toast.add({
+      severity: 'error',
+      summary: passwordSettingFailedSummary(failure.op),
+      detail: failure.message,
+      life: 8000,
+    });
+  },
+});
+const passwordSettingRunning = computed(() =>
+  user.value ? passwordSettings.runningOn(user.value.id) !== null : false,
+);
+
 // ---- Reset password dialog ------------------------------------------------
 
 const resetDialogOpen = ref(false);
@@ -842,6 +869,25 @@ const actions = computed<ObjectAction[]>(() => {
       capability: 'write:user.enableDisable',
       disabled: busy,
       run: openExpiryDialog,
+    },
+    {
+      label: u?.passwordNeverExpires ? 'Password expires normally' : 'Password never expires',
+      icon: 'pi-shield',
+      capability: 'write:user.enableDisable',
+      disabled: busy || passwordSettingRunning.value,
+      run: () => u && passwordSettings.run('neverExpires', !u.passwordNeverExpires, u),
+    },
+    {
+      label: u?.passwordMustChange
+        ? 'Don’t require a password change'
+        : 'Require password change at next sign-in',
+      icon: 'pi-replay',
+      capability: 'write:user.resetPassword',
+      // AD ignores "must change" while the password never expires.
+      unavailable:
+        u && u.passwordNeverExpires && !u.passwordMustChange ? 'the password never expires' : null,
+      disabled: busy || passwordSettingRunning.value,
+      run: () => u && passwordSettings.run('mustChange', !u.passwordMustChange, u),
     },
     {
       label: moveSubmitting.value ? 'Moving…' : 'Move to OU…',

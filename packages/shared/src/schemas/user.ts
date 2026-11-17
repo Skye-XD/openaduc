@@ -320,6 +320,14 @@ export const accountExpiryRequestSchema = z
   .strict();
 export type AccountExpiryRequest = z.infer<typeof accountExpiryRequestSchema>;
 
+// The account's own "password never expires" flag (DONT_EXPIRE_PASSWORD).
+export const passwordNeverExpiresRequestSchema = z.object({ neverExpires: z.boolean() }).strict();
+export type PasswordNeverExpiresRequest = z.infer<typeof passwordNeverExpiresRequestSchema>;
+
+// "User must change password at next sign-in" (pwdLastSet = 0), set or cleared.
+export const passwordMustChangeRequestSchema = z.object({ mustChange: z.boolean() }).strict();
+export type PasswordMustChangeRequest = z.infer<typeof passwordMustChangeRequestSchema>;
+
 export const groupMembershipChangeSchema = z.object({
   groupId: z.guid(),
 });

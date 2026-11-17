@@ -10,6 +10,8 @@ import type {
   ClassRoster,
   ClassTapOptions,
   AccountExpiryRequest,
+  PasswordMustChangeRequest,
+  PasswordNeverExpiresRequest,
   AuditBulkSummary,
   BulkAccountPreview,
   BulkAccountPreviewRequest,
@@ -559,6 +561,24 @@ export const api = {
       body: AccountExpiryRequest,
     ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
       return apiFetch(`/users/${encodeURIComponent(id)}/account-expiry`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    setPasswordNeverExpires(
+      id: string,
+      body: PasswordNeverExpiresRequest,
+    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/password-never-expires`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    setPasswordMustChange(
+      id: string,
+      body: PasswordMustChangeRequest,
+    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/password-must-change`, {
         method: 'POST',
         body: JSON.stringify(body),
       });
