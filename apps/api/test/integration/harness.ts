@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: BUSL-1.1
+// Integration-test harness: a real API instance (in-process, driven with
+// Fastify's inject) on its own freshly-migrated database, configured against
+// the dev Samba DC the way the setup wizard does it.
+import { spawnSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { FastifyInstance, HTTPMethods, InjectOptions, LightMyRequestResponse } from 'fastify';
+import { Client as LdapClient } from 'ldapts';
+import pg from 'pg';
+import { inject, vi } from 'vitest';
+import type { BulkJob } from '@openaduc/shared';
+import { TEMPLATE_DB } from './globalSetup.js';
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const dcDir = path.resolve(here, '../../../../dev/samba-dc');
+const ORIGIN = 'http://localhost:5173';
+
+// ---- Directory fixtures (see dev/samba-dc/README.md) -------------------
+
+export const DC = {
+  ldapsUrl: `ldaps://localhost:${process.env.DC_LDAPS_PORT ?? '10636'}`,
+  /** Plain LDAP port; the DC refuses simple binds on it unless StartTLS ran first. */
+  ldapUrl: `ldap://localhost:${process.env.DC_LDAP_PORT ?? '10389'}`,
+  caPath: path.join(dcDir, '.generated', 'ca.pem'),
+  domain: 'openaduc.test',
+  baseDn: 'DC=openaduc,DC=test',
+  password: 'OpenADUC-dev-User1',
+  /** Built-in Administrator, for test setup that changes the directory. */
+  administratorPassword: 'OpenADUC-dev-Admin1',
+  serviceAccount: 'svc-openaduc',
+  groups: {
+    operators: 'CN=OpenADUC Operators,OU=Groups,OU=OpenADUC Test,DC=openaduc,DC=test',
+    auditors: 'CN=OpenADUC Auditors,OU=Groups,OU=OpenADUC Test,DC=openaduc,DC=test',
+  },
+} as const;
+
+/** Put the directory fixtures back (re-lock, re-disable, …). Takes a few seconds. */
+export function reseedDirectory(): void {
+  const r = spawnSync('node', [path.join(dcDir, 'dc.mjs'), 'seed'], { encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(`dc:seed failed:\n${r.stdout}\n${r.stderr}`);
+}
+
+/** Run samba-tool inside the dev DC (e.g. to change domain password policy); returns its output. */
+export function sambaTool(...args: string[]): string {
+  const r = spawnSync('docker', ['exec', 'openaduc-dc-dc-1', 'samba-tool', ...args], {
+    encoding: 'utf8',
+  });
+  if (r.status !== 0) throw new Error(`samba-tool ${args.join(' ')} failed:\n${r.stderr}`);
+  return r.stdout;
+}
+
+/** Read a user straight from the DC as the service account, bypassing the API. */
+export async function readDirectoryUser(
+  samAccountName: string,
+  attributes: string[],
+): Promise<Record<string, unknown> | null> {
+  const client = new LdapClient({ url: DC.ldapsUrl, tlsOptions: { ca: readFileSync(DC.caPath) } });
+  try {
+    await client.bind(`${DC.serviceAccount}@${DC.domain}`, DC.password);
+    const { searchEntries } = await client.search(DC.baseDn, {
+      scope: 'sub',
+      filter: `(&(objectClass=user)(sAMAccountName=${samAccountName}))`,
+      attributes,
+    });
+    return searchEntries[0] ?? null;
+  } finally {
+    await client.unbind();
+  }
+}
+
+/**
+ * Add a user to, or remove them from, a group, as the domain Administrator.
+ * Tests that change memberships must undo them: `reseedDirectory` only adds.
+ */
+export async function setGroupMember(
+  groupDn: string,
+  samAccountName: string,
+  member: boolean,
+): Promise<void> {
+  const client = new LdapClient({ url: DC.ldapsUrl, tlsOptions: { ca: readFileSync(DC.caPath) } });
+  try {
+    await client.bind(`Administrator@${DC.domain}`, DC.administratorPassword);
+    const { searchEntries } = await client.search(DC.baseDn, {
+      scope: 'sub',
+      filter: `(sAMAccountName=${samAccountName})`,
+      attributes: ['distinguishedName'],
+    });
+    const userDn = searchEntries[0]?.dn;
+    if (!userDn) throw new Error(`no such user: ${samAccountName}`);
+    const { Change, Attribute } = await import('ldapts');
+    try {
+      await client.modify(
+        groupDn,
+        new Change({
+          operation: member ? 'add' : 'delete',
+          modification: new Attribute({ type: 'member', values: [userDn] }),
+        }),
+      );
+    } catch (err) {
+      // Already in the requested state.
+      const name = (err as Error).name;
+      if (
+        name !== 'AlreadyExistsError' &&
+        name !== 'NoSuchAttributeError' &&
+        name !== 'UnwillingToPerformError'
+      )
+        throw err;
+    }
+  } finally {
+    await client.unbind();
+  }
+}
+
+/** Run `fn` with an LDAP client bound as the domain Administrator. */
+export async function asAdministrator<T>(fn: (client: LdapClient) => Promise<T>): Promise<T> {
+  const client = new LdapClient({ url: DC.ldapsUrl, tlsOptions: { ca: readFileSync(DC.caPath) } });
+  try {
+    await client.bind(`Administrator@${DC.domain}`, DC.administratorPassword);
+    return await fn(client);
+  } finally {
+    await client.unbind();
+  }
+}
+
+/** Replace one attribute on a user, as the domain Administrator. */
+export async function setUserAttribute(
+  samAccountName: string,
+  attribute: string,
+  values: string[],
+): Promise<void> {
+  const client = new LdapClient({ url: DC.ldapsUrl, tlsOptions: { ca: readFileSync(DC.caPath) } });
+  try {
+    await client.bind(`Administrator@${DC.domain}`, DC.administratorPassword);
+    const { searchEntries } = await client.search(DC.baseDn, {
+      scope: 'sub',
+      filter: `(sAMAccountName=${samAccountName})`,
+      attributes: ['distinguishedName'],
+    });
+    const dn = searchEntries[0]?.dn;
+    if (!dn) throw new Error(`no such user: ${samAccountName}`);
+    const { Change, Attribute } = await import('ldapts');
+    await client.modify(
+      dn,
+      new Change({
+        operation: 'replace',
+        modification: new Attribute({ type: attribute, values }),
+      }),
+    );
+  } finally {
+    await client.unbind();
+  }
+}
+
+// ---- API instance ------------------------------------------------------
+
+export interface TestApi {
+  app: FastifyInstance;
+  directoryId: number | null;
+  /** A browser-like client with its own cookie jar and source address. */
+  client(): TestClient;
+  /**
+   * Stop this instance and build a new one over the same database, as a
+   * restart does: process memory (cached passwords, timers) starts empty.
+   * Existing clients carry on against the new instance.
+   */
+  restart(): Promise<void>;
+  close(): Promise<void>;
+}
+
+let instanceCounter = 0;
+
+/**
+ * Build the API against a fresh database cloned from the migrated template.
+ * Usually called once per test file (beforeAll); call it again for a
+ * second, independent instance (e.g. to run setup twice).
+ */
+export async function startApi(options: { env?: Record<string, string> } = {}): Promise<TestApi> {
+  const adminUrl = inject('adminDatabaseUrl');
+  const dbName = `openaduc_test_${process.pid}_${++instanceCounter}`;
+  await withAdmin(adminUrl, (c) => c.query(`CREATE DATABASE ${dbName} TEMPLATE ${TEMPLATE_DB}`));
+  const dbUrl = new URL(adminUrl);
+  dbUrl.pathname = `/${dbName}`;
+
+  const env = {
+    NODE_ENV: 'test',
+    LOG_LEVEL: process.env.TEST_LOG_LEVEL ?? 'fatal',
+    DATABASE_URL: dbUrl.toString(),
+    DATABASE_POOL_MIN: '0',
+    SESSION_COOKIE_SECRET: 'integration-test-cookie-secret-0123456789abcdef',
+    ENCRYPTION_KEY: Buffer.alloc(32, 7).toString('base64'),
+    API_CORS_ORIGIN: ORIGIN,
+    AD_TLS_REJECT_UNAUTHORIZED: '1',
+    AD_TLS_CA_PATH: DC.caPath,
+    SYNC_SCHEDULER_ENABLED: '0',
+    // Blank anything a developer's .env could contribute: the directory must
+    // come from the setup flow under test, not from env bootstrap.
+    AD_LDAP_URLS: '',
+    AD_DOMAIN: '',
+    AD_BASE_DN: '',
+    AD_SERVICE_ACCOUNT_UPN: '',
+    AD_SERVICE_ACCOUNT_PASSWORD: '',
+    BOOTSTRAP_ADMIN_GROUP_DN: '',
+    ...options.env,
+  };
+
+  const build = async (): Promise<FastifyInstance> => {
+    Object.assign(process.env, env);
+    // Fresh module graph so this instance reads the env set above (loadEnv
+    // memoizes) even when a file starts more than one API.
+    vi.resetModules();
+    const { buildApp } = await import('../../src/app.js');
+    const app = await buildApp();
+    await app.ready();
+    return app;
+  };
+
+  let clientCounter = 0;
+  const api: TestApi = {
+    app: await build(),
+    directoryId: null,
+    client: () => new TestClient(() => api.app, `10.99.0.${++clientCounter}`),
+    async restart() {
+      await api.app.close();
+      api.app = await build();
+    },
+    async close() {
+      await api.app.close();
+      await withAdmin(adminUrl, (c) => c.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`));
+    },
+  };
+  return api;
+}
+
+async function withAdmin<T>(url: string, fn: (c: pg.Client) => Promise<T>): Promise<T> {
+  const client = new pg.Client({ connectionString: url });
+  await client.connect();
+  try {
+    return await fn(client);
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * Run first-time setup against the dev DC as `oa.admin` (directory, service
+ * account, policy, initial sync), then map the operator and auditor roles to
+ * the fixture groups. Leaves the admin client signed in and stepped up.
+ */
+export async function configureDirectory(
+  api: TestApi,
+  connection: { ldapUrls: string[]; tlsMode: 'ldaps' | 'starttls' } = {
+    ldapUrls: [DC.ldapsUrl],
+    tlsMode: 'ldaps',
+  },
+): Promise<TestClient> {
+  const admin = api.client();
+  const init = await admin.post('/api/setup/initialize', {
+    domain: DC.domain,
+    baseDn: DC.baseDn,
+    ...connection,
+    adminUsername: 'oa.admin',
+    adminPassword: DC.password,
+  });
+  expectOk(init, 'setup/initialize');
+  api.directoryId = init.json<{ directory: { id: number } }>().directory.id;
+
+  expectOk(
+    await admin.post('/api/setup/service-account', {
+      username: DC.serviceAccount,
+      password: DC.password,
+    }),
+    'setup/service-account',
+  );
+  expectOk(
+    await admin.post('/api/setup/policy', { passwordExpiringDays: 14, staleLogonDays: 90 }),
+    'setup/policy',
+  );
+  expectOk(await admin.post('/api/setup/run-initial-sync', {}), 'setup/run-initial-sync');
+  for (let i = 0; ; i++) {
+    const status = await admin.get('/api/setup/initial-sync-status');
+    const job = status.json<{ job: { status: string; tasks: unknown[] } | null }>().job;
+    if (job?.status === 'succeeded') break;
+    if (job?.status === 'failed' || i > 120) {
+      throw new Error(`initial sync did not succeed: ${status.body}`);
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  // Faster than PUT /api/settings/roles (which needs step-up); that route
+  // has its own test.
+  for (const [key, dn] of [
+    ['authz.operator_group_dn', DC.groups.operators],
+    ['authz.auditor_group_dn', DC.groups.auditors],
+  ] as const) {
+    await api.app.db
+      .updateTable('app_settings')
+      .set({ value_json: JSON.stringify(dn) })
+      .where('key', '=', key)
+      .execute();
+    api.app.services.settings.invalidate(key);
+  }
+  return admin;
+}
+
+/**
+ * Add a second directory pointing at the same dev DC, as `admin` (a client
+ * left signed in and stepped up by configureDirectory). Operators sign in
+ * to it with `signInTo`; it shares the role mapping but none of the first
+ * directory's data.
+ */
+export async function addDirectory(admin: TestClient, name: string): Promise<number> {
+  const res = await admin.post('/api/directories', {
+    name,
+    domain: DC.domain,
+    baseDn: DC.baseDn,
+    ldapUrls: [DC.ldapsUrl],
+    tlsMode: 'ldaps',
+    adminUsername: 'oa.admin',
+    adminPassword: DC.password,
+  });
+  expectOk(res, `add directory ${name}`);
+  return res.json<{ directory: { id: number } }>().directory.id;
+}
+
+// ---- Client -------------------------------------------------------------
+
+export class TestClient {
+  private readonly cookies = new Map<string, string>();
+  /** Sent with every request, e.g. X-Forwarded-For to play a proxy. */
+  readonly headers: Record<string, string> = {};
+
+  constructor(
+    private readonly app: () => FastifyInstance,
+    /** Distinct per client so per-IP rate limits don't couple tests. */
+    readonly remoteAddress: string,
+  ) {}
+
+  async request(
+    method: HTTPMethods,
+    url: string,
+    payload?: unknown,
+  ): Promise<LightMyRequestResponse> {
+    const headers: Record<string, string> = { origin: ORIGIN, ...this.headers };
+    if (this.cookies.size > 0) {
+      headers.cookie = [...this.cookies].map(([k, v]) => `${k}=${v}`).join('; ');
+    }
+    const options: InjectOptions = { method, url, headers, remoteAddress: this.remoteAddress };
+    if (payload !== undefined) options.payload = payload as object;
+    const res = await this.app().inject(options);
+    for (const c of res.cookies) {
+      if (!c.value || (c.expires && c.expires.getTime() <= Date.now())) this.cookies.delete(c.name);
+      else this.cookies.set(c.name, c.value);
+    }
+    return res;
+  }
+
+  get(url: string) {
+    return this.request('GET', url);
+  }
+  post(url: string, body: unknown = {}) {
+    return this.request('POST', url, body);
+  }
+  patch(url: string, body: unknown = {}) {
+    return this.request('PATCH', url, body);
+  }
+  put(url: string, body: unknown = {}) {
+    return this.request('PUT', url, body);
+  }
+  delete(url: string, body?: unknown) {
+    return this.request('DELETE', url, body);
+  }
+
+  async signIn(api: TestApi, username: string, password: string = DC.password): Promise<void> {
+    await this.signInTo(api.directoryId!, username, password);
+  }
+
+  async signInTo(directoryId: number, username: string, password: string = DC.password) {
+    const res = await this.post('/api/auth/login', { directoryId, username, password });
+    expectOk(res, `sign in as ${username}`);
+  }
+
+  async stepUp(password: string = DC.password): Promise<void> {
+    expectOk(await this.post('/api/auth/step-up', { password }), 'step-up');
+  }
+}
+
+/** Wait for a bulk job to stop running with no rows left to run. */
+export async function finishedJob(client: TestClient, id: string): Promise<BulkJob> {
+  for (let i = 0; i < 300; i++) {
+    const { job } = (await client.get(`/api/bulk-jobs/${id}`)).json<{ job: BulkJob }>();
+    if (job.status !== 'queued' && job.status !== 'running' && job.counts.pending === 0) {
+      return job;
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`bulk job ${id} didn’t finish`);
+}
+
+/**
+ * Start a bulk job the way the UI does: preview it at `preview`, then
+ * start it at `start` with the preview's token; wait for it to finish.
+ */
+export async function previewedJob(
+  client: TestClient,
+  preview: string,
+  start: string,
+  body: Record<string, unknown>,
+  previewBody: Record<string, unknown> = body,
+): Promise<BulkJob> {
+  const previewed = await client.post(preview, previewBody);
+  expectOk(previewed, `preview ${preview}`);
+  const { previewToken } = previewed.json<{ previewToken: string }>();
+  const started = await client.post(start, { ...body, previewToken });
+  expectOk(started, `start ${start}`);
+  return finishedJob(client, started.json<{ job: BulkJob }>().job.id);
+}
+
+/** Revert a job as previewed (with `body` added to the request), and wait for the revert. */
+export async function revertJob(
+  client: TestClient,
+  jobId: string,
+  body: Record<string, unknown> = {},
+): Promise<BulkJob> {
+  const preview = await client.get(`/api/bulk-jobs/${jobId}/revert/preview`);
+  expectOk(preview, 'revert preview');
+  const { previewToken } = preview.json<{ previewToken: string }>();
+  const res = await client.post(`/api/bulk-jobs/${jobId}/revert`, { previewToken, ...body });
+  expectOk(res, 'revert');
+  return finishedJob(client, res.json<{ job: BulkJob }>().job.id);
+}
+
+export function expectOk(res: LightMyRequestResponse, what: string): void {
+  if (res.statusCode >= 300) {
+    throw new Error(`${what} failed: HTTP ${res.statusCode} ${res.body}`);
+  }
+}

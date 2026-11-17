@@ -8,11 +8,24 @@ updates:
       time: '06:00'
       timezone: Etc/UTC
     open-pull-requests-limit: 10
+    # Match the Node 22 runtime in .nvmrc and the Docker images.
+    ignore:
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+      # PrimeVue 5, @primeuix/themes 3 and primeicons 8 are under a commercial
+      # licence (licence key, redistribution limits). Stay on the MIT 4.x /
+      # 2.x / 7.x lines until PrimeVue is replaced.
+      - dependency-name: 'primevue'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@primeuix/themes'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'primeicons'
+        update-types: ['version-update:semver-major']
     groups:
       types:
         patterns: ['@types/*']
       eslint:
-        patterns: ['eslint*', '@eslint/*', '@typescript-eslint/*']
+        patterns: ['eslint*', '@eslint/*', '@typescript-eslint/*', 'typescript-eslint']
       vue:
         patterns: ['vue', 'vue-*', '@vue/*', '@vitejs/*', 'vite', 'pinia', 'primevue']
       tailwind:
@@ -25,6 +38,11 @@ updates:
     schedule:
       interval: weekly
       day: monday
+    # The images run the same Node 22 LTS as .nvmrc and CI. Node majors
+    # (including non-LTS ones like 25) move by hand, all three together.
+    ignore:
+      - dependency-name: 'node'
+        update-types: ['version-update:semver-major']
 
   - package-ecosystem: github-actions
     directory: /

@@ -1,10 +1,9 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
-import { RouterLink } from 'vue-router';
+import { RouterLink, useRoute, useRouter } from 'vue-router';
 import Tree from 'primevue/tree';
 import Button from 'primevue/button';
-import Checkbox from 'primevue/checkbox';
 import ContextMenu from 'primevue/contextmenu';
 import Dialog from 'primevue/dialog';
 import InputText from 'primevue/inputtext';
@@ -17,12 +16,16 @@ import type { MenuItem } from 'primevue/menuitem';
 import Card from '../design/primitives/Card.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import PageHeader from '../design/primitives/PageHeader.vue';
-import SyncButton from '../design/primitives/SyncButton.vue';
-import UserBulkBar from '../design/primitives/UserBulkBar.vue';
 import { api } from '../api/index.js';
 import { ApiError } from '../api/client.js';
 import { useAuthStore } from '../stores/auth.js';
-import type { DirectoryOu, OuContentsResponse } from '@openaduc/shared';
+import { useOuContents } from '../design/composables/useOuContents.js';
+import { useOuTree } from '../design/composables/useOuTree.js';
+import type { DirectoryOu, GroupCreateResponse, UserCreateResponse } from '@openaduc/shared';
+import NewGroupDialog from '../design/feedback/NewGroupDialog.vue';
+import { groupCreatedToast } from '../design/feedback/groupToasts.js';
+import NewUserDialog from '../design/feedback/NewUserDialog.vue';
+import { announceUserCreated } from '../design/feedback/userToasts.js';
 
 const auth = useAuthStore();
 const toast = useToast();
@@ -30,13 +33,12 @@ const toast = useToast();
 const canCreateOu = computed(() => auth.hasCapability('write:ou.create'));
 const canUpdateOu = computed(() => auth.hasCapability('write:ou.update'));
 const canDeleteOu = computed(() => auth.hasCapability('write:ou.delete'));
+const canCreateGroup = computed(() => auth.hasCapability('write:group.create'));
 const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
 
 // ---- OU tree -------------------------------------------------------------
 
-const ous = ref<DirectoryOu[]>([]);
-const loadingTree = ref(false);
-const treeError = ref<string | null>(null);
+const { ous, loading: loadingTree, error: treeError, load: loadOus } = useOuTree();
 
 // Tracks whether we've already populated `expandedKeys` once. The first
 // successful tree load expands everything so the operator sees the whole
@@ -46,19 +48,10 @@ const treeError = ref<string | null>(null);
 let expandedInitialized = false;
 
 async function loadTree(): Promise<void> {
-  loadingTree.value = true;
-  treeError.value = null;
-  try {
-    const resp = await api.ous.list();
-    ous.value = resp.ous;
-    if (!expandedInitialized && resp.ous.length > 0) {
-      expandAll();
-      expandedInitialized = true;
-    }
-  } catch (err) {
-    treeError.value = err instanceof ApiError ? err.message : 'failed to load OUs';
-  } finally {
-    loadingTree.value = false;
+  await loadOus();
+  if (!expandedInitialized && ous.value.length > 0) {
+    expandAll();
+    expandedInitialized = true;
   }
 }
 
@@ -165,84 +158,74 @@ const selectedOu = computed<DirectoryOu | null>(() => {
 type TabId = 'all' | 'users' | 'groups' | 'computers' | 'policies';
 const activeTab = ref<TabId>('all');
 
-const emptyContents: OuContentsResponse = {
-  users: [],
-  groups: [],
-  computers: [],
-  linkedGroupPolicies: [],
-  inheritedGroupPolicies: [],
-};
-const contents = ref<OuContentsResponse>({ ...emptyContents });
-const loadingContents = ref(false);
-const contentsError = ref<string | null>(null);
+const {
+  contents,
+  loading: loadingContents,
+  error: contentsError,
+  load: loadContents,
+  clear: clearContents,
+} = useOuContents();
 
 const totalGpoCount = computed(
   () => contents.value.linkedGroupPolicies.length + contents.value.inheritedGroupPolicies.length,
 );
 
-async function loadContents(dn: string): Promise<void> {
-  loadingContents.value = true;
-  contentsError.value = null;
-  try {
-    contents.value = await api.ous.contents(dn);
-  } catch (err) {
-    contents.value = { ...emptyContents };
-    contentsError.value = err instanceof ApiError ? err.message : 'failed to load OU contents';
-  } finally {
-    loadingContents.value = false;
-  }
-}
-
 watch(selectedDn, (dn) => {
-  // Switching OUs drops any user selection carried over from the previous one.
-  ouUserSelectedIds.value = new Set();
   if (dn) loadContents(dn);
-  else contents.value = { ...emptyContents };
+  else clearContents();
 });
 
-// ---- Bulk user selection (OU contents) -----------------------------------
-const ouUserSelectedIds = ref<Set<string>>(new Set());
-const allOuUsersSelected = computed(
-  () =>
-    contents.value.users.length > 0 &&
-    contents.value.users.every((u) => ouUserSelectedIds.value.has(u.id)),
+// ---- Selected OU in the URL ----------------------------------------------
+//
+// The selection lives in the `ou` query parameter too, so quick search and
+// shared links can open the browser at an OU and reload keeps it. Written
+// with replace: clicking through the tree doesn't stack history entries.
+
+const route = useRoute();
+const router = useRouter();
+// The route is global and moves on before this page unmounts; only touch
+// the query while it's still ours.
+const ownRoute = route.name;
+const routeOu = computed(() =>
+  route.name === ownRoute && typeof route.query.ou === 'string' ? route.query.ou : null,
 );
-const someOuUsersSelected = computed(() =>
-  contents.value.users.some((u) => ouUserSelectedIds.value.has(u.id)),
-);
-function toggleOuUser(id: string): void {
-  const next = new Set(ouUserSelectedIds.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
-  ouUserSelectedIds.value = next;
+const sameDn = (a: string | null, b: string | null) => a?.toLowerCase() === b?.toLowerCase();
+
+function setRouteOu(dn: string | null): void {
+  if (route.name !== ownRoute || sameDn(dn, routeOu.value)) return;
+  const query = { ...route.query };
+  if (dn) query.ou = dn;
+  else delete query.ou;
+  void router.replace({ query });
 }
-function toggleSelectAllOuUsers(): void {
-  ouUserSelectedIds.value = allOuUsersSelected.value
-    ? new Set()
-    : new Set(contents.value.users.map((u) => u.id));
-}
-function onOuBulkDone(): void {
-  if (selectedDn.value) loadContents(selectedDn.value);
-}
-// Selection is "off" until the first pick, so the list stays clean. Row
-// checkboxes fade in on hover; Ctrl/⌘+click a user starts a selection without
-// navigating. Once anything is selected, checkboxes + "Select all" show for
-// the whole list.
-const ouSelectionActive = computed(() => ouUserSelectedIds.value.size > 0);
-function onOuUserRowClick(e: MouseEvent, id: string): void {
-  if (e.ctrlKey || e.metaKey) {
-    e.preventDefault();
-    toggleOuUser(id);
+
+function expandAncestors(ou: DirectoryOu): void {
+  const next = { ...expandedKeys.value };
+  for (let dn = ou.parentDn; dn;) {
+    next[dn] = true;
+    dn = ous.value.find((o) => sameDn(o.distinguishedName, dn))?.parentDn ?? null;
   }
+  expandedKeys.value = next;
 }
+
+watch(
+  [routeOu, ous],
+  ([dn]) => {
+    if (dn === null || ous.value.length === 0 || sameDn(dn, selectedDn.value)) return;
+    const ou = ous.value.find((o) => sameDn(o.distinguishedName, dn));
+    if (!ou) {
+      setRouteOu(null);
+      return;
+    }
+    selectionKeys.value = { [ou.distinguishedName]: true };
+    expandAncestors(ou);
+  },
+  { immediate: true },
+);
+
+watch(selectedDn, (dn) => setRouteOu(dn));
 
 onMounted(loadTree);
-
-// After an LDAP sync of OUs, reload the tree (and the open OU's contents).
-function onSynced(): void {
-  loadTree();
-  if (selectedDn.value) loadContents(selectedDn.value);
-}
 
 // ---- Context menu --------------------------------------------------------
 
@@ -265,14 +248,11 @@ const ctxItems = computed<MenuItem[]>(() => {
   const ou = ctxOu.value;
   if (!ou) return [];
   const items: MenuItem[] = [];
-  // Write actions stay clickable whether or not edit mode is on —
-  // `auth.requireEdit` pops the StepUpDialog for an unauthenticated operator
-  // and auto-fires the action after they authenticate.
   if (canUpdateOu.value) {
     items.push({
       label: 'Edit description',
       icon: 'pi pi-pencil',
-      command: () => auth.requireEdit(() => openEditDialog(ou)),
+      command: () => openEditDialog(ou),
       tooltip: 'Edit this OU’s description (rename is not supported).',
     });
   }
@@ -280,16 +260,32 @@ const ctxItems = computed<MenuItem[]>(() => {
     items.push({
       label: 'Add child OU',
       icon: 'pi pi-folder-plus',
-      command: () => auth.requireEdit(() => openCreateDialog(ou)),
+      command: () => openCreateDialog(ou),
       tooltip: 'Create a new organizational unit under this one.',
     });
   }
   if (canCreateUser.value) {
     items.push({
-      label: 'New user here',
+      label: 'New user…',
       icon: 'pi pi-user-plus',
-      command: () => auth.requireEdit(() => openCreateUserDialog(ou)),
-      tooltip: 'Create a new (disabled) user account in this OU.',
+      command: () => openNewUser(ou.distinguishedName),
+      tooltip: 'Create a user in this OU.',
+    });
+  }
+  if (canCreateUser.value) {
+    items.push({
+      label: 'Import users…',
+      icon: 'pi pi-file-import',
+      command: () => openImport(ou.distinguishedName),
+      tooltip: 'Import users from a spreadsheet into this OU.',
+    });
+  }
+  if (canCreateGroup.value) {
+    items.push({
+      label: 'New group…',
+      icon: 'pi pi-users',
+      command: () => openNewGroup(ou.distinguishedName),
+      tooltip: 'Create a group in this OU.',
     });
   }
   if (canDeleteOu.value) {
@@ -305,9 +301,9 @@ const ctxItems = computed<MenuItem[]>(() => {
       label: 'Delete OU',
       icon: 'pi pi-trash',
       // Disabled only if children are unknown (still fetching) or children
-      // are present. Edit-mode is handled at click time by requireEdit.
+      // are present.
       disabled: ctxHasChildren.value !== false,
-      command: () => auth.requireEdit(() => openDeleteDialog(ou)),
+      command: () => openDeleteDialog(ou),
       tooltip: childTip,
     });
   }
@@ -332,8 +328,15 @@ const ctxItems = computed<MenuItem[]>(() => {
 });
 
 async function onTreeNodeContext(event: MouseEvent, node: TreeNode): Promise<void> {
-  if (!canCreateOu.value && !canUpdateOu.value && !canDeleteOu.value && !canCreateUser.value)
+  if (
+    !canCreateOu.value &&
+    !canUpdateOu.value &&
+    !canDeleteOu.value &&
+    !canCreateGroup.value &&
+    !canCreateUser.value
+  ) {
     return;
+  }
   event.preventDefault();
   event.stopPropagation();
   const dn = node.data?.dn as string | undefined;
@@ -364,6 +367,48 @@ async function onTreeNodeContext(event: MouseEvent, node: TreeNode): Promise<voi
   } finally {
     ctxCountsLoading.value = false;
   }
+}
+
+// ---- New group -----------------------------------------------------------
+
+const newGroupOpen = ref(false);
+const newGroupParentDn = ref<string | null>(null);
+
+function openNewGroup(parentDn: string): void {
+  newGroupParentDn.value = parentDn;
+  newGroupOpen.value = true;
+}
+
+function onGroupCreated(created: GroupCreateResponse): void {
+  newGroupOpen.value = false;
+  toast.add(groupCreatedToast(created));
+  if (selectedDn.value) void loadContents(selectedDn.value);
+}
+
+// ---- New user ------------------------------------------------------------
+
+const newUserOpen = ref(false);
+const newUserOuDn = ref<string | null>(null);
+
+/** Every bucket of the import starts in this OU. */
+function openImport(ouDn: string): void {
+  void router.push({ name: 'user-import', query: { ou: ouDn } });
+}
+
+function openNewUser(ouDn: string): void {
+  newUserOuDn.value = ouDn;
+  newUserOpen.value = true;
+}
+
+/** The operator lands on the new user's page. */
+async function onUserCreated(created: UserCreateResponse): Promise<void> {
+  newUserOpen.value = false;
+  if (created.id) {
+    await router.push({ name: 'user-detail', params: { id: created.id } });
+  } else if (selectedDn.value) {
+    void loadContents(selectedDn.value);
+  }
+  announceUserCreated(toast, created);
 }
 
 // ---- Create OU dialog ----------------------------------------------------
@@ -419,116 +464,10 @@ async function onCreateSubmit(): Promise<void> {
     createDialogOpen.value = false;
     await loadTree();
   } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = onCreateSubmit;
-      return;
-    }
+    if (auth.retryAfterStepUp(err, onCreateSubmit)) return;
     createError.value = err instanceof ApiError ? err.message : 'create failed';
   } finally {
     createSubmitting.value = false;
-  }
-}
-
-// ---- Create user dialog --------------------------------------------------
-//
-// Creates the account DISABLED with no password (server policy) into the
-// selected OU; the operator sets a password + enables it afterwards from the
-// user's page. Same step-up handling as the OU dialogs.
-
-const createUserDialogOpen = ref(false);
-const createUserParent = ref<DirectoryOu | null>(null);
-const createUserDraft = ref({
-  givenName: '',
-  surname: '',
-  displayName: '',
-  samAccountName: '',
-  userPrincipalName: '',
-  email: '',
-});
-const createUserSubmitting = ref(false);
-const createUserError = ref<string | null>(null);
-
-// Mirror the server-side sAMAccountName rule: 1..20 chars, none of the AD
-// reserved characters or whitespace.
-const SAM_RE = /^[^\s"[\]:;|=+*?<>/\\,]+$/;
-
-function openCreateUserDialog(parent: DirectoryOu): void {
-  createUserParent.value = parent;
-  createUserDraft.value = {
-    givenName: '',
-    surname: '',
-    displayName: '',
-    samAccountName: '',
-    userPrincipalName: '',
-    email: '',
-  };
-  createUserError.value = null;
-  createUserDialogOpen.value = true;
-}
-
-// Header button ("New user" on the right pane) — opens the dialog for the
-// currently-selected OU, gating on step-up first like the context-menu items.
-function openNewUserFromHeader(): void {
-  const ou = selectedOu.value;
-  if (ou) auth.requireEdit(() => openCreateUserDialog(ou));
-}
-
-const createUserSamValid = computed(() => {
-  const s = createUserDraft.value.samAccountName.trim();
-  return s.length >= 1 && s.length <= 20 && SAM_RE.test(s);
-});
-
-const createUserPreviewDn = computed(() => {
-  const parent = createUserParent.value;
-  if (!parent) return '';
-  const d = createUserDraft.value;
-  const cn =
-    d.displayName.trim() ||
-    [d.givenName.trim(), d.surname.trim()].filter(Boolean).join(' ').trim() ||
-    d.samAccountName.trim();
-  if (!cn) return '';
-  return `CN=${cn},${parent.distinguishedName}`;
-});
-
-async function onCreateUserSubmit(): Promise<void> {
-  if (!createUserParent.value) return;
-  if (!createUserSamValid.value) {
-    createUserError.value =
-      createUserDraft.value.samAccountName.trim().length > 20
-        ? 'Logon name must be 20 characters or fewer.'
-        : 'Logon name is required and cannot contain spaces or any of " [ ] : ; | = + * ? < > / \\ ,';
-    return;
-  }
-  createUserError.value = null;
-  createUserSubmitting.value = true;
-  try {
-    const d = createUserDraft.value;
-    const res = await api.users.create({
-      parentDn: createUserParent.value.distinguishedName,
-      samAccountName: d.samAccountName.trim(),
-      userPrincipalName: d.userPrincipalName.trim() || undefined,
-      givenName: d.givenName.trim() || undefined,
-      surname: d.surname.trim() || undefined,
-      displayName: d.displayName.trim() || undefined,
-      email: d.email.trim() || undefined,
-    });
-    toast.add({
-      severity: 'success',
-      summary: 'User created',
-      detail: `${res.samAccountName} created (disabled). Set a password and enable it to activate.`,
-      life: 6000,
-    });
-    createUserDialogOpen.value = false;
-    // Refresh the OU contents so the new (disabled) account shows up.
-    if (selectedDn.value) await loadContents(selectedDn.value);
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = onCreateUserSubmit;
-      return;
-    }
-    createUserError.value = err instanceof ApiError ? err.message : 'create failed';
-  } finally {
-    createUserSubmitting.value = false;
   }
 }
 
@@ -577,10 +516,7 @@ async function onEditSubmit(): Promise<void> {
     editDialogOpen.value = false;
     await loadTree();
   } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = onEditSubmit;
-      return;
-    }
+    if (auth.retryAfterStepUp(err, onEditSubmit)) return;
     editError.value = err instanceof ApiError ? err.message : 'update failed';
   } finally {
     editSubmitting.value = false;
@@ -623,10 +559,7 @@ async function onDeleteSubmit(): Promise<void> {
     }
     await loadTree();
   } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = onDeleteSubmit;
-      return;
-    }
+    if (auth.retryAfterStepUp(err, onDeleteSubmit)) return;
     deleteError.value = err instanceof ApiError ? err.message : 'delete failed';
   } finally {
     deleteSubmitting.value = false;
@@ -636,11 +569,7 @@ async function onDeleteSubmit(): Promise<void> {
 
 <template>
   <div class="page-inner page-fill ou-browser">
-    <PageHeader title="Directory structure">
-      <template #actions>
-        <SyncButton :task-keys="['ous.full']" @done="onSynced" />
-      </template>
-    </PageHeader>
+    <PageHeader title="Directory structure" />
 
     <div class="ou-grid">
       <!-- Left: OU tree. Right-click anywhere inside the pane is intercepted
@@ -717,17 +646,33 @@ async function onDeleteSubmit(): Promise<void> {
           </div>
           <code v-if="selectedOu" class="dn-line">{{ selectedOu.distinguishedName }}</code>
         </template>
-        <!-- Pinned to the right of the card head via the Card's actions slot,
-             so it stays put regardless of the OU name / DN length. -->
-        <template #actions>
+        <template v-if="selectedOu && (canCreateGroup || canCreateUser)" #actions>
           <Button
-            v-if="selectedOu && canCreateUser"
+            v-if="canCreateUser"
             label="New user"
             icon="pi pi-user-plus"
             size="small"
             severity="secondary"
             outlined
-            @click="openNewUserFromHeader"
+            @click="openNewUser(selectedOu.distinguishedName)"
+          />
+          <Button
+            v-if="canCreateUser"
+            label="Import users"
+            icon="pi pi-file-import"
+            size="small"
+            severity="secondary"
+            outlined
+            @click="openImport(selectedOu.distinguishedName)"
+          />
+          <Button
+            v-if="canCreateGroup"
+            label="New group"
+            icon="pi pi-plus"
+            size="small"
+            severity="secondary"
+            outlined
+            @click="openNewGroup(selectedOu.distinguishedName)"
           />
         </template>
         <div class="pane-body">
@@ -740,12 +685,6 @@ async function onDeleteSubmit(): Promise<void> {
           <div v-else-if="loadingContents" class="hint">Loading contents…</div>
           <div v-else-if="contentsError" class="hint error">{{ contentsError }}</div>
           <div v-else class="contents-tabs">
-            <UserBulkBar
-              :selected-ids="ouUserSelectedIds"
-              :all-ids="contents.users.map((u) => u.id)"
-              @update:selected-ids="(v) => (ouUserSelectedIds = v)"
-              @done="onOuBulkDone"
-            />
             <!-- Tab nav. Counts on every tab so the operator can scan
                  distribution without clicking through. The "All" tab is
                  first so opening an OU still shows everything at once,
@@ -825,26 +764,9 @@ async function onDeleteSubmit(): Promise<void> {
               </div>
               <section v-if="contents.users.length > 0" class="contents-section">
                 <h2 class="section-h">Users</h2>
-                <ul class="row-list" :class="{ selecting: ouSelectionActive }">
-                  <li
-                    v-for="u in contents.users"
-                    :key="u.id"
-                    class="row urow"
-                    :class="{ 'is-selected': ouUserSelectedIds.has(u.id) }"
-                  >
-                    <Checkbox
-                      class="urow-check"
-                      :model-value="ouUserSelectedIds.has(u.id)"
-                      binary
-                      :aria-label="`Select ${u.displayName ?? u.samAccountName}`"
-                      @update:model-value="() => toggleOuUser(u.id)"
-                      @click.stop
-                    />
-                    <RouterLink
-                      :to="`/users/${u.id}`"
-                      class="row-link"
-                      @click="onOuUserRowClick($event, u.id)"
-                    >
+                <ul class="row-list">
+                  <li v-for="u in contents.users" :key="u.id" class="row">
+                    <RouterLink :to="`/users/${u.id}`" class="row-link">
                       <i class="pi pi-user row-icon" />
                       <span class="row-main">
                         <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
@@ -948,43 +870,24 @@ async function onDeleteSubmit(): Promise<void> {
               <div v-if="contents.users.length === 0" class="hint">
                 No users live directly in this OU.
               </div>
-              <template v-else>
-                <ul class="row-list" :class="{ selecting: ouSelectionActive }">
-                  <li
-                    v-for="u in contents.users"
-                    :key="u.id"
-                    class="row urow"
-                    :class="{ 'is-selected': ouUserSelectedIds.has(u.id) }"
-                  >
-                    <Checkbox
-                      class="urow-check"
-                      :model-value="ouUserSelectedIds.has(u.id)"
-                      binary
-                      :aria-label="`Select ${u.displayName ?? u.samAccountName}`"
-                      @update:model-value="() => toggleOuUser(u.id)"
-                      @click.stop
-                    />
-                    <RouterLink
-                      :to="`/users/${u.id}`"
-                      class="row-link"
-                      @click="onOuUserRowClick($event, u.id)"
-                    >
-                      <i class="pi pi-user row-icon" />
-                      <span class="row-main">
-                        <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
-                        <span class="row-sub">
-                          {{ u.samAccountName }}
-                          <span v-if="u.email"> · {{ u.email }}</span>
-                        </span>
+              <ul v-else class="row-list">
+                <li v-for="u in contents.users" :key="u.id" class="row">
+                  <RouterLink :to="`/users/${u.id}`" class="row-link">
+                    <i class="pi pi-user row-icon" />
+                    <span class="row-main">
+                      <span class="row-name">{{ u.displayName ?? u.samAccountName }}</span>
+                      <span class="row-sub">
+                        {{ u.samAccountName }}
+                        <span v-if="u.email"> · {{ u.email }}</span>
                       </span>
-                      <span class="row-flags">
-                        <span v-if="!u.enabled" class="flag flag-muted">disabled</span>
-                        <span v-if="u.locked" class="flag flag-warn">locked</span>
-                      </span>
-                    </RouterLink>
-                  </li>
-                </ul>
-              </template>
+                    </span>
+                    <span class="row-flags">
+                      <span v-if="!u.enabled" class="flag flag-muted">disabled</span>
+                      <span v-if="u.locked" class="flag flag-warn">locked</span>
+                    </span>
+                  </RouterLink>
+                </li>
+              </ul>
             </div>
 
             <!-- Groups -->
@@ -1113,6 +1016,20 @@ async function onDeleteSubmit(): Promise<void> {
         </span>
       </template>
     </ContextMenu>
+
+    <NewUserDialog
+      v-if="newUserOpen"
+      v-model:visible="newUserOpen"
+      :ou-dn="newUserOuDn"
+      @created="onUserCreated"
+    />
+
+    <NewGroupDialog
+      v-if="newGroupOpen"
+      v-model:visible="newGroupOpen"
+      :parent-dn="newGroupParentDn"
+      @created="onGroupCreated"
+    />
 
     <!-- Add child OU dialog -->
     <Dialog
@@ -1269,91 +1186,6 @@ async function onDeleteSubmit(): Promise<void> {
           severity="danger"
           :loading="deleteSubmitting"
           @click="onDeleteSubmit"
-        />
-      </template>
-    </Dialog>
-
-    <!-- New user dialog. The account is created disabled with no password;
-         the operator sets a password + enables it from the user's page. -->
-    <Dialog
-      :visible="createUserDialogOpen"
-      modal
-      header="New user"
-      :style="{ width: '34rem' }"
-      :closable="!createUserSubmitting"
-      @update:visible="(v) => !v && (createUserDialogOpen = false)"
-    >
-      <p class="dialog-prose primary">
-        Create a new account in <strong>{{ createUserParent?.name }}</strong
-        >.
-      </p>
-      <p class="dialog-prose secondary">
-        The account is created <strong>disabled with no password</strong>. Set a password and enable
-        it afterwards from the user’s page.
-      </p>
-      <div class="create-form">
-        <div class="form-row">
-          <label class="fld-label">First name</label>
-          <InputText v-model="createUserDraft.givenName" fluid :disabled="createUserSubmitting" />
-        </div>
-        <div class="form-row">
-          <label class="fld-label">Last name</label>
-          <InputText v-model="createUserDraft.surname" fluid :disabled="createUserSubmitting" />
-        </div>
-        <div class="form-row">
-          <label class="fld-label">Display name (optional)</label>
-          <InputText
-            v-model="createUserDraft.displayName"
-            placeholder="defaults to First Last"
-            fluid
-            :disabled="createUserSubmitting"
-          />
-        </div>
-        <div class="form-row">
-          <label class="fld-label">User logon name (sAMAccountName)</label>
-          <InputText
-            v-model="createUserDraft.samAccountName"
-            autofocus
-            fluid
-            :disabled="createUserSubmitting"
-            @keyup.enter="onCreateUserSubmit"
-          />
-        </div>
-        <div class="form-row">
-          <label class="fld-label">User principal name (optional)</label>
-          <InputText
-            v-model="createUserDraft.userPrincipalName"
-            placeholder="user@domain"
-            fluid
-            :disabled="createUserSubmitting"
-          />
-        </div>
-        <div class="form-row">
-          <label class="fld-label">Email (optional)</label>
-          <InputText v-model="createUserDraft.email" fluid :disabled="createUserSubmitting" />
-        </div>
-        <div v-if="createUserPreviewDn" class="preview-row">
-          <span class="muted">DN:</span>
-          <code class="dn-line">{{ createUserPreviewDn }}</code>
-        </div>
-        <Message v-if="createUserError" severity="error" :closable="false">{{
-          createUserError
-        }}</Message>
-      </div>
-      <template #footer>
-        <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="createUserSubmitting"
-          @click="createUserDialogOpen = false"
-        />
-        <Button
-          label="Create user"
-          icon="pi pi-user-plus"
-          :loading="createUserSubmitting"
-          :disabled="!createUserSamValid"
-          @click="onCreateUserSubmit"
         />
       </template>
     </Dialog>
@@ -1552,15 +1384,6 @@ async function onDeleteSubmit(): Promise<void> {
   border-radius: 2px;
 }
 
-.ds-tab-count {
-  font-size: 11px;
-  margin-left: 6px;
-  color: var(--text-3);
-  background: var(--surface-3);
-  padding: 1px 5px;
-  border-radius: 3px;
-}
-
 .ds-tab.active .ds-tab-count {
   color: var(--text-2);
 }
@@ -1716,41 +1539,6 @@ async function onDeleteSubmit(): Promise<void> {
 }
 .mt-3 {
   margin-top: 12px;
-}
-
-/* Bulk user selection in the OU contents. Checkboxes stay hidden until you
-   hover a row or a selection is active, so the list reads clean by default. */
-.usel-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-3);
-  padding: 2px 8px 8px 10px;
-}
-.urow {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  border-radius: 6px;
-}
-.urow.is-selected {
-  background: color-mix(in oklab, var(--accent) 12%, transparent);
-}
-.urow .row-link {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-.urow-check {
-  flex: 0 0 auto;
-  margin-left: 6px;
-  opacity: 0;
-  transition: opacity 0.12s ease;
-}
-.urow:hover .urow-check,
-.urow.is-selected .urow-check,
-.row-list.selecting .urow-check {
-  opacity: 1;
 }
 
 /* Description row in the context menu — informational, not clickable. */

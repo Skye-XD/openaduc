@@ -8,8 +8,8 @@
 # Each service uses an image tag with a local-build fallback, so the
 # stack works whether you pull pre-built images or build from source.
 #
-# For local development with hot reload and a Samba AD-DC, also include
-# the dev overlay:
+# For local development with hot reload, also include the dev overlay
+# (`pnpm dc:up` starts a development Samba AD DC separately):
 #
 #     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 #
@@ -44,8 +44,6 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
-    ports:
-      - '127.0.0.1:3000:3000'
 
   web:
     image: ${OPENADUC_WEB_IMAGE:-openaduc/web:latest}
@@ -56,7 +54,7 @@ services:
     depends_on:
       - api
     ports:
-      - '127.0.0.1:8080:80'
+      - '127.0.0.1:8080:80' # only the host's reverse proxy (Caddy) reaches the UI
 
 volumes:
   postgres-data:

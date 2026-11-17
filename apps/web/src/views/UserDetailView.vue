@@ -1,44 +1,96 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { onBeforeRouteLeave, useRouter } from 'vue-router';
+import { latestRequest } from '../design/lib/latestRequest.js';
+import { useUserRecord } from '../design/composables/useDirectoryRecords.js';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRouter } from 'vue-router';
 import Button from 'primevue/button';
-import Password from 'primevue/password';
-import DatePicker from 'primevue/datepicker';
-import Checkbox from 'primevue/checkbox';
 import Dialog from 'primevue/dialog';
 import InputText from 'primevue/inputtext';
-import Menu from 'primevue/menu';
 import Textarea from 'primevue/textarea';
 import Message from 'primevue/message';
-import Toast from 'primevue/toast';
-import TreeSelect from 'primevue/treeselect';
-import type { MenuItem } from 'primevue/menuitem';
-import type { TreeNode } from 'primevue/treenode';
 import { useToast } from 'primevue/usetoast';
 import { api, type AuditEventRow } from '../api/index.js';
-import { ApiError } from '../api/client.js';
 import { useAuthStore } from '../stores/auth.js';
-import Avatar from '../design/primitives/Avatar.vue';
 import StatusBadge from '../design/primitives/StatusBadge.vue';
 import Card from '../design/primitives/Card.vue';
 import GroupChip from '../design/primitives/GroupChip.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
+import AppToast from '../design/feedback/AppToast.vue';
 import ConfirmDialog from '../design/feedback/ConfirmDialog.vue';
+import InlineFailure from '../design/feedback/InlineFailure.vue';
+import { undoable } from '../design/feedback/undoToast.js';
+import {
+  accountActionToast,
+  announceUserCreated,
+  passwordResetToast,
+} from '../design/feedback/userToasts.js';
+import DeleteUsersDialog from '../design/feedback/DeleteUsersDialog.vue';
+import MoveToOuDialog from '../design/feedback/MoveToOuDialog.vue';
+import NewUserDialog from '../design/feedback/NewUserDialog.vue';
+import RenameUserDialog from '../design/feedback/RenameUserDialog.vue';
+import ResetPasswordDialog from '../design/feedback/ResetPasswordDialog.vue';
+import IssueTapDialog from '../design/feedback/IssueTapDialog.vue';
+import AccountExpiryDialog from '../design/feedback/AccountExpiryDialog.vue';
+import BulkJobPanel from '../design/feedback/BulkJobPanel.vue';
+import ReassignReportsDialog from '../design/feedback/ReassignReportsDialog.vue';
+import BulkRevertDialog from '../design/feedback/BulkRevertDialog.vue';
+import { expiryMoment } from '../design/lib/accountExpiry.js';
+import SignInStatus from '../design/primitives/SignInStatus.vue';
+import { lockoutEnd, signInBlockers, signInNotes, type SignInFix } from '../design/lib/signIn.js';
+import type { ResetOutcome } from '../design/composables/usePasswordReset.js';
 import ReportingStructureCard from '../design/primitives/ReportingStructureCard.vue';
 import ActivityFeed from '../design/primitives/ActivityFeed.vue';
 import SignInEventsList from '../design/primitives/SignInEventsList.vue';
+import UserLicenseList from '../design/primitives/UserLicenseList.vue';
+import LicenseBadge from '../design/primitives/LicenseBadge.vue';
+import LicenseBadgeNote from '../design/primitives/LicenseBadgeNote.vue';
+import { LICENSE_ICON } from '../design/lib/licenses.js';
 import SignInEventDetailDialog from '../design/feedback/SignInEventDetailDialog.vue';
-import { fmtAbsolute, fmtRelative } from '../design/lib/format.js';
-import type { GroupSummary, UserDetail, UserUpdateRequest } from '@openaduc/shared';
-import { useStickyHeader } from './_detail/useStickyHeader';
-import { useCompactTabs } from './_detail/useCompactTabs';
+import { fmtAbsolute, nameOf } from '../design/lib/format.js';
+import type { UserCreateResponse, UserDetail } from '@openaduc/shared';
+import ObjectPageLayout from './_detail/ObjectPageLayout.vue';
+import type { ObjectAction, ObjectLink, ObjectPageTab } from './_detail/objectPage';
+import type { ActionFailure } from '../design/lib/actionFailure.js';
+import { useRecordCrumb } from '../design/layout/recordCrumb.js';
+import { useMoveDialog } from './_detail/useMoveDialog';
+import { useExpiryDialog } from './_detail/useExpiryDialog';
+import { useConfirm } from '../design/composables/useConfirm.js';
+import { useAccountActions, type AccountAction } from '../design/composables/useAccountActions.js';
+import { useReassignReports } from '../design/composables/useReassignReports.js';
+import {
+  USER_ACTIONS,
+  USER_ACTION_ORDER,
+  userActionUnavailable,
+  userActionLabel,
+  type UserAction,
+} from '../design/lib/userActions.js';
+import { useSignInFixes } from '../design/composables/useSignInFixes.js';
+import { SHORTCUT_KEYS } from '../design/lib/shortcutKeys.js';
+import {
+  membershipChangeText,
+  membershipDoneText,
+  membershipOf,
+  useGroupMembership,
+  type Membership,
+  type MembershipChange,
+  type MembershipFailure,
+} from '../design/composables/useGroupMembership.js';
+import { placeFailure } from '../design/lib/failurePlacement.js';
+import type { UndoOffer } from '../design/lib/undoableWrite.js';
+import { useAddToGroup, MIN_GROUP_QUERY } from '../design/composables/useAddToGroup.js';
+import {
+  useUserAttributeEdit,
+  type MultiValuedAttribute,
+  type ScalarAttribute,
+} from '../design/composables/useUserAttributeEdit.js';
 
 // 'location' / 'security' tabs map to 'organization' / 'contact' / 'account'.
 // 'overview' is new; 'raw' is admin-gated. 'signins' shows Microsoft Entra
 // sign-in events for this user — only rendered when the directory has an
 // Entra integration configured.
-type TabId = 'overview' | 'organization' | 'contact' | 'account' | 'groups' | 'signins' | 'raw';
+type TabId =
+  'overview' | 'organization' | 'contact' | 'account' | 'groups' | 'licenses' | 'signins' | 'raw';
 
 // Attributes already rendered with first-class affordances elsewhere on the
 // page (heading, subtitle, status badges, dedicated Security tab, dedicated
@@ -90,6 +142,7 @@ const HANDLED_ATTRS = new Set<string>([
   'ipPhone',
   'homePhone',
   'homePostalAddress',
+  'streetAddress',
   'description',
   'company',
   'c',
@@ -121,30 +174,6 @@ function valuesOf(v: unknown): string[] {
   return [String(v)];
 }
 
-type ScalarKey =
-  | 'displayName'
-  | 'givenName'
-  | 'surname'
-  | 'email'
-  | 'phone'
-  | 'mobile'
-  | 'title'
-  | 'department'
-  | 'employeeID'
-  | 'employeeNumber'
-  | 'ipPhone'
-  | 'homePhone'
-  | 'homePostalAddress'
-  | 'description'
-  | 'company'
-  | 'c'
-  | 'co'
-  | 'l'
-  | 'st'
-  | 'postalCode';
-
-type ArrayKey = 'otherMailbox' | 'otherHomePhone' | 'otherMobile';
-type EditableKey = ScalarKey | ArrayKey;
 type FieldView = 'organization' | 'contact';
 
 // Sub-sections within Organization and Contact tabs. Each section is a
@@ -168,7 +197,7 @@ const SECTION_LABEL: Record<SectionKey, string> = {
 };
 
 interface ScalarField {
-  key: ScalarKey;
+  key: ScalarAttribute;
   label: string;
   view: FieldView;
   section: SectionKey;
@@ -181,7 +210,7 @@ interface ScalarField {
 }
 
 interface ArrayField {
-  key: ArrayKey;
+  key: MultiValuedAttribute;
   label: string;
   placeholder: string;
   section: SectionKey;
@@ -248,6 +277,13 @@ const SCALAR_FIELDS: ScalarField[] = [
     section: 'phones',
   },
   // Contact → Address -------------------------------------------------
+  {
+    key: 'streetAddress',
+    label: 'Street',
+    multiline: true,
+    view: 'contact',
+    section: 'address',
+  },
   { key: 'l', label: 'City', view: 'contact', section: 'address' },
   { key: 'st', label: 'State / Province', view: 'contact', section: 'address' },
   { key: 'postalCode', label: 'Postal code', view: 'contact', section: 'address' },
@@ -294,37 +330,67 @@ function arrayFieldsForSection(s: SectionKey): ArrayField[] {
 const props = defineProps<{ id: string }>();
 const auth = useAuthStore();
 const toast = useToast();
-const router = useRouter();
 
-const user = ref<UserDetail | null>(null);
-const loading = ref(false);
-const error = ref<string | null>(null);
-const refreshing = ref(false);
-const saving = ref(false);
-const activeTab = ref<TabId>('overview');
+const {
+  draft,
+  reset: resetDraft,
+  changes,
+  changed,
+  dirty,
+  problems,
+  valid,
+  saving,
+  save: saveAttributes,
+  failure: saveFailure,
+  dismiss: dismissSaveFailure,
+} = useUserAttributeEdit({
+  onSaved: async (n) => {
+    toast.add({
+      severity: 'success',
+      summary: 'Attributes saved',
+      detail: `${n} field${n === 1 ? '' : 's'} updated`,
+      life: 3000,
+    });
+    await load();
+  },
+});
+
+const {
+  record: user,
+  loading,
+  error,
+  load,
+  refreshing,
+  refresh,
+} = useUserRecord({
+  id: () => props.id,
+  // The Overview activity card belongs to the previous user: clear it, and
+  // abandon a request for it still in flight.
+  beforeLoad: () => {
+    // Moving to another user drops the record; drop its edits with it, so
+    // the leave prompts never count them while the next one loads or fails.
+    if (!user.value) resetDraft(null);
+    activityRequests.begin();
+    activityLoading.value = false;
+    activityLoaded.value = false;
+    activityEvents.value = [];
+  },
+  onLoaded: resetDraft,
+});
+useRecordCrumb(
+  () => props.id,
+  () => user.value?.displayName ?? user.value?.samAccountName,
+);
+
 const rawFilter = ref('');
 
-// Drives the compact-on-scroll hero. `setHero` is bound to the hero
-// section's :ref; the composable then wires a scroll listener on the
-// nearest scroll ancestor and a ResizeObserver on the hero.
-// `heroCompact` flips when the operator scrolls; `heroHeight` tracks
-// the rendered height so the tab bar's sticky offset can follow the
-// hero's bottom edge mid-animation.
-const { setHero, compact: heroCompact, heroHeight } = useStickyHeader();
-const { setNav: setTabsNav, compact: tabsCompact } = useCompactTabs();
-
-// Capability flags. The Edit toggle handles "are you elevated"; the
-// capability flags decide whether each action surface is offered at all.
 const canUnlock = computed(() => auth.hasCapability('write:user.unlock'));
 const canEdit = computed(() => auth.hasCapability('write:user.attributes'));
-const canEnableDisable = computed(() => auth.hasCapability('write:user.enableDisable'));
 const canResetPassword = computed(() => auth.hasCapability('write:user.resetPassword'));
 const canManageGroups = computed(() => auth.hasCapability('write:group.membership'));
-const canMove = computed(() => auth.hasCapability('write:user.move'));
-const canDeleteUser = computed(() => auth.hasCapability('write:user.delete'));
-// Raw LDAP tab is admin-only — gated by view:raw_attributes (admin role
-// gets all caps, operator/auditor explicitly do not).
-const canViewRaw = computed(() => auth.hasCapability('view:raw_attributes'));
+// The Raw LDAP tab shows only when the API sent the attributes, which it
+// does for view:raw_attributes holders (admins).
+const canViewRaw = computed(() => !!user.value?.rawAttributes);
 
 // Per-user activity feed. Auto-loaded on user load to populate the
 // Overview "Recent activity" card. Fetches a small page (10) since the
@@ -334,111 +400,27 @@ const activityLoading = ref(false);
 const activityLoaded = ref(false);
 const activityError = ref<string | null>(null);
 
+const activityRequests = latestRequest();
+
 async function loadActivity(): Promise<void> {
   if (!user.value || activityLoading.value) return;
+  const isCurrent = activityRequests.begin();
+  const forUserId = user.value.id;
   activityLoading.value = true;
   activityError.value = null;
   try {
-    const r = await api.users.activity(user.value.id, 10);
+    const r = await api.users.activity(forUserId, 10);
+    // Ignore if the operator has moved on to another user meanwhile.
+    if (!isCurrent() || user.value?.id !== forUserId) return;
     activityEvents.value = r.rows;
     activityLoaded.value = true;
   } catch (err) {
+    if (!isCurrent()) return;
     activityError.value = err instanceof Error ? err.message : 'Failed to load activity';
   } finally {
-    activityLoading.value = false;
+    if (isCurrent()) activityLoading.value = false;
   }
 }
-
-// Attribute-edit form state. Scalar fields are stored verbatim. Multi-valued
-// fields (otherMailbox etc.) are stored as a single newline-delimited string
-// that the textarea v-models against, then split on save.
-const form = reactive<Record<EditableKey, string>>({
-  displayName: '',
-  givenName: '',
-  surname: '',
-  email: '',
-  phone: '',
-  mobile: '',
-  title: '',
-  department: '',
-  employeeID: '',
-  employeeNumber: '',
-  ipPhone: '',
-  homePhone: '',
-  homePostalAddress: '',
-  description: '',
-  company: '',
-  c: '',
-  co: '',
-  l: '',
-  st: '',
-  postalCode: '',
-  otherMailbox: '',
-  otherHomePhone: '',
-  otherMobile: '',
-});
-
-function parseLines(s: string): string[] {
-  return s
-    .split('\n')
-    .map((x) => x.trim())
-    .filter((x) => x.length > 0);
-}
-
-function arraysEqual(a: string[], b: string[]): boolean {
-  if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-  return true;
-}
-
-// Per-user edit engagement. Global edit mode (the elevation timer) only means
-// "you *may* edit" — the attribute fields on a given user's page go editable
-// only after the operator engages via the ⋯ → "Edit details" action. That way
-// an open timer doesn't silently treat every user page as being edited.
-const editingUser = ref(false);
-const editActive = computed(() => auth.editMode && editingUser.value);
-
-function resetForm(): void {
-  editingUser.value = false;
-  if (!user.value) return;
-  for (const f of SCALAR_FIELDS) {
-    form[f.key] = user.value[f.key] ?? '';
-  }
-  for (const f of ARRAY_FIELDS) {
-    form[f.key] = (user.value[f.key] ?? []).join('\n');
-  }
-}
-
-// Each dirty entry carries the field key plus the canonical patch value the
-// API expects: a string|null for scalars, a string[]|null for arrays.
-type DirtyEntry =
-  | { key: ScalarKey; kind: 'scalar'; from: string | null; to: string | null }
-  | { key: ArrayKey; kind: 'array'; from: string[]; to: string[] };
-
-const dirtyFields = computed<DirtyEntry[]>(() => {
-  if (!user.value) return [];
-  const changed: DirtyEntry[] = [];
-  for (const f of SCALAR_FIELDS) {
-    const original = user.value[f.key] ?? null;
-    const draft = form[f.key].trim();
-    const next = draft === '' ? null : draft;
-    if (next !== original) changed.push({ key: f.key, kind: 'scalar', from: original, to: next });
-  }
-  for (const f of ARRAY_FIELDS) {
-    const original = user.value[f.key] ?? [];
-    const next = parseLines(form[f.key]);
-    if (!arraysEqual(original, next)) {
-      changed.push({ key: f.key, kind: 'array', from: original, to: next });
-    }
-  }
-  return changed;
-});
-
-const isDirty = computed(() => dirtyFields.value.length > 0);
-
-// Quick membership lookup so per-field templates can highlight modified
-// values without iterating dirtyFields each time.
-const dirtyFieldKeys = computed(() => new Set(dirtyFields.value.map((d) => d.key as string)));
 
 const displayName = computed(() => user.value?.displayName ?? user.value?.samAccountName ?? '—');
 const subtitle = computed(() => {
@@ -470,55 +452,9 @@ function onSignInSelect(id: string): void {
   signInDialogOpen.value = true;
 }
 
-// Which user the page holds, and which load is the latest. Every action on this page targets
-// `user.value`: a record left over from the previous URL, or a slow response for it arriving
-// after the next one, would send a reset or a disable to the wrong person.
-let loadSeq = 0;
-let shownFor: string | null = null;
-
-async function load(): Promise<void> {
-  const seq = ++loadSeq;
-  const wanted = props.id;
-  if (shownFor !== wanted) {
-    user.value = null;
-    shownFor = null;
-  }
-  loading.value = true;
-  error.value = null;
-  // Stale activity cache from a previous user — clear so the Overview card
-  // re-fetches against the new user on next load.
-  activityLoaded.value = false;
-  activityEvents.value = [];
-  try {
-    const resp = await api.users.get(wanted);
-    if (seq !== loadSeq) return; // a newer load has started: this answer is for another page
-    user.value = resp.user;
-    shownFor = wanted;
-    resetForm();
-  } catch (err) {
-    if (seq !== loadSeq) return;
-    if (err instanceof ApiError && err.status === 404) {
-      error.value = 'User not found';
-    } else {
-      error.value = err instanceof Error ? err.message : 'Failed to load user';
-    }
-  } finally {
-    if (seq === loadSeq) loading.value = false;
-  }
-}
-
-async function refreshFromAd(): Promise<void> {
-  // The backend's GET /api/users/:id always live-refreshes against AD before
-  // responding, so reusing `load()` is a sync of just this user.
-  refreshing.value = true;
-  try {
-    await load();
-    if (!error.value) {
-      toast.add({ severity: 'success', summary: 'Refreshed from directory', life: 2500 });
-    }
-  } finally {
-    refreshing.value = false;
-  }
+function refreshFromAd(): Promise<void> {
+  // GET live-refreshes against AD, so a reload is a sync of this one object.
+  return refresh(toast, 'Refreshed from directory');
 }
 
 watch(() => props.id, load);
@@ -528,19 +464,29 @@ onMounted(load);
 //
 // Stop the operator from navigating away (back button, sidebar click, tab
 // close) when there are unsaved field edits in the buffer. Vue Router's
-// onBeforeRouteLeave handles in-app nav; the matching beforeunload listener
-// covers full page unloads.
+// guards handle in-app nav; the matching beforeunload listener covers full
+// page unloads.
 
-onBeforeRouteLeave((_to, _from) => {
-  if (!isDirty.value) return true;
-  const ok = window.confirm(
-    `You have ${dirtyFields.value.length} unsaved change${dirtyFields.value.length === 1 ? '' : 's'}. Leave anyway?`,
-  );
-  return ok;
-});
+const { ask: askToLeave, dialog: leaveDialog } = useConfirm();
+
+function confirmDiscard(): boolean | Promise<boolean> {
+  if (!dirty.value) return true;
+  const n = changes.value.length;
+  return askToLeave({
+    title: 'Discard unsaved changes?',
+    message: `You have ${n} unsaved change${n === 1 ? '' : 's'} on this user.`,
+    confirmLabel: 'Leave without saving',
+    cancelLabel: 'Keep editing',
+    severity: 'warn',
+  });
+}
+
+onBeforeRouteLeave(confirmDiscard);
+// Another user's page reuses this one; switching tabs only changes the query.
+onBeforeRouteUpdate((to, from) => to.params.id === from.params.id || confirmDiscard());
 
 function onBeforeUnload(ev: BeforeUnloadEvent): void {
-  if (!isDirty.value) return;
+  if (!dirty.value) return;
   ev.preventDefault();
   // Modern browsers ignore the message string but require returnValue set.
   ev.returnValue = '';
@@ -549,634 +495,223 @@ function onBeforeUnload(ev: BeforeUnloadEvent): void {
 onMounted(() => window.addEventListener('beforeunload', onBeforeUnload));
 onBeforeUnmount(() => window.removeEventListener('beforeunload', onBeforeUnload));
 
-// When edit mode flips off (manually or via TTL expiry), discard any
-// unsaved drafts. Without this, fields that no longer have a save button
-// would still display stale draft text. We pop a quiet toast only if we
-// actually had to throw something away.
-//
-// One important exception: when the server signals step_up_required during
-// a save, the auth store flips elevated → false to drive the prompt. That
-// looks like "edit mode ended" to this watcher, but the operator's intent
-// is mid-flight — they clicked Save, are about to re-enter their password,
-// and expect the edits to still be there when the dialog clears. Skipping
-// reset+toast on that path keeps the form populated so the queued retry
-// (in saveAttributes' catch) submits the same patch.
-watch(
-  () => auth.editMode,
-  (now, prev) => {
-    if (prev && !now) {
-      if (auth.stepUpRequested) return;
-      if (isDirty.value) {
-        toast.add({
-          severity: 'info',
-          summary: 'Unsaved changes discarded',
-          detail: 'Edit mode ended before you saved.',
-          life: 3500,
-        });
-      }
-      resetForm();
-    }
-  },
-);
-
-// ---- Attribute save / discard --------------------------------------------
-
-async function saveAttributes(): Promise<void> {
-  if (!user.value || !isDirty.value) return;
-  saving.value = true;
-  try {
-    const patch: NonNullable<UserUpdateRequest['patch']> = {};
-    for (const d of dirtyFields.value) {
-      // The patch type is a discriminated union per field. A loose record
-      // cast here keeps the dispatch readable; the server validates each
-      // value's shape via the zod schema.
-      const bag = patch as Record<string, string | null | string[]>;
-      if (d.kind === 'scalar') {
-        bag[d.key] = d.to;
-      } else {
-        // Send null for empty arrays so the server deletes the attribute
-        // outright rather than receiving a no-op replace.
-        bag[d.key] = d.to.length === 0 ? null : d.to;
-      }
-    }
-    await api.users.update(user.value.id, { patch });
-    toast.add({
-      severity: 'success',
-      summary: 'Attributes saved',
-      detail: `${dirtyFields.value.length} field${dirtyFields.value.length === 1 ? '' : 's'} updated`,
-      life: 3000,
-    });
-    await load();
-  } catch (err) {
-    // Step-up required: the API client's global handler already opened
-    // the StepUpDialog. Queue this very save as the retry so a successful
-    // re-auth submits the same patch — the operator should not have to
-    // re-enter edits or click Save a second time. No toast: the dialog
-    // is the operator-visible affordance.
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = saveAttributes;
-      return;
-    }
-    toast.add({
-      severity: 'error',
-      summary: 'Save failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    saving.value = false;
-  }
-}
-
-function discardAttributes(): void {
-  resetForm();
-}
-
-// Exit editing for this user (from the Cancel button). Reverts any pending
-// edits and drops out of edit mode; a toast confirms what happened.
-function cancelEditing(): void {
-  const hadChanges = isDirty.value;
-  resetForm(); // reverts fields and sets editingUser = false
-  toast.add({
-    severity: 'info',
-    summary: hadChanges ? 'Changes discarded' : 'Stopped editing',
-    life: 2500,
-  });
-}
-
 // ---- Hero actions (unlock / enable / disable) ----------------------------
 
-const actionRunning = ref<'unlock' | 'enable' | 'disable' | 'move' | null>(null);
-
-async function doUnlock(): Promise<void> {
-  if (!user.value) return;
-  actionRunning.value = 'unlock';
-  // Snapshot the lock context before the call so the toast can mention it
-  // even though the post-unlock reload clears the fields.
-  const wasLockedAt = user.value.lockedAt;
-  const wouldHaveAutoUnlockedAt = user.value.autoUnlockAt;
-  try {
-    await api.users.unlock(user.value.id);
-    const detailParts: string[] = [
-      `${user.value.displayName ?? user.value.samAccountName} can sign in now.`,
-    ];
-    if (wasLockedAt) {
-      detailParts.push(`Was locked at ${fmtAbsolute(wasLockedAt)}.`);
-    }
-    if (wouldHaveAutoUnlockedAt) {
-      detailParts.push(`Would have auto-unlocked at ${fmtAbsolute(wouldHaveAutoUnlockedAt)}.`);
-    }
-    toast.add({
-      severity: 'success',
-      summary: 'Account unlocked',
-      detail: detailParts.join(' '),
-      life: 5000,
-    });
+const accountActions = useAccountActions<UserDetail>({
+  onDone: async (action, u, offer) => {
+    toast.add(accountActionToast(action, u, offer));
     await load();
-  } catch (err) {
-    toast.add({
-      severity: 'error',
-      summary: 'Unlock failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    actionRunning.value = null;
-  }
-}
+  },
+});
 
-async function doToggleEnabled(disable: boolean): Promise<void> {
-  if (!user.value) return;
-  actionRunning.value = disable ? 'disable' : 'enable';
-  try {
-    if (disable) await api.users.disable(user.value.id);
-    else await api.users.enable(user.value.id);
-    toast.add({
-      severity: 'success',
-      summary: disable ? 'Account disabled' : 'Account enabled',
-      life: 3000,
-    });
-    await load();
-  } catch (err) {
-    toast.add({
-      severity: 'error',
-      summary: disable ? 'Disable failed' : 'Enable failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    actionRunning.value = null;
-  }
+const accountActionRunning = computed(() =>
+  user.value ? accountActions.runningOn(user.value.id) : null,
+);
+
+function runOnUser(action: AccountAction): void {
+  if (user.value) accountActions.run(action, user.value);
 }
 
 // ---- Reset password dialog ------------------------------------------------
 
 const resetDialogOpen = ref(false);
-const resetDraft = ref({
-  newPassword: '',
-  forceChangeAtNextLogin: true,
-  passwordNeverExpires: false,
-});
-const resetSubmitting = ref(false);
-const resetError = ref<string | null>(null);
 
 function openResetDialog(): void {
-  // Both options start unchecked. An unticked "never expires" leaves the flag
-  // as-is (see onResetSubmit) rather than clearing it, so a routine password
-  // reset never silently changes an account's expiry policy.
-  resetDraft.value = {
-    newPassword: '',
-    forceChangeAtNextLogin: false,
-    passwordNeverExpires: false,
-  };
-  resetError.value = null;
   resetDialogOpen.value = true;
 }
 
-// "Never expires" and "force change at next sign-in" can't both apply (AD
-// rule), so checking either one clears the other — both directions.
-function onResetNeverExpiresToggle(): void {
-  if (resetDraft.value.passwordNeverExpires) {
-    resetDraft.value.forceChangeAtNextLogin = false;
-  }
-}
-function onResetForceChangeToggle(): void {
-  if (resetDraft.value.forceChangeAtNextLogin) {
-    resetDraft.value.passwordNeverExpires = false;
-  }
+// ---- Issue Temporary Access Pass -------------------------------------------
+
+const tapDialogOpen = ref(false);
+
+function onTapIssued(): void {
+  void loadActivity();
 }
 
-async function onResetSubmit(): Promise<void> {
-  if (!user.value) return;
-  resetError.value = null;
-  if (resetDraft.value.newPassword.length < 8) {
-    resetError.value = 'New password must be at least 8 characters';
-    return;
-  }
-  resetSubmitting.value = true;
-  try {
-    await api.users.resetPassword(user.value.id, {
-      newPassword: resetDraft.value.newPassword,
-      forceChangeAtNextLogin: resetDraft.value.forceChangeAtNextLogin,
-      // Only send the flag when the operator ticked it; an unticked box means
-      // "leave expiry policy alone", not "clear never-expires".
-      ...(resetDraft.value.passwordNeverExpires ? { passwordNeverExpires: true } : {}),
-    });
-    toast.add({
-      severity: 'success',
-      summary: 'Password reset',
-      detail: resetDraft.value.forceChangeAtNextLogin
-        ? 'User must change at next sign-in'
-        : 'New password is in effect',
-      life: 4000,
-    });
-    resetDialogOpen.value = false;
-    await load();
-  } catch (err) {
-    resetError.value = err instanceof ApiError ? err.message : 'reset failed';
-  } finally {
-    resetSubmitting.value = false;
-  }
+async function onPasswordReset(outcome: ResetOutcome): Promise<void> {
+  toast.add(passwordResetToast(outcome));
+  await load();
 }
 
 // ---- Move to OU ----------------------------------------------------------
 
-const moveDialogOpen = ref(false);
-const moveSubmitting = ref(false);
-const moveError = ref<string | null>(null);
-// PrimeVue TreeSelect uses a record keyed by node `key` for selection state.
-// We always operate on a single OU, so the record will have at most one entry.
-const moveSelection = ref<Record<string, boolean>>({});
-// Loaded once when the dialog opens. Tree is rebuilt reactively from this.
-const moveOus = ref<
-  { distinguishedName: string; name: string; parentDn: string | null; stale: boolean }[]
->([]);
-const moveOusLoading = ref(false);
+const {
+  move: mover,
+  open: moveDialogOpen,
+  show: openMoveDialog,
+  close: closeMoveDialog,
+  dialogFailure: moveDialogFailure,
+  pageFailure: movePageFailure,
+  submitting: moveSubmitting,
+} = useMoveDialog({ kind: 'user', id: () => props.id, onMoved: () => load() });
 
-// Current parent OU of the loaded user (null while no user / DN can't be split).
-const currentOuDn = computed<string | null>(() => {
-  const dn = user.value?.distinguishedName;
-  if (!dn) return null;
-  // Same comma-aware split the API uses; duplicated here so we don't need a
-  // server round-trip just to compute the parent.
-  let i = 0;
-  while (i < dn.length) {
-    const ch = dn[i];
-    if (ch === '\\') {
-      i += 2;
-      continue;
-    }
-    if (ch === ',') return dn.slice(i + 1).trim() || null;
-    i++;
-  }
-  return null;
-});
+// ---- Account expiry ------------------------------------------------------
 
-// Build a PrimeVue TreeNode forest from the flat OU list. OUs whose
-// `parentDn` is unknown to us (e.g. the directory root, or a non-OU
-// container) become roots of the tree.
-const moveOuTree = computed<TreeNode[]>(() => {
-  const all = moveOus.value;
-  if (all.length === 0) return [];
-  const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
-  for (const ou of all) {
-    byDn.set(ou.distinguishedName.toLowerCase(), {
-      key: ou.distinguishedName,
-      label: ou.name,
-      data: { dn: ou.distinguishedName, stale: ou.stale },
-      icon: 'pi pi-folder',
-      children: [],
-    });
-  }
-  const roots: TreeNode[] = [];
-  for (const ou of all) {
-    const node = byDn.get(ou.distinguishedName.toLowerCase())!;
-    const parentKey = ou.parentDn?.toLowerCase();
-    const parent = parentKey ? byDn.get(parentKey) : undefined;
-    if (parent) parent.children!.push(node);
-    else roots.push(node);
-  }
-  // Sort each level alphabetically by label.
-  const sortRec = (nodes: TreeNode[]): void => {
-    nodes.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? ''));
-    for (const n of nodes) if (n.children) sortRec(n.children);
-  };
-  sortRec(roots);
-  return roots;
-});
+const {
+  expiry,
+  open: expiryDialogOpen,
+  show: showExpiryDialog,
+  close: closeExpiryDialog,
+  dialogFailure: expiryDialogFailure,
+  pageFailure: expiryPageFailure,
+  submitting: expirySubmitting,
+} = useExpiryDialog({ id: () => props.id, onSet: () => load() });
 
-const selectedTargetDn = computed<string | null>(() => {
-  const keys = Object.keys(moveSelection.value).filter((k) => moveSelection.value[k]);
-  return keys[0] ?? null;
-});
-
-const moveTargetIsCurrent = computed(() => {
-  const target = selectedTargetDn.value;
-  const current = currentOuDn.value;
-  return target !== null && current !== null && target.toLowerCase() === current.toLowerCase();
-});
-
-async function openMoveDialog(): Promise<void> {
-  moveError.value = null;
-  moveSelection.value = {};
-  moveDialogOpen.value = true;
-  if (moveOus.value.length === 0) {
-    moveOusLoading.value = true;
-    try {
-      const resp = await api.ous.list();
-      moveOus.value = resp.ous;
-    } catch (err) {
-      moveError.value = err instanceof ApiError ? err.message : 'failed to load OUs';
-    } finally {
-      moveOusLoading.value = false;
-    }
-  }
-  // Pre-select the user's current OU so the operator can see where they are
-  // before picking a destination. The TreeSelect renders its parent chain
-  // expanded automatically when a key is preselected.
-  const cur = currentOuDn.value;
-  if (cur) moveSelection.value = { [cur]: true };
+function openExpiryDialog(): void {
+  if (user.value) showExpiryFor(user.value);
 }
 
-async function onMoveSubmit(): Promise<void> {
-  if (!user.value) return;
-  const target = selectedTargetDn.value;
-  if (!target) {
-    moveError.value = 'pick a destination OU';
-    return;
-  }
-  if (moveTargetIsCurrent.value) {
-    moveError.value = 'user is already in that OU';
-    return;
-  }
-  moveError.value = null;
-  moveSubmitting.value = true;
-  actionRunning.value = 'move';
-  try {
-    await api.users.move(user.value.id, { targetOuDn: target });
-    toast.add({
-      severity: 'success',
-      summary: 'User moved',
-      detail: `Now under ${target}`,
-      life: 4000,
-    });
-    moveDialogOpen.value = false;
-    await load();
-  } catch (err) {
-    moveError.value = err instanceof ApiError ? err.message : 'move failed';
-  } finally {
-    moveSubmitting.value = false;
-    actionRunning.value = null;
-  }
+function showExpiryFor(u: UserDetail): void {
+  showExpiryDialog({ id: u.id, name: nameOf(u), accountExpiresAt: u.accountExpiresAt });
 }
+
+// ---- Reassign direct reports ----------------------------------------------
+
+const reassign = useReassignReports({
+  managerId: () => props.id,
+  manager: () => user.value,
+  toast,
+  reload: load,
+});
+const {
+  hasReports,
+  job: reassignJob,
+  jobBusy: reassignJobBusy,
+  jobRunning: reassignRunning,
+  jobFailure: reassignJobFailure,
+} = reassign;
+
+// ---- Sign-in status --------------------------------------------------------
+
+const blockers = computed(() => (user.value ? signInBlockers(user.value) : []));
+const signInNoteList = computed(() => (user.value ? signInNotes(user.value) : []));
+
+const fixes = useSignInFixes<UserDetail>({
+  actions: accountActions,
+  resetPassword: openResetDialog,
+  extendExpiry: showExpiryFor,
+  extendingExpiry: () => expirySubmitting.value,
+});
+
+const primaryFix = computed<SignInFix | null>(() => (user.value ? fixes.fixOf(user.value) : null));
+
+const primaryFixRunning = computed(
+  () => !!user.value && !!primaryFix.value && fixes.running(primaryFix.value, user.value),
+);
+
+function runFix(fix: SignInFix): void {
+  if (user.value) fixes.run(fix, user.value);
+}
+
+const lockoutEndText = computed(() => {
+  const locked = blockers.value.find((b) => b.kind === 'locked');
+  return locked ? lockoutEnd(locked) : null;
+});
+
+// A failed account action, or a failed move or expiry change its dialog
+// isn't showing (an Undo), shows under the Actions menu.
+const actionFailure = computed<ActionFailure | null>(
+  () => fixes.actionFailureOn(props.id) ?? movePageFailure.value ?? expiryPageFailure.value,
+);
 
 // ---- Group membership: remove + add --------------------------------------
 
-const groupBusy = ref<string | null>(null);
-
-// Removing a group is destructive and a single click on the chip's "x" was
-// too easy to trigger by accident. Funnel removals through a confirmation
-// dialog with an explicit Cancel/Remove choice.
-const removeConfirm = ref<{ groupId: string; label: string } | null>(null);
-
-function requestRemoveGroup(groupId: string, label: string): void {
-  if (!user.value || groupBusy.value !== null) return;
-  removeConfirm.value = { groupId, label };
+async function onMembershipChanged(
+  change: MembershipChange,
+  m: Membership,
+  offer: UndoOffer,
+): Promise<void> {
+  toast.add(
+    undoable({ severity: 'success', summary: membershipDoneText(change, m), life: 3000 }, offer),
+  );
+  await load();
 }
 
-function cancelRemoveGroup(): void {
-  removeConfirm.value = null;
-}
+const {
+  pending: groupPending,
+  remove: removeMembership,
+  failure: removeFailure,
+  retry: retryRemove,
+  dismiss: dismissRemoveFailure,
+} = useGroupMembership({ onChanged: onMembershipChanged });
 
-async function confirmRemoveGroup(): Promise<void> {
-  const pending = removeConfirm.value;
-  if (!pending || !user.value) return;
-  groupBusy.value = pending.groupId;
-  try {
-    await api.users.removeGroup(user.value.id, { groupId: pending.groupId });
-    toast.add({ severity: 'success', summary: `Removed from ${pending.label}`, life: 3000 });
-    removeConfirm.value = null;
-    await load();
-  } catch (err) {
-    toast.add({
-      severity: 'error',
-      summary: 'Remove failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    groupBusy.value = null;
-  }
-}
-
-// ---- Delete user ---------------------------------------------------------
-
-const deleteConfirmOpen = ref(false);
-const deleting = ref(false);
-
-function openDeleteDialog(): void {
-  deleteConfirmOpen.value = true;
-}
-
-// Enter edit mode from the actions menu — a discoverable alternative to the
-// global edit-mode FAB. Lands on the Organization tab (where the editable
-// attribute grid lives) and elevates via requireEdit; that flips editMode on,
-// turning the fields into inputs and revealing the Save bar.
-function startEditDetails(): void {
-  // Elevate if needed, then engage editing for THIS user and jump to the
-  // attribute grid. Editing stays off until this runs.
-  auth.requireEdit(() => {
-    editingUser.value = true;
-    activeTab.value = 'organization';
-  });
-}
-
-// ---- Account expiration ---------------------------------------------------
-const expiryOpen = ref(false);
-const expiryNever = ref(true);
-const expiryDate = ref<Date | null>(null);
-const expirySaving = ref(false);
-const expiryError = ref<string | null>(null);
-
-function openExpiryDialog(): void {
-  const cur = user.value?.accountExpiresAt ?? null;
-  expiryNever.value = !cur;
-  expiryDate.value = cur ? new Date(cur) : null;
-  expiryError.value = null;
-  expiryOpen.value = true;
-}
-
-async function saveExpiry(): Promise<void> {
-  if (!user.value) return;
-  if (!expiryNever.value && !expiryDate.value) {
-    expiryError.value = 'Pick a date, or choose “Never expires”.';
-    return;
-  }
-  expiryError.value = null;
-  expirySaving.value = true;
-  try {
-    await api.users.update(user.value.id, {
-      patch: { accountExpiresAt: expiryNever.value ? null : expiryDate.value!.toISOString() },
-    });
-    toast.add({
-      severity: 'success',
-      summary: 'Account expiration updated',
-      detail: expiryNever.value
-        ? 'Set to never expire.'
-        : `Expires ${fmtAbsolute(expiryDate.value!.toISOString())}.`,
-      life: 4000,
-    });
-    expiryOpen.value = false;
-    await load();
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = saveExpiry;
-      return;
-    }
-    expiryError.value = err instanceof ApiError ? err.message : String(err);
-  } finally {
-    expirySaving.value = false;
-  }
-}
-
-// ---- Password expiration --------------------------------------------------
-// AD has no per-user "password expires on <date>" attribute — expiry is domain
-// policy (maxPwdAge) applied to pwdLastSet. The two per-user handles are:
-//   • "Password never expires" flag (DONT_EXPIRE_PASSWORD) — the toggle below.
-//   • "Expire now" → pwdLastSet=0, i.e. must change at next sign-in.
-const pwdExpiryOpen = ref(false);
-const pwdNever = ref(false);
-const pwdSaving = ref(false);
-const pwdExpiringNow = ref(false);
-const pwdExpiryError = ref<string | null>(null);
-
-function openPwdExpiryDialog(): void {
-  pwdNever.value = user.value?.passwordNeverExpires ?? false;
-  pwdExpiryError.value = null;
-  pwdExpiryOpen.value = true;
-}
-
-const pwdNeverDirty = computed(
-  () => pwdNever.value !== (user.value?.passwordNeverExpires ?? false),
-);
-
-async function savePwdNeverExpires(): Promise<void> {
-  if (!user.value || !pwdNeverDirty.value) return;
-  pwdExpiryError.value = null;
-  pwdSaving.value = true;
-  try {
-    await api.users.setPasswordNeverExpires(user.value.id, pwdNever.value);
-    toast.add({
-      severity: 'success',
-      summary: 'Password expiration updated',
-      detail: pwdNever.value
-        ? 'Password set to never expire.'
-        : 'Password now follows the domain expiry policy.',
-      life: 4000,
-    });
-    pwdExpiryOpen.value = false;
-    await load();
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = savePwdNeverExpires;
-      return;
-    }
-    pwdExpiryError.value = err instanceof ApiError ? err.message : String(err);
-  } finally {
-    pwdSaving.value = false;
-  }
-}
-
-async function expirePasswordNow(): Promise<void> {
-  if (!user.value) return;
-  pwdExpiryError.value = null;
-  pwdExpiringNow.value = true;
-  try {
-    await api.users.expirePassword(user.value.id);
-    toast.add({
-      severity: 'success',
-      summary: 'Password expired',
-      detail: 'The user must change their password at next sign-in.',
-      life: 4000,
-    });
-    pwdExpiryOpen.value = false;
-    await load();
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = expirePasswordNow;
-      return;
-    }
-    pwdExpiryError.value = err instanceof ApiError ? err.message : String(err);
-  } finally {
-    pwdExpiringNow.value = false;
-  }
-}
-
-async function confirmDelete(): Promise<void> {
-  if (!user.value || deleting.value) return;
-  deleting.value = true;
-  try {
-    const label = user.value.displayName || user.value.samAccountName;
-    await api.users.remove(user.value.id);
-    toast.add({
-      severity: 'success',
-      summary: 'User deleted',
-      detail: `${label} was removed from Active Directory.`,
-      life: 5000,
-    });
-    deleteConfirmOpen.value = false;
-    // The account is gone — leave the (now-stale) detail page for the list.
-    router.push('/users');
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = confirmDelete;
-      return;
-    }
-    toast.add({
-      severity: 'error',
-      summary: 'Delete failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    deleting.value = false;
-  }
+function removeGroup(group: UserDetail['groupMemberships'][number]): void {
+  if (user.value) removeMembership(membershipOf(user.value, group));
 }
 
 const addGroupOpen = ref(false);
-const groupSearchQuery = ref('');
-const groupSearchResults = ref<GroupSummary[]>([]);
-const groupSearchLoading = ref(false);
-let groupSearchTimer: ReturnType<typeof setTimeout> | undefined;
-
-function openAddGroupDialog(): void {
-  groupSearchQuery.value = '';
-  groupSearchResults.value = [];
-  addGroupOpen.value = true;
-}
-
-watch(groupSearchQuery, (q) => {
-  if (groupSearchTimer) clearTimeout(groupSearchTimer);
-  if (q.trim().length < 2) {
-    groupSearchResults.value = [];
-    return;
-  }
-  groupSearchTimer = setTimeout(async () => {
-    groupSearchLoading.value = true;
-    try {
-      const resp = await api.groups.search({ q: q.trim(), pageSize: 12 });
-      groupSearchResults.value = resp.rows;
-    } catch {
-      groupSearchResults.value = [];
-    } finally {
-      groupSearchLoading.value = false;
-    }
-  }, 200);
+const {
+  error: addGroupError,
+  query: groupSearchQuery,
+  queryTooShort: groupQueryTooShort,
+  ready: addGroupReady,
+  results: groupSearchResults,
+  truncated: groupResultsTruncated,
+  searching: groupSearchLoading,
+  searchError: groupSearchError,
+  existing: existingMembership,
+  adding: addingGroupId,
+  load: loadAddGroup,
+  add: addToGroup,
+  failure: addFailure,
+  retry: retryAdd,
+  dismiss: dismissAddFailure,
+} = useAddToGroup({
+  onChanged: async (change, m, offer) => {
+    if (change === 'add') addGroupOpen.value = false;
+    await onMembershipChanged(change, m, offer);
+  },
 });
 
-async function doAddGroup(group: GroupSummary): Promise<void> {
-  if (!user.value) return;
-  groupBusy.value = group.id;
-  try {
-    await api.users.addGroup(user.value.id, { groupId: group.id });
-    toast.add({ severity: 'success', summary: `Added to ${group.name}`, life: 3000 });
-    addGroupOpen.value = false;
-    await load();
-  } catch (err) {
-    toast.add({
-      severity: 'error',
-      summary: 'Add failed',
-      detail: err instanceof ApiError ? err.message : String(err),
-      life: 6000,
-    });
-  } finally {
-    groupBusy.value = null;
-  }
+const isThisUsers = (f: MembershipFailure) => f.op.membership.memberId === props.id;
+const { onPage: removePageFailure } = placeFailure(removeFailure, { belongsHere: isThisUsers });
+const { inDialog: addDialogFailure, onPage: addPageFailure } = placeFailure(addFailure, {
+  belongsHere: isThisUsers,
+  dialog: { open: () => addGroupOpen.value, made: (f) => !f.undo },
+});
+
+// Closing the dialog gives up on an add that failed in it.
+function closeAddGroupDialog(): void {
+  addGroupOpen.value = false;
+  if (addDialogFailure.value) dismissAddFailure();
 }
 
-const existingGroupIds = computed(
-  () => new Set((user.value?.groupMemberships ?? []).map((g) => g.id)),
+// A failed remove, or a failed change the add dialog isn't showing (an
+// Undo), shows on the Groups tab.
+const groupFailure = computed(() => {
+  const remove = removePageFailure.value;
+  const add = addPageFailure.value;
+  const [f, retry, dismiss] = remove
+    ? [remove, retryRemove, dismissRemoveFailure]
+    : add
+      ? [add, retryAdd, dismissAddFailure]
+      : [null, null, null];
+  if (!f) return null;
+  return {
+    summary: `Couldn’t ${membershipChangeText(f.op.change, f.op.membership)}`,
+    message: f.message,
+    retry,
+    dismiss,
+  };
+});
+
+// Another user's page reuses this one; what failed on the last one is moot.
+watch(
+  () => props.id,
+  () => {
+    accountActions.dismiss();
+    mover.dismiss();
+    expiry.dismiss();
+    dismissRemoveFailure();
+    dismissAddFailure();
+  },
 );
+
+function openAddGroupDialog(): void {
+  if (!user.value) return;
+  addGroupOpen.value = true;
+  void loadAddGroup(user.value.id);
+}
 
 // Filter + alphabetical sort + direct/inherited split for the Groups tab.
 // AD returns memberships in arbitrary order; sorting by display name keeps
@@ -1235,123 +770,158 @@ const filteredRawRows = computed<AttrRow[]>(() => {
   });
 });
 
-// ---- Hero launcher links -------------------------------------------------
+// ---- Header ----------------------------------------------------------------
 
-const mailtoHref = computed(() => (user.value?.email ? `mailto:${user.value.email}` : null));
-// `msteams:/l/chat/0/0?users=…` is the documented deep-link form. Browsers
-// hand this off to the OS handler — the same way `mailto:` does — so
-// clicking opens the Teams desktop app (or prompts to open it).
-const teamsHref = computed(() =>
-  user.value?.email ? `msteams:/l/chat/0/0?users=${encodeURIComponent(user.value.email)}` : null,
-);
-
-// Render a DN with the leading `CN=…` segment stripped so it doesn't repeat
-// the heading. Falls back to the full DN if the CN doesn't match the
-// displayed name.
-const dnPath = computed(() => {
-  const dn = user.value?.distinguishedName ?? '';
-  if (!dn) return '';
-  const m = /^CN=([^,]+),(.*)$/i.exec(dn);
-  if (!m) return dn;
-  const cn = m[1]!.replace(/\\,/g, ',');
-  const rest = m[2]!;
-  const heading = (user.value?.displayName ?? user.value?.samAccountName ?? '').trim();
-  return cn === heading ? rest : dn;
+// The email when there is one, else the UPN or SAM name.
+const identifier = computed(() => {
+  const u = user.value;
+  if (!u) return null;
+  if (u.email) return { text: u.email, copyLabel: 'email' };
+  return { text: u.userPrincipalName ?? u.samAccountName };
 });
 
-// Actions dropdown — replaces the row of action buttons that used to live
-// under the hero. Items are still rendered when edit mode is off so the
-// operator can see what's available, but they're disabled until editing
-// is unlocked (matching the previous button behavior).
-const actionsMenu = ref<InstanceType<typeof Menu> | null>(null);
+// `msteams:/l/chat/0/0?users=…` is the documented deep-link form. Browsers
+// hand it to the OS handler, as with `mailto:`, so it opens the Teams app.
+const links = computed<ObjectLink[]>(() => {
+  const email = user.value?.email;
+  if (!email) return [];
+  return [
+    { label: 'Email', icon: 'pi-envelope', href: `mailto:${email}`, title: 'Send email' },
+    {
+      label: 'Teams',
+      icon: 'pi-comments',
+      href: `msteams:/l/chat/0/0?users=${encodeURIComponent(email)}`,
+      title: 'Open Teams chat',
+    },
+  ];
+});
 
-function toggleActionsMenu(event: Event): void {
-  actionsMenu.value?.toggle(event);
+// Listed while the record loads too, so the layout can hold the Actions
+// button's place.
+const actions = computed<ObjectAction[]>(() => {
+  const u = user.value;
+  // The only disable case is "an action of this kind is already running" so
+  // the operator can't double-fire.
+  const busy =
+    accountActionRunning.value !== null || moveSubmitting.value || expirySubmitting.value;
+  const userAction = (action: UserAction, run: () => void): ObjectAction => {
+    const info = USER_ACTIONS[action];
+    return {
+      label: userActionLabel(action, accountActionRunning.value),
+      icon: info.icon,
+      capability: info.capability,
+      shortcut: info.shortcut,
+      unavailable: u ? userActionUnavailable(action, u) : null,
+      ...(info.danger ? { danger: true } : {}),
+      // Reset password runs in its dialog.
+      ...(info.running ? { disabled: busy } : {}),
+      run,
+    };
+  };
+  return [
+    ...USER_ACTION_ORDER.map((a) =>
+      userAction(a, a === 'reset-password' ? openResetDialog : () => runOnUser(a)),
+    ),
+    ...(u?.entra?.temporaryAccessPass
+      ? [
+          {
+            label: 'Issue Temporary Access Pass…',
+            icon: 'pi-ticket',
+            capability: 'write:user.issueTap',
+            shortcut: SHORTCUT_KEYS.user.issueTap,
+            unavailable: u.enabled ? null : 'the account is disabled',
+            run: () => {
+              tapDialogOpen.value = true;
+            },
+          } satisfies ObjectAction,
+        ]
+      : []),
+    {
+      label: expirySubmitting.value ? 'Saving expiry…' : 'Account expiry…',
+      icon: 'pi-calendar',
+      capability: 'write:user.enableDisable',
+      disabled: busy,
+      run: openExpiryDialog,
+    },
+    {
+      label: moveSubmitting.value ? 'Moving…' : 'Move to OU…',
+      icon: 'pi-folder-open',
+      capability: 'write:user.move',
+      shortcut: SHORTCUT_KEYS.user.move,
+      disabled: busy,
+      run: openMoveDialog,
+    },
+    {
+      label: 'Rename…',
+      icon: 'pi-id-card',
+      capability: 'write:user.rename',
+      disabled: busy,
+      run: () => {
+        renameDialogOpen.value = true;
+      },
+    },
+    {
+      label: 'Copy…',
+      icon: 'pi-copy',
+      capability: 'write:user.create',
+      run: () => {
+        copyDialogOpen.value = true;
+      },
+    },
+    {
+      label: 'Reassign direct reports…',
+      icon: 'pi-sitemap',
+      capability: 'write:user.attributes',
+      unavailable: u && !hasReports.value ? 'has no direct reports' : null,
+      disabled: reassignRunning.value,
+      run: reassign.open,
+    },
+    // Delete is offered only once the account is disabled, which is also
+    // what the server enforces.
+    {
+      label: 'Delete…',
+      icon: 'pi-trash',
+      capability: 'write:user.delete',
+      unavailable: u?.enabled === false ? null : 'only a disabled account can be deleted',
+      danger: true,
+      disabled: busy,
+      run: () => {
+        deleteDialogOpen.value = true;
+      },
+    },
+  ];
+});
+
+// ---- Rename / delete -------------------------------------------------------
+// Both run in their own dialogs; the view only opens them and reacts.
+const router = useRouter();
+const renameDialogOpen = ref(false);
+const deleteDialogOpen = ref(false);
+const copyDialogOpen = ref(false);
+
+/** The operator lands on the copy's page. */
+async function onCopied(created: UserCreateResponse): Promise<void> {
+  copyDialogOpen.value = false;
+  if (created.id) await router.push({ name: 'user-detail', params: { id: created.id } });
+  announceUserCreated(toast, created);
 }
 
-const actionItems = computed<MenuItem[]>(() => {
-  const items: MenuItem[] = [];
-  const u = user.value;
-  if (!u) return items;
-  // Buttons stay clickable whether or not edit mode is on — `auth.requireEdit`
-  // pops the StepUpDialog for an unauthenticated operator and auto-fires the
-  // action after they authenticate. The only disable case is "an action of
-  // this kind is already running" so the operator can't double-fire.
-  const busy = actionRunning.value !== null;
+async function onRenamed(): Promise<void> {
+  toast.add({ severity: 'success', summary: 'User renamed', life: 4000 });
+  await load();
+}
 
-  if (canEdit.value) {
-    if (!editingUser.value) {
-      items.push({
-        label: 'Edit details…',
-        icon: 'pi pi-pencil',
-        command: startEditDetails,
-      });
-    }
-    items.push({
-      label: 'Set account expiration…',
-      icon: 'pi pi-calendar',
-      command: () => auth.requireEdit(openExpiryDialog),
-    });
-    items.push({
-      label: 'Password expiration…',
-      icon: 'pi pi-clock',
-      command: () => auth.requireEdit(openPwdExpiryDialog),
-    });
-  }
-
-  if (canUnlock.value && u.locked) {
-    items.push({
-      label: actionRunning.value === 'unlock' ? 'Unlocking…' : 'Unlock account',
-      icon: 'pi pi-unlock',
-      disabled: busy,
-      command: () => auth.requireEdit(doUnlock),
-    });
-  }
-  if (canResetPassword.value) {
-    items.push({
-      label: 'Reset password…',
-      icon: 'pi pi-key',
-      class: 'menu-item-danger',
-      command: () => auth.requireEdit(openResetDialog),
-    });
-  }
-  if (canEnableDisable.value) {
-    if (u.enabled) {
-      items.push({
-        label: actionRunning.value === 'disable' ? 'Disabling…' : 'Disable account',
-        icon: 'pi pi-ban',
-        class: 'menu-item-danger',
-        disabled: busy,
-        command: () => auth.requireEdit(() => doToggleEnabled(true)),
-      });
-    } else {
-      items.push({
-        label: actionRunning.value === 'enable' ? 'Enabling…' : 'Enable account',
-        icon: 'pi pi-check',
-        disabled: busy,
-        command: () => auth.requireEdit(() => doToggleEnabled(false)),
-      });
-    }
-  }
-  if (canMove.value) {
-    items.push({
-      label: actionRunning.value === 'move' ? 'Moving…' : 'Move to OU…',
-      icon: 'pi pi-folder-open',
-      disabled: busy,
-      command: () => auth.requireEdit(openMoveDialog),
-    });
-  }
-  if (canDeleteUser.value) {
-    items.push({
-      label: 'Delete account…',
-      icon: 'pi pi-trash',
-      class: 'menu-item-danger',
-      disabled: busy,
-      command: () => auth.requireEdit(openDeleteDialog),
-    });
-  }
-  return items;
-});
+function onDeleted(deletedIds: string[]): void {
+  if (!deletedIds.includes(props.id)) return;
+  toast.add({
+    severity: 'success',
+    summary: 'Account deleted',
+    detail: `${user.value?.displayName ?? user.value?.samAccountName ?? 'The account'} was deleted.`,
+    life: 5000,
+  });
+  deleteDialogOpen.value = false;
+  void router.push({ name: 'user-search' });
+}
 
 // Render the user's location as a proper postal address: the city/state/postal
 // code on one line, country on the next. Empty parts are dropped — values are
@@ -1373,36 +943,29 @@ function addressLines(u: UserDetail | null): string[] {
 
 const overviewLocation = computed(() => addressLines(user.value));
 
-// Tab specs drive the nav rendering so we can hide capability-gated tabs
-// without scattering v-ifs across the template.
-interface TabSpec {
-  id: TabId;
-  label: string;
-  icon: string; // PrimeIcon variant class, e.g. 'pi-th-large'
-  count?: number;
-  visible: boolean;
-  // When true, the tab always renders icon-only (label hidden, native
-  // tooltip on hover). Used for tabs whose icon is universal enough to
-  // stand on its own — Overview and Debug — so the bar has more room
-  // for word labels on the more ambiguous tabs.
-  iconOnly?: boolean;
-}
-const tabs = computed<TabSpec[]>(() => {
+// Overview and Debug are icon-only: their icons stand on their own, which
+// leaves room for labels on the others.
+const tabs = computed<ObjectPageTab<TabId>[]>(() => {
   const u = user.value;
-  const list: TabSpec[] = [
+  const list: ObjectPageTab<TabId>[] = [
     { id: 'overview', label: 'Overview', icon: 'pi-th-large', visible: true, iconOnly: true },
     { id: 'organization', label: 'Organization', icon: 'pi-sitemap', visible: true },
     { id: 'contact', label: 'Contact', icon: 'pi-envelope', visible: true },
     { id: 'account', label: 'Account', icon: 'pi-id-card', visible: true },
   ];
-  const groupsTab: TabSpec = {
+  list.push({
     id: 'groups',
     label: 'Groups',
     icon: 'pi-users',
+    count: u?.groupMemberships.length ?? 0,
     visible: true,
-  };
-  if (u) groupsTab.count = u.groupMemberships.length;
-  list.push(groupsTab);
+  });
+  list.push({
+    id: 'licenses',
+    label: 'Licenses',
+    icon: LICENSE_ICON,
+    visible: !!u?.entra?.licenses,
+  });
   // Sign-ins is conditional on an Entra integration. We use the same
   // `entra` field the response carries when integration is enabled —
   // null = not configured, so the tab disappears entirely.
@@ -1422,13 +985,6 @@ const tabs = computed<TabSpec[]>(() => {
   return list;
 });
 
-// If the active tab gets hidden (e.g. capability changes), fall back to overview
-watch(tabs, (list) => {
-  if (!list.find((t) => t.id === activeTab.value && t.visible)) {
-    activeTab.value = 'overview';
-  }
-});
-
 // First N groups for the Overview summary
 const groupsTop = computed(() => (user.value?.groupMemberships ?? []).slice(0, 5));
 const activityTop = computed(() => activityEvents.value.slice(0, 5));
@@ -1437,415 +993,529 @@ const activityTop = computed(() => activityEvents.value.slice(0, 5));
 watch(user, (u) => {
   if (u && !activityLoaded.value && !activityLoading.value) void loadActivity();
 });
-
-const copied = ref<{ email: boolean; dn: boolean }>({ email: false, dn: false });
-async function copy(kind: 'email' | 'dn'): Promise<void> {
-  const u = user.value;
-  if (!u) return;
-  const text = kind === 'email' ? (u.email ?? '') : u.distinguishedName;
-  if (!text) return;
-  try {
-    await navigator.clipboard.writeText(text);
-    copied.value = { ...copied.value, [kind]: true };
-    setTimeout(() => {
-      copied.value = { ...copied.value, [kind]: false };
-    }, 1800);
-  } catch {
-    toast.add({ severity: 'warn', summary: 'Clipboard unavailable', life: 2500 });
-  }
-}
 </script>
 
 <template>
-  <Toast />
-  <div class="page-inner detail-page" :style="{ '--detail-sticky-offset': `${heroHeight}px` }">
+  <AppToast />
+  <div class="page-inner detail-page">
     <Message v-if="error" severity="error" :closable="false">{{ error }}</Message>
 
-    <div v-if="user" class="detail-stack">
-      <!-- Hero. Two-column layout: avatar + identity + identifier line +
-           launchers + DN, with a compact meta strip on the right. Actions
-           live on the tab bar (not here) so the hero stays focused on
-           "who is this" rather than "what can I do." -->
-      <section :ref="setHero" class="detail-hero" :class="{ 'is-compact': heroCompact }">
-        <Avatar
-          :name="user.displayName ?? user.samAccountName"
-          :seed="user.samAccountName"
-          :size="heroCompact ? 28 : 80"
-          :photo-url="photoUrl"
-        />
-
-        <div class="detail-hero-main">
-          <div class="detail-hero-row">
-            <h1 class="detail-hero-name">{{ displayName }}</h1>
-            <StatusBadge :user="user" size="lg" />
-            <span
-              v-if="user.isPrivileged"
-              class="badge badge-amber badge-lg"
-              title="AD adminCount=1 — this account is or was a member of a protected group. AD does not clear adminCount automatically when removed, so verify current group memberships before relying on this."
-            >
-              <i class="pi pi-shield" /> privileged
-            </span>
-            <span
-              v-if="user.passwordNeverExpires"
-              class="badge badge-violet badge-lg"
-              title="DONT_EXPIRE_PASSWORD set"
-            >
-              <i class="pi pi-shield" /> never expires
-            </span>
-            <span v-if="user.freshness.isStale" class="badge badge-amber badge-lg stale-flag">
-              <span class="badge-dot" /> Cache stale
-            </span>
-          </div>
-
-          <div v-if="subtitle" class="detail-hero-title">{{ subtitle }}</div>
-
-          <!-- Primary identifier line. Prefers the email; falls back
-               to UPN/SAM only when no email is set. -->
-          <button
-            v-if="user.email"
-            type="button"
-            class="copybtn copybtn-inline"
-            :title="copied.email ? 'Copied!' : 'Copy email'"
-            @click="copy('email')"
-          >
-            <i :class="copied.email ? 'pi pi-check' : 'pi pi-copy'" />
-            <span class="mono">{{ user.email }}</span>
-          </button>
-          <div v-else class="detail-hero-upn mono">
-            {{ user.userPrincipalName ?? user.samAccountName }}
-          </div>
-
-          <!-- Email / Teams launchers + DN copy live on a single row to
-               keep the hero tight. -->
-          <div class="detail-hero-actions-row">
-            <a v-if="mailtoHref" class="copybtn launcher" :href="mailtoHref" title="Send email">
-              <i class="pi pi-envelope" />
-              <span>Email</span>
-            </a>
-            <a v-if="teamsHref" class="copybtn launcher" :href="teamsHref" title="Open Teams chat">
-              <i class="pi pi-comments" />
-              <span>Teams</span>
-            </a>
-            <button
-              type="button"
-              class="copybtn launcher hero-path"
-              :title="copied.dn ? 'Copied!' : 'Copy distinguished name'"
-              @click="copy('dn')"
-            >
-              <i :class="copied.dn ? 'pi pi-check' : 'pi pi-sitemap'" />
-              <span class="mono hero-path-text">{{ dnPath }}</span>
-            </button>
-          </div>
-        </div>
-      </section>
-
-      <!-- Tabs. Actions menu lives at the right end of the bar so it's
-           always one click away regardless of which tab is active. The
-           menu items themselves stay disabled until edit mode is on,
-           which provides the "you need to enable editing" affordance
-           without an extra hint chip. -->
-      <nav
-        :ref="setTabsNav"
-        class="ds-tabs ds-tabs-with-actions"
-        :class="{ compact: tabsCompact, 'hero-compact': heroCompact }"
-        role="tablist"
-      >
-        <button
-          v-for="t in tabs.filter((t) => t.visible)"
-          :key="t.id"
-          type="button"
-          role="tab"
-          class="ds-tab"
-          :class="{ active: activeTab === t.id, 'icon-only': t.iconOnly }"
-          :aria-selected="activeTab === t.id"
-          :title="tabsCompact || t.iconOnly ? t.label : undefined"
-          :aria-label="t.label"
-          @click="activeTab = t.id"
+    <ObjectPageLayout
+      v-if="user || loading"
+      kind="user"
+      :loading="!user"
+      :skeleton="{ status: true, subtitle: true, cards: 4 }"
+      :name="displayName"
+      :avatar="{
+        name: user?.displayName ?? user?.samAccountName ?? null,
+        seed: user?.samAccountName ?? null,
+        photoUrl,
+      }"
+      :subtitle="subtitle"
+      :identifier="identifier"
+      :dn="user?.distinguishedName ?? ''"
+      :links="links"
+      :tabs="tabs"
+      fallback-tab="overview"
+      :actions="actions"
+      :actions-busy="accountActionRunning !== null || moveSubmitting || expirySubmitting"
+      :action-failure="actionFailure"
+      :refreshing="refreshing"
+      :cached-at="user?.freshness.cachedAt ?? null"
+      :live-refreshed-at="user?.freshness.liveRefreshedAt ?? null"
+      @refresh="refreshFromAd"
+    >
+      <template v-if="user" #badges>
+        <StatusBadge :user="user" size="lg" />
+        <span
+          v-if="user.isPrivileged"
+          class="badge badge-amber badge-lg"
+          title="AD adminCount=1 — this account is or was a member of a protected group. AD does not clear adminCount automatically when removed, so verify current group memberships before relying on this."
         >
-          <i :class="['pi', t.icon]" aria-hidden="true" />
-          <span class="ds-tab-label">{{ t.label }}</span>
-          <span v-if="t.count !== undefined" class="ds-tab-count mono">{{ t.count }}</span>
-        </button>
-        <div class="ds-tabs-spacer" />
-        <Button
-          icon="pi pi-refresh"
-          text
-          severity="secondary"
-          size="small"
-          :loading="refreshing"
-          title="Refresh from directory"
-          class="ds-tabs-refresh"
-          @click="refreshFromAd"
+          <i class="pi pi-shield" /> privileged
+        </span>
+        <span
+          v-if="user.passwordNeverExpires"
+          class="badge badge-violet badge-lg"
+          title="DONT_EXPIRE_PASSWORD set"
+        >
+          <i class="pi pi-shield" /> never expires
+        </span>
+        <span v-if="user.freshness.isStale" class="badge badge-amber badge-lg stale-flag">
+          <span class="badge-dot" /> Cache stale
+        </span>
+      </template>
+
+      <template v-if="user" #status>
+        <SignInStatus
+          :blockers="blockers"
+          :notes="signInNoteList"
+          :last-logon-at="user.lastLogonAt"
         />
-        <div v-if="auth.canEverWrite && actionItems.length > 0" class="ds-tabs-actions">
-          <Button
-            label="Actions"
-            icon="pi pi-chevron-down"
-            icon-pos="right"
-            severity="secondary"
-            text
-            size="small"
-            :loading="actionRunning !== null"
-            aria-haspopup="true"
-            aria-controls="user-actions-menu"
-            @click="toggleActionsMenu"
-          />
-          <Menu id="user-actions-menu" ref="actionsMenu" :model="actionItems" :popup="true" />
-        </div>
-      </nav>
+      </template>
 
-      <!-- Overview — at-a-glance summary that aggregates the most-asked-about
+      <template v-if="primaryFix" #primary="{ compact }">
+        <Button
+          :label="primaryFix.label"
+          :icon="`pi ${primaryFix.icon}`"
+          :size="compact ? 'small' : undefined"
+          :loading="primaryFixRunning"
+          :disabled="accountActionRunning !== null || moveSubmitting || expirySubmitting"
+          @click="runFix(primaryFix)"
+        />
+      </template>
+
+      <template v-if="user" #default="{ tab: activeTab, select: selectTab }">
+        <BulkJobPanel
+          v-if="reassignJob"
+          :job="reassignJob"
+          :failure="reassignJobFailure"
+          :busy="reassignJobBusy"
+          @stop="reassign.stopJob"
+          @continue="reassign.continueJob"
+          @retry="reassign.retryFailed"
+          @revert="reassign.revertJob"
+          @dismiss="reassign.dismissJob"
+        />
+        <!-- Overview — at-a-glance summary that aggregates the most-asked-about
            pieces from each detail tab so the operator does not have to hunt. -->
-      <div v-if="activeTab === 'overview'" class="detail-grid">
-        <Card title="Organization">
-          <dl class="kv-grid">
-            <dt class="fld-label">Title</dt>
-            <dd>{{ user.title ?? '—' }}</dd>
-            <dt class="fld-label">Department</dt>
-            <dd>{{ user.department ?? '—' }}</dd>
-            <dt class="fld-label">Company</dt>
-            <dd>{{ user.company ?? '—' }}</dd>
-            <dt class="fld-label">Manager</dt>
-            <dd>
-              <router-link
-                v-if="user.manager?.id"
-                :to="{ name: 'user-detail', params: { id: user.manager.id } }"
-                class="reports-link"
-              >
-                <i class="pi pi-user" />
-                <span>{{ user.manager.displayName ?? user.manager.distinguishedName }}</span>
-              </router-link>
-              <span v-else-if="user.manager">{{
-                user.manager.displayName ?? user.manager.distinguishedName
-              }}</span>
-              <span v-else>—</span>
-            </dd>
-          </dl>
-        </Card>
-
-        <Card title="Contact">
-          <dl class="kv-grid">
-            <dt class="fld-label">Email</dt>
-            <dd class="mono kv-wrap">{{ user.email ?? '—' }}</dd>
-            <dt class="fld-label">Mobile</dt>
-            <dd class="mono">{{ user.mobile ?? '—' }}</dd>
-            <dt class="fld-label">Work phone</dt>
-            <dd class="mono">{{ user.phone ?? '—' }}</dd>
-            <dt class="fld-label kv-top">Location</dt>
-            <dd>
-              <template v-if="overviewLocation.length > 0">
-                <div v-for="line in overviewLocation" :key="line" class="address-line">
-                  {{ line }}
-                </div>
-              </template>
-              <template v-else>—</template>
-            </dd>
-          </dl>
-        </Card>
-
-        <Card title="Account">
-          <dl class="kv-grid">
-            <dt class="fld-label">Status</dt>
-            <dd><StatusBadge :user="user" /></dd>
-            <dt class="fld-label">Last logon</dt>
-            <dd class="mono">{{ fmtAbsolute(user.lastLogonAt) }}</dd>
-            <template v-if="user.entra">
-              <dt class="fld-label" title="Most recent interactive sign-in reported by Entra ID">
-                Last sign-in (Entra)
-              </dt>
-              <dd class="mono">
-                <template v-if="user.entra.lastSignInAt">{{
-                  fmtAbsolute(user.entra.lastSignInAt)
-                }}</template>
-                <span
-                  v-else-if="user.entra.lastStatus === 'p1_required'"
-                  class="entra-na"
-                  title="signInActivity requires an Entra ID P1 license"
-                  >P1 required</span
-                >
-                <span v-else class="entra-na">—</span>
-              </dd>
-            </template>
-            <template v-if="user.entra && user.entra.mfa">
-              <dt
-                class="fld-label"
-                title="MFA registration state from /reports/authenticationMethods"
-              >
-                MFA
-              </dt>
+        <div v-if="activeTab === 'overview'" class="detail-grid">
+          <Card title="Organization">
+            <dl class="kv-grid">
+              <dt class="fld-label">Title</dt>
+              <dd>{{ user.title ?? '—' }}</dd>
+              <dt class="fld-label">Department</dt>
+              <dd>{{ user.department ?? '—' }}</dd>
+              <dt class="fld-label">Company</dt>
+              <dd>{{ user.company ?? '—' }}</dd>
+              <dt class="fld-label">Manager</dt>
               <dd>
-                <span
-                  v-if="user.entra.mfa.isRegistered === true"
-                  class="badge badge-green"
-                  :title="
-                    user.entra.mfa.defaultMethod
-                      ? `Default: ${user.entra.mfa.defaultMethod}`
-                      : undefined
-                  "
+                <router-link
+                  v-if="user.manager?.id"
+                  :to="{ name: 'user-detail', params: { id: user.manager.id } }"
+                  class="reports-link"
                 >
-                  <i class="pi pi-shield" /> registered
-                </span>
-                <span
-                  v-else-if="user.entra.mfa.isRegistered === false && user.entra.mfa.isCapable"
-                  class="badge badge-amber"
-                  title="User can register MFA but hasn't yet"
-                >
-                  capable, not registered
-                </span>
-                <span
-                  v-else-if="user.entra.mfa.isRegistered === false"
-                  class="badge badge-red"
-                  title="User cannot register MFA in this tenant"
-                >
-                  not capable
-                </span>
-                <span v-else class="entra-na">unknown</span>
-                <div v-if="user.entra.mfa.methods.length > 0" class="mfa-methods mono">
-                  {{ user.entra.mfa.methods.join(', ') }}
-                </div>
+                  <i class="pi pi-user" />
+                  <span>{{ user.manager.displayName ?? user.manager.distinguishedName }}</span>
+                </router-link>
+                <span v-else-if="user.manager">{{
+                  user.manager.displayName ?? user.manager.distinguishedName
+                }}</span>
+                <span v-else>—</span>
               </dd>
+            </dl>
+          </Card>
+
+          <Card title="Contact">
+            <dl class="kv-grid">
+              <dt class="fld-label">Email</dt>
+              <dd class="mono kv-wrap">{{ user.email ?? '—' }}</dd>
+              <dt class="fld-label">Mobile</dt>
+              <dd class="mono">{{ user.mobile ?? '—' }}</dd>
+              <dt class="fld-label">Work phone</dt>
+              <dd class="mono">{{ user.phone ?? '—' }}</dd>
+              <dt class="fld-label kv-top">Location</dt>
+              <dd>
+                <template v-if="overviewLocation.length > 0">
+                  <div v-for="line in overviewLocation" :key="line" class="address-line">
+                    {{ line }}
+                  </div>
+                </template>
+                <template v-else>—</template>
+              </dd>
+            </dl>
+          </Card>
+
+          <Card title="Account">
+            <dl class="kv-grid">
+              <dt class="fld-label">Status</dt>
+              <dd><StatusBadge :user="user" /></dd>
+              <dt class="fld-label">Last logon</dt>
+              <dd class="mono">{{ fmtAbsolute(user.lastLogonAt) }}</dd>
+              <template v-if="user.entra">
+                <dt class="fld-label" title="Most recent interactive sign-in reported by Entra ID">
+                  Last sign-in (Entra)
+                </dt>
+                <dd class="mono">
+                  <template v-if="user.entra.lastSignInAt">{{
+                    fmtAbsolute(user.entra.lastSignInAt)
+                  }}</template>
+                  <span
+                    v-else-if="user.entra.lastStatus === 'p1_required'"
+                    class="entra-na"
+                    title="signInActivity requires an Entra ID P1 license"
+                    >P1 required</span
+                  >
+                  <span v-else class="entra-na">—</span>
+                </dd>
+              </template>
+              <template v-if="user.entra && user.entra.mfa">
+                <dt
+                  class="fld-label"
+                  title="MFA registration state from /reports/authenticationMethods"
+                >
+                  MFA
+                </dt>
+                <dd>
+                  <span
+                    v-if="user.entra.mfa.isRegistered === true"
+                    class="badge badge-green"
+                    :title="
+                      user.entra.mfa.defaultMethod
+                        ? `Default: ${user.entra.mfa.defaultMethod}`
+                        : undefined
+                    "
+                  >
+                    <i class="pi pi-shield" /> registered
+                  </span>
+                  <span
+                    v-else-if="user.entra.mfa.isRegistered === false && user.entra.mfa.isCapable"
+                    class="badge badge-amber"
+                    title="User can register MFA but hasn't yet"
+                  >
+                    capable, not registered
+                  </span>
+                  <span
+                    v-else-if="user.entra.mfa.isRegistered === false"
+                    class="badge badge-red"
+                    title="User cannot register MFA in this tenant"
+                  >
+                    not capable
+                  </span>
+                  <span v-else class="entra-na">unknown</span>
+                  <div v-if="user.entra.mfa.methods.length > 0" class="mfa-methods mono">
+                    {{ user.entra.mfa.methods.join(', ') }}
+                  </div>
+                </dd>
+              </template>
+              <dt class="fld-label">Password set</dt>
+              <dd class="mono">{{ fmtAbsolute(user.passwordLastSetAt) }}</dd>
+              <dt class="fld-label">Expires</dt>
+              <dd class="mono">
+                {{ user.passwordNeverExpires ? 'never' : fmtAbsolute(user.passwordExpiresAt) }}
+              </dd>
+            </dl>
+          </Card>
+
+          <Card>
+            <template #head>
+              <h3 class="dc-card-title">
+                Groups
+                <span class="ds-tab-count mono">{{ user.groupMemberships.length }}</span>
+              </h3>
             </template>
-            <dt class="fld-label">Password set</dt>
-            <dd class="mono">{{ fmtAbsolute(user.passwordLastSetAt) }}</dd>
-            <dt class="fld-label">Expires</dt>
-            <dd class="mono">
-              {{ user.passwordNeverExpires ? 'never' : fmtAbsolute(user.passwordExpiresAt) }}
-            </dd>
-          </dl>
-        </Card>
-
-        <Card>
-          <template #head>
-            <h3 class="dc-card-title">
-              Groups
-              <span class="ds-tab-count mono">{{ user.groupMemberships.length }}</span>
-            </h3>
-          </template>
-          <template #actions>
-            <Button
-              label="View all"
-              text
-              size="small"
-              severity="secondary"
-              @click="activeTab = 'groups'"
+            <template #actions>
+              <Button
+                label="View all"
+                text
+                size="small"
+                severity="secondary"
+                @click="selectTab('groups')"
+              />
+            </template>
+            <EmptyState
+              v-if="user.groupMemberships.length === 0"
+              icon="pi pi-users"
+              title="No memberships"
+              compact
             />
-          </template>
-          <EmptyState
-            v-if="user.groupMemberships.length === 0"
-            icon="pi pi-users"
-            title="No memberships"
-            compact
-          />
-          <div v-else class="group-grid">
-            <GroupChip
-              v-for="g in groupsTop"
-              :key="g.id"
-              :name="g.name || g.distinguishedName"
-              :nested="!g.direct"
-              :to="{ name: 'group-detail', params: { id: g.id } }"
-            />
-            <span v-if="user.groupMemberships.length > groupsTop.length" class="hint">
-              + {{ user.groupMemberships.length - groupsTop.length }} more
-            </span>
-          </div>
-        </Card>
+            <div v-else class="group-grid">
+              <GroupChip
+                v-for="g in groupsTop"
+                :key="g.id"
+                :name="g.name || g.distinguishedName"
+                :nested="!g.direct"
+                :to="{ name: 'group-detail', params: { id: g.id } }"
+              />
+              <span v-if="user.groupMemberships.length > groupsTop.length" class="hint">
+                + {{ user.groupMemberships.length - groupsTop.length }} more
+              </span>
+            </div>
+          </Card>
 
-        <!-- Recent sign-ins (Entra) takes priority on the overview —
+          <!-- Recent sign-ins (Entra) takes priority on the overview —
              operators investigating a user usually want to know "did
              they sign in, when, from where" first. Falls back to a
              Recent activity card (top 5 of the per-user audit log)
              when no Entra integration is configured; "View all" on
              that card jumps to /audit. -->
-        <Card v-if="user.entra && auth.actor?.directoryId" class="overview-activity">
-          <template #head>
-            <h3 class="dc-card-title">Recent sign-ins</h3>
-          </template>
-          <template #actions>
-            <Button
-              label="View all"
-              text
-              size="small"
-              severity="secondary"
-              @click="activeTab = 'signins'"
-            />
-          </template>
-          <SignInEventsList
-            :directory-id="auth.actor.directoryId"
-            :user-id="user.id"
-            :page-size="5"
-            hide-user-column
-            @select="onSignInSelect"
-          />
-        </Card>
-        <Card v-else class="overview-activity">
-          <template #head>
-            <h3 class="dc-card-title">Recent activity</h3>
-          </template>
-          <template #actions>
-            <router-link to="/audit" class="p-button p-button-text p-button-secondary p-button-sm">
-              <span class="p-button-label">View all</span>
-            </router-link>
-          </template>
-          <Message v-if="activityError" severity="warn" :closable="false">{{
-            activityError
-          }}</Message>
-          <ActivityFeed
-            :events="activityTop"
-            :loading="activityLoading && activityTop.length === 0"
-          />
-        </Card>
-      </div>
-
-      <!-- Organization — Person / Identifiers / Job + Reporting Structure +
-           "More from directory" attribute roll-up. -->
-      <Card v-else-if="activeTab === 'organization'">
-        <section v-for="sec in VIEW_SECTIONS.organization" :key="sec" class="ident-section">
-          <h3 class="ident-section-title">{{ SECTION_LABEL[sec] }}</h3>
-
-          <div v-if="scalarFieldsForSection(sec).length > 0 || sec === 'ids'" class="attr-grid">
-            <div
-              v-for="f in scalarFieldsForSection(sec)"
-              :key="f.key"
-              class="fld"
-              :class="{ 'fld-multiline': f.multiline, 'fld-modified': dirtyFieldKeys.has(f.key) }"
-            >
-              <div class="fld-label">
-                {{ f.label }}
-                <span
-                  v-if="dirtyFieldKeys.has(f.key)"
-                  class="fld-modified-dot"
-                  title="Unsaved change"
-                ></span>
-              </div>
-              <Textarea
-                v-if="editActive && canEdit && f.multiline"
-                v-model="form[f.key]"
-                :placeholder="f.label"
-                :disabled="saving"
-                auto-resize
-                rows="2"
-                :class="['attr-input', { mono: f.mono }]"
-              />
-              <InputText
-                v-else-if="editActive && canEdit"
-                v-model="form[f.key]"
-                :type="f.type ?? 'text'"
-                :class="['attr-input', { mono: f.mono }]"
-                :placeholder="f.label"
-                :disabled="saving"
+          <Card v-if="user.entra && auth.actor?.directoryId" class="overview-activity">
+            <template #head>
+              <h3 class="dc-card-title">Recent sign-ins</h3>
+            </template>
+            <template #actions>
+              <Button
+                label="View all"
+                text
                 size="small"
-                fluid
+                severity="secondary"
+                @click="selectTab('signins')"
               />
-              <div
-                v-else
-                class="fld-value readonly-val"
-                :class="{ empty: !user[f.key], 'readonly-multiline': f.multiline }"
+            </template>
+            <SignInEventsList
+              :directory-id="auth.actor.directoryId"
+              :user-id="user.id"
+              :page-size="5"
+              hide-user-column
+              @select="onSignInSelect"
+            />
+          </Card>
+          <Card v-else class="overview-activity">
+            <template #head>
+              <h3 class="dc-card-title">Recent activity</h3>
+            </template>
+            <template #actions>
+              <router-link
+                to="/audit"
+                class="p-button p-button-text p-button-secondary p-button-sm"
               >
-                <span :class="{ mono: f.mono }">{{ user[f.key] ?? '—' }}</span>
+                <span class="p-button-label">View all</span>
+              </router-link>
+            </template>
+            <Message v-if="activityError" severity="warn" :closable="false">{{
+              activityError
+            }}</Message>
+            <ActivityFeed
+              :events="activityTop"
+              :loading="activityLoading && activityTop.length === 0"
+            />
+          </Card>
+        </div>
+
+        <!-- Organization — Person / Identifiers / Job + Reporting Structure +
+           "More from directory" attribute roll-up. -->
+        <Card v-else-if="activeTab === 'organization'">
+          <section v-for="sec in VIEW_SECTIONS.organization" :key="sec" class="ident-section">
+            <h3 class="ident-section-title">{{ SECTION_LABEL[sec] }}</h3>
+
+            <div v-if="scalarFieldsForSection(sec).length > 0 || sec === 'ids'" class="attr-grid">
+              <div
+                v-for="f in scalarFieldsForSection(sec)"
+                :key="f.key"
+                class="fld"
+                :class="{ 'fld-multiline': f.multiline, 'fld-modified': changed(f.key) }"
+              >
+                <div class="fld-label">
+                  {{ f.label }}
+                  <span
+                    v-if="changed(f.key)"
+                    class="fld-modified-dot"
+                    title="Unsaved change"
+                  ></span>
+                </div>
+                <Textarea
+                  v-if="canEdit && f.multiline"
+                  v-model="draft[f.key]"
+                  :invalid="!!problems[f.key]"
+                  :placeholder="f.label"
+                  :disabled="saving"
+                  auto-resize
+                  rows="2"
+                  :class="['attr-input', { mono: f.mono }]"
+                />
+                <InputText
+                  v-else-if="canEdit"
+                  v-model="draft[f.key]"
+                  :invalid="!!problems[f.key]"
+                  :type="f.type ?? 'text'"
+                  :class="['attr-input', { mono: f.mono }]"
+                  :placeholder="f.label"
+                  :disabled="saving"
+                  size="small"
+                  fluid
+                />
+                <div
+                  v-else
+                  class="fld-value readonly-val"
+                  :class="{ empty: !user[f.key], 'readonly-multiline': f.multiline }"
+                >
+                  <span :class="{ mono: f.mono }">{{ user[f.key] ?? '—' }}</span>
+                </div>
+                <small v-if="canEdit && problems[f.key]" class="fld-problem">{{
+                  problems[f.key]
+                }}</small>
+              </div>
+
+              <template v-if="sec === 'ids'">
+                <div class="fld">
+                  <div class="fld-label">Username</div>
+                  <div class="fld-value mono readonly-val">{{ user.samAccountName }}</div>
+                </div>
+                <div class="fld">
+                  <div class="fld-label">UPN</div>
+                  <div class="fld-value mono readonly-val">{{ user.userPrincipalName ?? '—' }}</div>
+                </div>
+              </template>
+            </div>
+          </section>
+
+          <ReportingStructureCard
+            :manager="user.manager"
+            :direct-reports="user.directReports"
+            :self-name="displayName"
+          >
+            <template v-if="canEdit && hasReports" #actions>
+              <Button
+                label="Reassign…"
+                icon="pi pi-sitemap"
+                size="small"
+                severity="secondary"
+                text
+                :disabled="reassignRunning"
+                @click="reassign.open"
+              />
+            </template>
+          </ReportingStructureCard>
+
+          <section v-if="extraAttrRows.length > 0" class="ident-section">
+            <h3 class="ident-section-title">
+              More from directory
+              <span class="hint"
+                >{{ extraAttrRows.length }} attribute{{
+                  extraAttrRows.length === 1 ? '' : 's'
+                }}</span
+              >
+            </h3>
+            <div class="extras-grid">
+              <div v-for="row in extraAttrRows" :key="row.key" class="extras-row">
+                <div class="extras-key mono">{{ row.key }}</div>
+                <div class="extras-vals">
+                  <div
+                    v-for="(val, idx) in row.values"
+                    :key="`${row.key}-${idx}`"
+                    class="extras-val"
+                  >
+                    {{ val }}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </Card>
+
+        <!-- Contact — Email / Phones / Address + Communication placeholder +
+           Directory Visibility. -->
+        <Card v-else-if="activeTab === 'contact'">
+          <section v-for="sec in VIEW_SECTIONS.contact" :key="sec" class="ident-section">
+            <h3 class="ident-section-title">{{ SECTION_LABEL[sec] }}</h3>
+
+            <div v-if="scalarFieldsForSection(sec).length > 0" class="attr-grid">
+              <div
+                v-for="f in scalarFieldsForSection(sec)"
+                :key="f.key"
+                class="fld"
+                :class="{ 'fld-multiline': f.multiline, 'fld-modified': changed(f.key) }"
+              >
+                <div class="fld-label">
+                  {{ f.label }}
+                  <span
+                    v-if="changed(f.key)"
+                    class="fld-modified-dot"
+                    title="Unsaved change"
+                  ></span>
+                </div>
+                <Textarea
+                  v-if="canEdit && f.multiline"
+                  v-model="draft[f.key]"
+                  :invalid="!!problems[f.key]"
+                  :placeholder="f.label"
+                  :disabled="saving"
+                  auto-resize
+                  rows="3"
+                  :class="['attr-input', { mono: f.mono }]"
+                />
+                <InputText
+                  v-else-if="canEdit"
+                  v-model="draft[f.key]"
+                  :invalid="!!problems[f.key]"
+                  :type="f.type ?? 'text'"
+                  :class="['attr-input', { mono: f.mono }]"
+                  :placeholder="f.label"
+                  :disabled="saving"
+                  size="small"
+                  fluid
+                />
+                <div
+                  v-else
+                  class="fld-value readonly-val"
+                  :class="{ empty: !user[f.key], 'readonly-multiline': f.multiline }"
+                >
+                  <span :class="{ mono: f.mono }">{{ user[f.key] ?? '—' }}</span>
+                </div>
+                <small v-if="canEdit && problems[f.key]" class="fld-problem">{{
+                  problems[f.key]
+                }}</small>
               </div>
             </div>
 
-            <template v-if="sec === 'ids'">
+            <div v-if="arrayFieldsForSection(sec).length > 0" class="attr-multi-grid">
+              <div
+                v-for="f in arrayFieldsForSection(sec)"
+                :key="f.key"
+                class="fld attr-multi"
+                :class="{ 'fld-modified': changed(f.key) }"
+              >
+                <div class="fld-label">
+                  {{ f.label }}
+                  <span v-if="(user[f.key]?.length ?? 0) > 0" class="ds-tab-count mono">
+                    {{ user[f.key]!.length }}
+                  </span>
+                  <span
+                    v-if="changed(f.key)"
+                    class="fld-modified-dot"
+                    title="Unsaved change"
+                  ></span>
+                </div>
+                <Textarea
+                  v-if="canEdit"
+                  v-model="draft[f.key]"
+                  :invalid="!!problems[f.key]"
+                  :placeholder="f.placeholder"
+                  :disabled="saving"
+                  auto-resize
+                  rows="2"
+                  class="attr-input"
+                />
+                <div
+                  v-else-if="(user[f.key]?.length ?? 0) === 0"
+                  class="fld-value readonly-val empty"
+                >
+                  <span>—</span>
+                </div>
+                <div v-else class="multi-chips">
+                  <span
+                    v-for="(val, idx) in user[f.key]"
+                    :key="`${f.key}-${idx}`"
+                    class="multi-chip mono"
+                    >{{ val }}</span
+                  >
+                </div>
+                <small v-if="canEdit && problems[f.key]" class="fld-problem">{{
+                  problems[f.key]
+                }}</small>
+              </div>
+            </div>
+
+            <div v-if="sec === 'email' && user.emailAliases.length > 0" class="ident-subblock">
+              <div class="fld-label">
+                Aliases
+                <span class="ds-tab-count mono">{{ user.emailAliases.length }}</span>
+              </div>
+              <div class="multi-chips">
+                <span v-for="alias in user.emailAliases" :key="alias" class="multi-chip mono">{{
+                  alias
+                }}</span>
+              </div>
+            </div>
+          </section>
+
+          <section class="ident-section">
+            <h3 class="ident-section-title">Directory visibility</h3>
+            <div class="attr-grid">
+              <div class="fld">
+                <div class="fld-label">Display name</div>
+                <div class="fld-value readonly-val">{{ user.displayName ?? '—' }}</div>
+              </div>
               <div class="fld">
                 <div class="fld-label">Username</div>
                 <div class="fld-value mono readonly-val">{{ user.samAccountName }}</div>
@@ -1854,25 +1524,293 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 <div class="fld-label">UPN</div>
                 <div class="fld-value mono readonly-val">{{ user.userPrincipalName ?? '—' }}</div>
               </div>
-            </template>
+            </div>
+          </section>
+        </Card>
+
+        <!-- Groups -->
+        <Card v-else-if="activeTab === 'groups'">
+          <div class="groups-toolbar">
+            <div class="groups-toolbar-left">
+              <span class="p-input-icon-left groups-filter">
+                <i class="pi pi-search" />
+                <InputText v-model="groupFilter" placeholder="Filter groups…" size="small" />
+              </span>
+              <span class="groups-count">
+                {{ groupsFiltered.length
+                }}<span v-if="groupsFiltered.length !== user.groupMemberships.length">
+                  of {{ user.groupMemberships.length }}</span
+                >
+              </span>
+            </div>
+            <Button
+              v-if="canManageGroups"
+              label="Add group"
+              icon="pi pi-plus"
+              size="small"
+              @click="openAddGroupDialog"
+            />
           </div>
-        </section>
 
-        <ReportingStructureCard
-          :manager="user.manager"
-          :direct-reports="user.directReports"
-          :self-name="displayName"
-        />
+          <InlineFailure
+            v-if="groupFailure"
+            class="groups-failure"
+            :summary="groupFailure.summary"
+            :message="groupFailure.message"
+            :busy="groupPending !== null || addingGroupId !== null"
+            @retry="groupFailure.retry"
+            @dismiss="groupFailure.dismiss"
+          />
 
-        <section v-if="extraAttrRows.length > 0" class="ident-section">
-          <h3 class="ident-section-title">
-            More from directory
-            <span class="hint"
-              >{{ extraAttrRows.length }} attribute{{ extraAttrRows.length === 1 ? '' : 's' }}</span
-            >
-          </h3>
-          <div class="extras-grid">
-            <div v-for="row in extraAttrRows" :key="row.key" class="extras-row">
+          <EmptyState
+            v-if="user.groupMemberships.length === 0"
+            icon="pi pi-users"
+            :title="
+              user.freshness.isStale ? 'No groups in the cache' : 'Not a member of any groups'
+            "
+            :message="
+              user.freshness.isStale
+                ? 'The cache is stale. Run a sync if this seems wrong.'
+                : 'Apart from their primary group, usually Domain Users.'
+            "
+          />
+          <EmptyState
+            v-else-if="groupsFiltered.length === 0"
+            icon="pi pi-filter"
+            title="No groups match"
+            message="Try a different filter."
+            compact
+          />
+          <template v-else>
+            <section v-if="groupsDirect.length > 0" class="group-section">
+              <h4 class="group-section-title">
+                Direct
+                <span class="group-section-count mono">{{ groupsDirect.length }}</span>
+              </h4>
+              <div class="group-grid">
+                <GroupChip
+                  v-for="g in groupsDirect"
+                  :key="g.id"
+                  :name="g.name || g.distinguishedName"
+                  :nested="false"
+                  :removable="canManageGroups && groupPending?.membership.groupId !== g.id"
+                  :to="{ name: 'group-detail', params: { id: g.id } }"
+                  @remove="removeGroup(g)"
+                />
+              </div>
+            </section>
+            <section v-if="groupsInherited.length > 0" class="group-section">
+              <h4 class="group-section-title">
+                Inherited via nested groups
+                <span class="group-section-count mono">{{ groupsInherited.length }}</span>
+              </h4>
+              <div class="group-grid">
+                <GroupChip
+                  v-for="g in groupsInherited"
+                  :key="g.id"
+                  :name="g.name || g.distinguishedName"
+                  :nested="true"
+                  :to="{ name: 'group-detail', params: { id: g.id } }"
+                />
+              </div>
+            </section>
+          </template>
+        </Card>
+
+        <!-- Account — sign-in & lockout, password & security, lifecycle, plus
+           a placeholder for Devices / Authentication Methods that surfaces
+           only once the Entra integration lands. -->
+        <div v-else-if="activeTab === 'account'" class="detail-grid">
+          <Card title="Sign-in & Identity">
+            <dl class="kv-grid">
+              <dt class="fld-label">Status</dt>
+              <dd><StatusBadge :user="user" /></dd>
+              <dt class="fld-label">Locked</dt>
+              <dd>{{ user.locked ? 'Yes' : 'No' }}</dd>
+              <template v-if="user.lockedAt">
+                <dt class="fld-label">Locked at</dt>
+                <dd class="mono">{{ fmtAbsolute(user.lockedAt) }}</dd>
+              </template>
+              <template v-if="lockoutEndText">
+                <dt class="fld-label">Lockout ends</dt>
+                <dd>{{ lockoutEndText }}</dd>
+              </template>
+              <dt class="fld-label">Last logon</dt>
+              <dd class="mono">{{ fmtAbsolute(user.lastLogonAt) }}</dd>
+            </dl>
+            <div class="card-actions">
+              <Button
+                v-if="canUnlock"
+                :label="user.locked ? 'Unlock account' : 'Not locked'"
+                icon="pi pi-unlock"
+                :disabled="!user.locked || accountActionRunning !== null"
+                :severity="user.locked ? 'warn' : 'secondary'"
+                :outlined="!user.locked"
+                size="small"
+                :loading="accountActionRunning === 'unlock'"
+                @click="runOnUser('unlock')"
+              />
+            </div>
+          </Card>
+
+          <Card title="Password & Security">
+            <dl class="kv-grid">
+              <dt class="fld-label">Last set</dt>
+              <dd class="mono">{{ fmtAbsolute(user.passwordLastSetAt) }}</dd>
+              <dt class="fld-label">Last bad password</dt>
+              <dd class="mono">
+                {{ user.lastBadPasswordAt ? fmtAbsolute(user.lastBadPasswordAt) : 'never' }}
+              </dd>
+              <dt class="fld-label">Expires</dt>
+              <dd class="mono">
+                {{ user.passwordNeverExpires ? 'never' : fmtAbsolute(user.passwordExpiresAt) }}
+              </dd>
+            </dl>
+            <div class="card-actions">
+              <Button
+                v-if="canResetPassword"
+                label="Reset password"
+                icon="pi pi-key"
+                severity="danger"
+                outlined
+                size="small"
+                @click="openResetDialog"
+              />
+            </div>
+          </Card>
+
+          <Card title="Lifecycle">
+            <dl class="kv-grid">
+              <dt class="fld-label">Account expires</dt>
+              <dd class="mono">
+                {{ user.accountExpiresAt ? `At ${expiryMoment(user.accountExpiresAt)}` : 'never' }}
+              </dd>
+              <dt class="fld-label">Last modified</dt>
+              <dd class="mono">{{ fmtAbsolute(user.modifiedAtSource) }}</dd>
+              <dt class="fld-label">Privileged</dt>
+              <dd>{{ user.isPrivileged ? 'Yes (adminCount=1)' : 'No' }}</dd>
+            </dl>
+          </Card>
+
+          <Card title="Authentication & MFA">
+            <!-- MFA data when an Entra integration is configured AND the
+               entra.mfa.registration runner has visited this user.
+               Note: registered devices come from a separate Graph
+               endpoint (/users/{id}/registeredDevices) we haven't
+               wired yet — listed as a follow-up. -->
+            <template v-if="user.entra && user.entra.mfa">
+              <dl class="kv-grid">
+                <dt class="fld-label">Status</dt>
+                <dd>
+                  <span v-if="user.entra.mfa.isRegistered === true" class="badge badge-green">
+                    <i class="pi pi-shield" /> registered
+                  </span>
+                  <span
+                    v-else-if="user.entra.mfa.isRegistered === false && user.entra.mfa.isCapable"
+                    class="badge badge-amber"
+                    title="User can register MFA but hasn't yet"
+                  >
+                    capable, not registered
+                  </span>
+                  <span v-else-if="user.entra.mfa.isRegistered === false" class="badge badge-red">
+                    not capable
+                  </span>
+                  <span v-else class="entra-na">unknown</span>
+                </dd>
+                <dt class="fld-label">Methods registered</dt>
+                <dd>
+                  <ul v-if="user.entra.mfa.methods.length > 0" class="mfa-method-list">
+                    <li v-for="m in user.entra.mfa.methods" :key="m">
+                      <i class="pi pi-lock" /> {{ m }}
+                    </li>
+                  </ul>
+                  <span v-else class="entra-na">none</span>
+                </dd>
+                <dt class="fld-label">Default method</dt>
+                <dd>{{ user.entra.mfa.defaultMethod ?? '—' }}</dd>
+                <dt class="fld-label">Passwordless capable</dt>
+                <dd>
+                  {{
+                    user.entra.mfa.isPasswordlessCapable === null
+                      ? '—'
+                      : user.entra.mfa.isPasswordlessCapable
+                        ? 'Yes'
+                        : 'No'
+                  }}
+                </dd>
+                <dt class="fld-label">Last refreshed</dt>
+                <dd class="mono">
+                  {{ user.entra.mfa.fetchedAt ? fmtAbsolute(user.entra.mfa.fetchedAt) : '—' }}
+                </dd>
+              </dl>
+            </template>
+            <EmptyState
+              v-else-if="user.entra"
+              icon="pi pi-clock"
+              title="MFA data not yet synced"
+              message="Enable the MFA registration feature in Settings → Integrations and run the entra.mfa.registration task to populate this card."
+              compact
+            />
+            <EmptyState
+              v-else
+              icon="pi pi-shield"
+              title="Requires Entra integration"
+              message="Configure the Microsoft Graph integration in Settings → Integrations to surface MFA registration here. Registered devices coming in a future release."
+              compact
+            />
+          </Card>
+        </div>
+
+        <Card v-else-if="activeTab === 'licenses' && user.entra?.licenses" title="Licenses">
+          <UserLicenseList :user-id="user.id" :name="displayName" />
+        </Card>
+
+        <!-- Sign-ins — Microsoft Entra audit log for this user, served
+           from the local entra_signin_events cache (delta-synced every
+           15min by entra.signins.events). Filtering by user_object_guid
+           is reliable; the live-Graph approach was unreliable due to
+           UPN case-sensitivity in Graph's $filter. -->
+        <Card v-else-if="activeTab === 'signins' && user?.entra && auth.actor?.directoryId">
+          <SignInEventsList
+            :directory-id="auth.actor.directoryId"
+            :user-id="user.id"
+            hide-user-column
+            @select="onSignInSelect"
+          />
+        </Card>
+
+        <!-- Raw LDAP — every populated attribute on the entry, as AD returned
+           it. Source of truth for deciding which attributes to promote into
+           the typed grids; admin-only via the view:raw_attributes capability. -->
+        <Card v-else-if="activeTab === 'raw' && canViewRaw">
+          <div class="raw-toolbar">
+            <InputText
+              v-model="rawFilter"
+              placeholder="Filter by attribute name or value…"
+              size="small"
+              fluid
+            />
+            <span class="hint">
+              {{ filteredRawRows.length }} of {{ rawAttrRows.length }} attribute{{
+                rawAttrRows.length === 1 ? '' : 's'
+              }}
+            </span>
+          </div>
+          <EmptyState
+            v-if="rawAttrRows.length === 0"
+            icon="pi pi-inbox"
+            title="No raw attributes"
+            message="The directory returned no populated attributes for this user."
+          />
+          <EmptyState
+            v-else-if="filteredRawRows.length === 0"
+            icon="pi pi-filter"
+            title="No matches"
+            message="Try a different filter."
+            compact
+          />
+          <div v-else class="extras-grid">
+            <div v-for="row in filteredRawRows" :key="row.key" class="extras-row">
               <div class="extras-key mono">{{ row.key }}</div>
               <div class="extras-vals">
                 <div v-for="(val, idx) in row.values" :key="`${row.key}-${idx}`" class="extras-val">
@@ -1881,608 +1819,100 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
               </div>
             </div>
           </div>
-        </section>
-      </Card>
-
-      <!-- Contact — Email / Phones / Address + Communication placeholder +
-           Directory Visibility. -->
-      <Card v-else-if="activeTab === 'contact'">
-        <section v-for="sec in VIEW_SECTIONS.contact" :key="sec" class="ident-section">
-          <h3 class="ident-section-title">{{ SECTION_LABEL[sec] }}</h3>
-
-          <div v-if="scalarFieldsForSection(sec).length > 0" class="attr-grid">
-            <div
-              v-for="f in scalarFieldsForSection(sec)"
-              :key="f.key"
-              class="fld"
-              :class="{ 'fld-multiline': f.multiline, 'fld-modified': dirtyFieldKeys.has(f.key) }"
-            >
-              <div class="fld-label">
-                {{ f.label }}
-                <span
-                  v-if="dirtyFieldKeys.has(f.key)"
-                  class="fld-modified-dot"
-                  title="Unsaved change"
-                ></span>
-              </div>
-              <Textarea
-                v-if="editActive && canEdit && f.multiline"
-                v-model="form[f.key]"
-                :placeholder="f.label"
-                :disabled="saving"
-                auto-resize
-                rows="3"
-                :class="['attr-input', { mono: f.mono }]"
-              />
-              <InputText
-                v-else-if="editActive && canEdit"
-                v-model="form[f.key]"
-                :type="f.type ?? 'text'"
-                :class="['attr-input', { mono: f.mono }]"
-                :placeholder="f.label"
-                :disabled="saving"
-                size="small"
-                fluid
-              />
-              <div
-                v-else
-                class="fld-value readonly-val"
-                :class="{ empty: !user[f.key], 'readonly-multiline': f.multiline }"
-              >
-                <span :class="{ mono: f.mono }">{{ user[f.key] ?? '—' }}</span>
-              </div>
-            </div>
-          </div>
-
-          <div v-if="arrayFieldsForSection(sec).length > 0" class="attr-multi-grid">
-            <div
-              v-for="f in arrayFieldsForSection(sec)"
-              :key="f.key"
-              class="fld attr-multi"
-              :class="{ 'fld-modified': dirtyFieldKeys.has(f.key) }"
-            >
-              <div class="fld-label">
-                {{ f.label }}
-                <span v-if="(user[f.key]?.length ?? 0) > 0" class="ds-tab-count mono">
-                  {{ user[f.key]!.length }}
-                </span>
-                <span
-                  v-if="dirtyFieldKeys.has(f.key)"
-                  class="fld-modified-dot"
-                  title="Unsaved change"
-                ></span>
-              </div>
-              <Textarea
-                v-if="editActive && canEdit"
-                v-model="form[f.key]"
-                :placeholder="f.placeholder"
-                :disabled="saving"
-                auto-resize
-                rows="2"
-                class="attr-input"
-              />
-              <div
-                v-else-if="(user[f.key]?.length ?? 0) === 0"
-                class="fld-value readonly-val empty"
-              >
-                <span>—</span>
-              </div>
-              <div v-else class="multi-chips">
-                <span
-                  v-for="(val, idx) in user[f.key]"
-                  :key="`${f.key}-${idx}`"
-                  class="multi-chip mono"
-                  >{{ val }}</span
-                >
-              </div>
-            </div>
-          </div>
-
-          <div v-if="sec === 'email' && user.emailAliases.length > 0" class="ident-subblock">
-            <div class="fld-label">
-              Aliases
-              <span class="ds-tab-count mono">{{ user.emailAliases.length }}</span>
-            </div>
-            <div class="multi-chips">
-              <span v-for="alias in user.emailAliases" :key="alias" class="multi-chip mono">{{
-                alias
-              }}</span>
-            </div>
-          </div>
-        </section>
-
-        <section class="ident-section">
-          <h3 class="ident-section-title">Directory visibility</h3>
-          <div class="attr-grid">
-            <div class="fld">
-              <div class="fld-label">Display name</div>
-              <div class="fld-value readonly-val">{{ user.displayName ?? '—' }}</div>
-            </div>
-            <div class="fld">
-              <div class="fld-label">Username</div>
-              <div class="fld-value mono readonly-val">{{ user.samAccountName }}</div>
-            </div>
-            <div class="fld">
-              <div class="fld-label">UPN</div>
-              <div class="fld-value mono readonly-val">{{ user.userPrincipalName ?? '—' }}</div>
-            </div>
-          </div>
-        </section>
-      </Card>
-
-      <!-- Groups -->
-      <Card v-else-if="activeTab === 'groups'">
-        <div class="groups-toolbar">
-          <div class="groups-toolbar-left">
-            <span class="p-input-icon-left groups-filter">
-              <i class="pi pi-search" />
-              <InputText v-model="groupFilter" placeholder="Filter groups…" size="small" />
-            </span>
-            <span class="groups-count">
-              {{ groupsFiltered.length
-              }}<span v-if="groupsFiltered.length !== user.groupMemberships.length">
-                of {{ user.groupMemberships.length }}</span
-              >
-            </span>
-          </div>
-          <Button
-            v-if="canManageGroups"
-            label="Add group"
-            icon="pi pi-plus"
-            size="small"
-            @click="auth.requireEdit(openAddGroupDialog)"
-          />
-        </div>
-
-        <EmptyState
-          v-if="user.groupMemberships.length === 0"
-          icon="pi pi-users"
-          title="No memberships in cache"
-          message="Run a sync if this seems wrong."
-        />
-        <EmptyState
-          v-else-if="groupsFiltered.length === 0"
-          icon="pi pi-filter"
-          title="No groups match"
-          message="Try a different filter."
-          compact
-        />
-        <template v-else>
-          <section v-if="groupsDirect.length > 0" class="group-section">
-            <h4 class="group-section-title">
-              Direct
-              <span class="group-section-count mono">{{ groupsDirect.length }}</span>
-            </h4>
-            <div class="group-grid">
-              <GroupChip
-                v-for="g in groupsDirect"
-                :key="g.id"
-                :name="g.name || g.distinguishedName"
-                :nested="false"
-                :removable="canManageGroups && groupBusy !== g.id"
-                :to="{ name: 'group-detail', params: { id: g.id } }"
-                @remove="
-                  auth.requireEdit(() => requestRemoveGroup(g.id, g.name || g.distinguishedName))
-                "
-              />
-            </div>
-          </section>
-          <section v-if="groupsInherited.length > 0" class="group-section">
-            <h4 class="group-section-title">
-              Inherited via nested groups
-              <span class="group-section-count mono">{{ groupsInherited.length }}</span>
-            </h4>
-            <div class="group-grid">
-              <GroupChip
-                v-for="g in groupsInherited"
-                :key="g.id"
-                :name="g.name || g.distinguishedName"
-                :nested="true"
-                :to="{ name: 'group-detail', params: { id: g.id } }"
-              />
-            </div>
-          </section>
-        </template>
-      </Card>
-
-      <!-- Account — sign-in & lockout, password & security, lifecycle, plus
-           a placeholder for Devices / Authentication Methods that surfaces
-           only once the Entra integration lands. -->
-      <div v-else-if="activeTab === 'account'" class="detail-grid">
-        <Card title="Sign-in & Identity">
-          <dl class="kv-grid">
-            <dt class="fld-label">Status</dt>
-            <dd><StatusBadge :user="user" /></dd>
-            <dt class="fld-label">Locked</dt>
-            <dd>{{ user.locked ? 'Yes' : 'No' }}</dd>
-            <template v-if="user.lockedAt">
-              <dt class="fld-label">Locked at</dt>
-              <dd class="mono">{{ fmtAbsolute(user.lockedAt) }}</dd>
-            </template>
-            <template v-if="user.locked">
-              <dt class="fld-label">Auto-unlocks</dt>
-              <dd class="mono">
-                <template v-if="user.autoUnlockAt">
-                  {{ fmtAbsolute(user.autoUnlockAt) }}
-                  <span class="text-muted"> · {{ fmtRelative(user.autoUnlockAt) }}</span>
-                </template>
-                <template v-else>
-                  <span class="text-muted">manual unlock required</span>
-                </template>
-              </dd>
-            </template>
-            <dt class="fld-label">Last logon</dt>
-            <dd class="mono">{{ fmtAbsolute(user.lastLogonAt) }}</dd>
-          </dl>
-          <div class="card-actions">
-            <Button
-              v-if="canUnlock"
-              :label="user.locked ? 'Unlock account' : 'Not locked'"
-              icon="pi pi-unlock"
-              :disabled="!user.locked || actionRunning !== null"
-              :severity="user.locked ? 'warn' : 'secondary'"
-              :outlined="!user.locked"
-              size="small"
-              :loading="actionRunning === 'unlock'"
-              @click="auth.requireEdit(doUnlock)"
-            />
-          </div>
         </Card>
 
-        <Card title="Password & Security">
-          <dl class="kv-grid">
-            <dt class="fld-label">Last set</dt>
-            <dd class="mono">{{ fmtAbsolute(user.passwordLastSetAt) }}</dd>
-            <dt class="fld-label">Last bad password</dt>
-            <dd class="mono">
-              {{ user.lastBadPasswordAt ? fmtAbsolute(user.lastBadPasswordAt) : 'never' }}
-            </dd>
-            <dt class="fld-label">Expires</dt>
-            <dd class="mono">
-              {{ user.passwordNeverExpires ? 'never' : fmtAbsolute(user.passwordExpiresAt) }}
-            </dd>
-          </dl>
-          <div class="card-actions">
-            <Button
-              v-if="canResetPassword"
-              label="Reset password"
-              icon="pi pi-key"
-              severity="danger"
-              outlined
-              size="small"
-              @click="auth.requireEdit(openResetDialog)"
-            />
-          </div>
-        </Card>
-
-        <Card title="Lifecycle">
-          <dl class="kv-grid">
-            <dt class="fld-label">Account expires</dt>
-            <dd class="mono">
-              {{ user.accountExpiresAt ? fmtAbsolute(user.accountExpiresAt) : 'never' }}
-            </dd>
-            <dt class="fld-label">Last modified</dt>
-            <dd class="mono">{{ fmtAbsolute(user.modifiedAtSource) }}</dd>
-            <dt class="fld-label">Privileged</dt>
-            <dd>{{ user.isPrivileged ? 'Yes (adminCount=1)' : 'No' }}</dd>
-          </dl>
-        </Card>
-
-        <Card title="Authentication & MFA">
-          <!-- MFA data when an Entra integration is configured AND the
-               entra.mfa.registration runner has visited this user.
-               Note: registered devices come from a separate Graph
-               endpoint (/users/{id}/registeredDevices) we haven't
-               wired yet — listed as a follow-up. -->
-          <template v-if="user.entra && user.entra.mfa">
-            <dl class="kv-grid">
-              <dt class="fld-label">Status</dt>
-              <dd>
-                <span v-if="user.entra.mfa.isRegistered === true" class="badge badge-green">
-                  <i class="pi pi-shield" /> registered
-                </span>
-                <span
-                  v-else-if="user.entra.mfa.isRegistered === false && user.entra.mfa.isCapable"
-                  class="badge badge-amber"
-                  title="User can register MFA but hasn't yet"
-                >
-                  capable, not registered
-                </span>
-                <span v-else-if="user.entra.mfa.isRegistered === false" class="badge badge-red">
-                  not capable
-                </span>
-                <span v-else class="entra-na">unknown</span>
-              </dd>
-              <dt class="fld-label">Methods registered</dt>
-              <dd>
-                <ul v-if="user.entra.mfa.methods.length > 0" class="mfa-method-list">
-                  <li v-for="m in user.entra.mfa.methods" :key="m">
-                    <i class="pi pi-lock" /> {{ m }}
-                  </li>
-                </ul>
-                <span v-else class="entra-na">none</span>
-              </dd>
-              <dt class="fld-label">Default method</dt>
-              <dd>{{ user.entra.mfa.defaultMethod ?? '—' }}</dd>
-              <dt class="fld-label">Passwordless capable</dt>
-              <dd>
-                {{
-                  user.entra.mfa.isPasswordlessCapable === null
-                    ? '—'
-                    : user.entra.mfa.isPasswordlessCapable
-                      ? 'Yes'
-                      : 'No'
-                }}
-              </dd>
-              <dt class="fld-label">Last refreshed</dt>
-              <dd class="mono">
-                {{ user.entra.mfa.fetchedAt ? fmtAbsolute(user.entra.mfa.fetchedAt) : '—' }}
-              </dd>
-            </dl>
-          </template>
-          <EmptyState
-            v-else-if="user.entra"
-            icon="pi pi-clock"
-            title="MFA data not yet synced"
-            message="Enable the MFA registration feature in Settings → Integrations and run the entra.mfa.registration task to populate this card."
-            compact
-          />
-          <EmptyState
-            v-else
-            icon="pi pi-shield"
-            title="Requires Entra integration"
-            message="Configure the Microsoft Graph integration in Settings → Integrations to surface MFA registration here. Registered devices coming in a future release."
-            compact
-          />
-        </Card>
-      </div>
-
-      <!-- Sign-ins — Microsoft Entra audit log for this user, served
-           from the local entra_signin_events cache (delta-synced every
-           15min by entra.signins.events). Filtering by user_object_guid
-           is reliable; the live-Graph approach was unreliable due to
-           UPN case-sensitivity in Graph's $filter. -->
-      <Card v-else-if="activeTab === 'signins' && user?.entra && auth.actor?.directoryId">
-        <SignInEventsList
-          :directory-id="auth.actor.directoryId"
-          :user-id="user.id"
-          hide-user-column
-          @select="onSignInSelect"
-        />
-      </Card>
-
-      <!-- Raw LDAP — every populated attribute on the entry, as AD returned
-           it. Source of truth for deciding which attributes to promote into
-           the typed grids; admin-only via the view:raw_attributes capability. -->
-      <Card v-else-if="activeTab === 'raw' && canViewRaw">
-        <div class="raw-toolbar">
-          <InputText
-            v-model="rawFilter"
-            placeholder="Filter by attribute name or value…"
-            size="small"
-            fluid
-          />
-          <span class="hint">
-            {{ filteredRawRows.length }} of {{ rawAttrRows.length }} attribute{{
-              rawAttrRows.length === 1 ? '' : 's'
-            }}
-          </span>
-        </div>
-        <EmptyState
-          v-if="rawAttrRows.length === 0"
-          icon="pi pi-inbox"
-          title="No raw attributes"
-          message="The directory returned no populated attributes for this user."
-        />
-        <EmptyState
-          v-else-if="filteredRawRows.length === 0"
-          icon="pi pi-filter"
-          title="No matches"
-          message="Try a different filter."
-          compact
-        />
-        <div v-else class="extras-grid">
-          <div v-for="row in filteredRawRows" :key="row.key" class="extras-row">
-            <div class="extras-key mono">{{ row.key }}</div>
-            <div class="extras-vals">
-              <div v-for="(val, idx) in row.values" :key="`${row.key}-${idx}`" class="extras-val">
-                {{ val }}
-              </div>
-            </div>
-          </div>
-        </div>
-      </Card>
-
-      <!-- Save / discard bar — page-level so it covers edits made on
+        <!-- Save / discard bar — page-level so it covers edits made on
            either the Identity or the Location tab. Sticky to the bottom of
            the viewport while scrolling so it's always reachable on tall
            attribute lists. -->
-      <transition name="save-bar">
-        <div v-if="editActive && canEdit" class="save-bar save-bar-floating">
-          <span class="save-bar-summary">
-            <i class="pi pi-pencil" />
-            <template v-if="isDirty">
-              Editing · <strong>{{ dirtyFields.length }}</strong> unsaved change{{
-                dirtyFields.length === 1 ? '' : 's'
-              }}
-            </template>
-            <template v-else>Editing · no changes yet</template>
-          </span>
-          <span v-if="isDirty" class="save-bar-fields">
-            <span v-for="d in dirtyFields" :key="d.key" class="dirty-chip">
-              {{ d.key }}
+        <transition name="save-bar">
+          <div v-if="canEdit && dirty" class="save-bar save-bar-floating">
+            <span class="save-bar-summary">
+              <i class="pi pi-pencil" />
+              <strong>{{ changes.length }}</strong>
+              unsaved change{{ changes.length === 1 ? '' : 's' }}
             </span>
-          </span>
-          <span class="save-bar-actions">
-            <Button
-              label="Cancel"
-              text
-              severity="secondary"
-              size="small"
-              :disabled="saving"
-              @click="cancelEditing"
-            />
-            <Button
-              label="Save changes"
-              icon="pi pi-check"
-              size="small"
-              :loading="saving"
-              :disabled="!isDirty"
-              @click="saveAttributes"
-            />
-          </span>
-        </div>
-      </transition>
-
-      <p class="freshness-foot">
-        <span class="hint">
-          Live refreshed {{ fmtRelative(user.freshness.liveRefreshedAt) }} · Cache written
-          {{ fmtRelative(user.freshness.cachedAt) }}
-        </span>
-      </p>
-    </div>
-
-    <!-- Reset password dialog. No longer needs the AD password input —
-         the active edit-mode session has it cached server-side. -->
-    <Dialog
-      :visible="resetDialogOpen"
-      modal
-      header="Reset password"
-      :style="{ width: '28rem' }"
-      :closable="!resetSubmitting"
-      @update:visible="(v) => !v && (resetDialogOpen = false)"
-    >
-      <p class="dialog-prose primary">
-        Set a new password for <strong>{{ user?.displayName ?? user?.samAccountName }}</strong
-        >.
-      </p>
-      <p class="dialog-prose secondary">
-        AD policy still applies — complexity, length, and history rules can reject the value.
-      </p>
-      <div class="reset-form">
-        <div class="form-row">
-          <label class="fld-label">New password</label>
-          <Password
-            v-model="resetDraft.newPassword"
-            :feedback="false"
-            toggle-mask
-            input-class="w-full"
-            class="w-full"
-            :disabled="resetSubmitting"
-            autocomplete="new-password"
-            @keyup.enter="onResetSubmit"
-          />
-        </div>
-        <label class="check-row">
-          <input
-            v-model="resetDraft.forceChangeAtNextLogin"
-            type="checkbox"
-            :disabled="resetSubmitting"
-            @change="onResetForceChangeToggle"
-          />
-          <span>Force change at next sign-in</span>
-        </label>
-        <label class="check-row">
-          <input
-            v-model="resetDraft.passwordNeverExpires"
-            type="checkbox"
-            :disabled="resetSubmitting"
-            @change="onResetNeverExpiresToggle"
-          />
-          <span>Password never expires</span>
-        </label>
-        <Message v-if="resetError" severity="error" :closable="false">{{ resetError }}</Message>
-      </div>
-      <template #footer>
-        <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="resetSubmitting"
-          @click="resetDialogOpen = false"
-        />
-        <Button label="Reset" :loading="resetSubmitting" @click="onResetSubmit" />
+            <span class="save-bar-fields">
+              <span v-for="d in changes" :key="d.key" class="dirty-chip">
+                {{ d.key }}
+              </span>
+            </span>
+            <span class="save-bar-actions">
+              <Button
+                label="Discard"
+                text
+                severity="secondary"
+                size="small"
+                :disabled="saving"
+                @click="resetDraft(user)"
+              />
+              <Button
+                label="Save changes"
+                icon="pi pi-check"
+                size="small"
+                :loading="saving"
+                :disabled="!valid"
+                @click="saveAttributes()"
+              />
+            </span>
+            <div v-if="saveFailure" class="save-bar-failure" role="alert">
+              <i class="pi pi-times-circle" aria-hidden="true" />
+              <span>Save failed: {{ saveFailure }}</span>
+              <Button
+                icon="pi pi-times"
+                text
+                rounded
+                size="small"
+                severity="secondary"
+                aria-label="Dismiss"
+                @click="dismissSaveFailure"
+              />
+            </div>
+          </div>
+        </transition>
       </template>
-    </Dialog>
-
-    <!-- Move to OU dialog: TreeSelect over the cached OU list. The current
-         parent OU is preselected so the operator can see where they are
-         before picking a destination. -->
-    <Dialog
+    </ObjectPageLayout>
+    <MoveToOuDialog
       :visible="moveDialogOpen"
-      modal
-      header="Move to OU"
-      :style="{ width: '34rem' }"
-      :closable="!moveSubmitting"
-      @update:visible="(v) => !v && (moveDialogOpen = false)"
-    >
-      <p class="dialog-prose primary">
-        Move <strong>{{ user?.displayName ?? user?.samAccountName }}</strong> to a different
-        organizational unit.
-      </p>
-      <p class="dialog-prose secondary">
-        The user's CN stays the same — only the parent container changes. Group memberships and the
-        user's GUID are preserved.
-      </p>
-      <div v-if="currentOuDn" class="move-current">
-        <span class="muted">Currently in:</span>
-        <code class="dn-line">{{ currentOuDn }}</code>
-      </div>
-      <div class="move-tree">
-        <div v-if="moveOusLoading" class="hint">Loading OUs…</div>
-        <TreeSelect
-          v-else
-          v-model="moveSelection"
-          :options="moveOuTree"
-          selection-mode="single"
-          placeholder="Pick a destination OU"
-          fluid
-          :disabled="moveSubmitting"
-        />
-      </div>
-      <Message v-if="moveError" severity="error" :closable="false">{{ moveError }}</Message>
-      <Message v-else-if="moveTargetIsCurrent" severity="info" :closable="false">
-        That's the user's current OU — pick a different one.
-      </Message>
-      <template #footer>
-        <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="moveSubmitting"
-          @click="moveDialogOpen = false"
-        />
-        <Button
-          label="Move"
-          icon="pi pi-folder-open"
-          :loading="moveSubmitting"
-          :disabled="!selectedTargetDn || moveTargetIsCurrent"
-          @click="onMoveSubmit"
-        />
-      </template>
-    </Dialog>
+      :move="mover"
+      kind="user"
+      :name="user ? nameOf(user) : ''"
+      :failure="moveDialogFailure"
+      @close="closeMoveDialog"
+    />
+    <ReassignReportsDialog :workflow="reassign" :manager-name="displayName" />
+    <BulkRevertDialog :workflow="reassign.jobRevert" />
+    <AccountExpiryDialog
+      :visible="expiryDialogOpen"
+      :expiry="expiry"
+      :failure="expiryDialogFailure"
+      @close="closeExpiryDialog"
+    />
 
-    <!-- Add group dialog: simple debounced search against /groups, with
-         the user's existing memberships filtered out of results. -->
+    <!-- Add group dialog: search by name; groups the user is directly in are
+         shown but can't be added. -->
     <Dialog
       :visible="addGroupOpen"
       modal
       header="Add to group"
       :style="{ width: '32rem' }"
-      :closable="groupBusy === null"
-      @update:visible="(v) => !v && (addGroupOpen = false)"
+      :closable="addingGroupId === null"
+      @update:visible="(v) => !v && closeAddGroupDialog()"
     >
       <p class="dialog-prose secondary">Search by name. Adding commits immediately.</p>
       <InputText v-model="groupSearchQuery" placeholder="Search groups…" autofocus fluid />
       <div class="group-search-results">
         <div v-if="groupSearchLoading" class="hint">Searching…</div>
         <EmptyState
-          v-else-if="groupSearchQuery.trim().length < 2"
+          v-else-if="groupQueryTooShort"
           icon="pi pi-search"
           title="Type to search"
-          message="At least 2 characters."
+          :message="`At least ${MIN_GROUP_QUERY} characters.`"
           compact
         />
+        <Message v-else-if="groupSearchError" severity="error" :closable="false">
+          Couldn’t search groups: {{ groupSearchError }}
+        </Message>
         <EmptyState
           v-else-if="groupSearchResults.length === 0"
           icon="pi pi-inbox"
@@ -2494,181 +1924,61 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
             v-for="g in groupSearchResults"
             :key="g.id"
             class="group-result"
-            :class="{ disabled: existingGroupIds.has(g.id) }"
+            :class="{ disabled: existingMembership(g.id) === 'direct' }"
           >
             <div class="group-result-meta">
               <span class="group-result-name">{{ g.name || g.distinguishedName }}</span>
               <span class="group-result-dn mono">{{ g.distinguishedName }}</span>
+              <span v-if="existingMembership(g.id) === 'nested'" class="hint">
+                member via a nested group
+              </span>
             </div>
+            <LicenseBadge :group-id="g.id" />
             <Button
-              v-if="!existingGroupIds.has(g.id)"
+              v-if="existingMembership(g.id) !== 'direct'"
               label="Add"
               icon="pi pi-plus"
               size="small"
-              :loading="groupBusy === g.id"
-              @click="doAddGroup(g)"
+              :loading="addingGroupId === g.id"
+              :disabled="addingGroupId !== null || !addGroupReady"
+              @click="addToGroup(g)"
             />
             <span v-else class="hint">already a member</span>
           </li>
         </ul>
+        <p v-if="groupResultsTruncated && !groupSearchLoading" class="hint">
+          Showing {{ groupSearchResults.length }} — refine your search
+        </p>
       </div>
+      <LicenseBadgeNote v-if="groupSearchResults.length > 0" />
+      <Message v-if="addGroupError" severity="error" :closable="false">{{ addGroupError }}</Message>
+      <Message v-else-if="addDialogFailure" severity="error" closable @close="dismissAddFailure">
+        Couldn’t
+        {{ membershipChangeText(addDialogFailure.op.change, addDialogFailure.op.membership) }}:
+        {{ addDialogFailure.message }}
+      </Message>
       <template #footer>
-        <Button label="Close" text severity="secondary" @click="addGroupOpen = false" />
+        <Button label="Close" text severity="secondary" @click="closeAddGroupDialog" />
       </template>
     </Dialog>
 
-    <!-- Group removal confirmation: a single-click on the chip's "x" was too
-         easy to fire by accident, so every removal now goes through here. -->
-    <ConfirmDialog
-      :visible="removeConfirm !== null"
-      title="Remove group membership?"
-      :message="
-        removeConfirm
-          ? `Remove ${user?.displayName || user?.samAccountName || 'this user'} from “${removeConfirm.label}”?`
-          : ''
-      "
-      detail="The change is committed to the directory immediately."
-      confirm-label="Remove"
-      severity="danger"
-      :busy="groupBusy !== null && removeConfirm !== null && groupBusy === removeConfirm.groupId"
-      @update:visible="(v) => !v && cancelRemoveGroup()"
-      @cancel="cancelRemoveGroup"
-      @confirm="confirmRemoveGroup"
+    <ConfirmDialog v-bind="leaveDialog" />
+
+    <ResetPasswordDialog v-model:visible="resetDialogOpen" :user="user" @reset="onPasswordReset" />
+    <IssueTapDialog v-model:visible="tapDialogOpen" :user="user" @issued="onTapIssued" />
+    <RenameUserDialog v-model:visible="renameDialogOpen" :user="user" @renamed="onRenamed" />
+    <NewUserDialog
+      v-if="copyDialogOpen"
+      v-model:visible="copyDialogOpen"
+      :copy-from="id"
+      @created="onCopied"
     />
-
-    <ConfirmDialog
-      :visible="deleteConfirmOpen"
-      title="Delete this user?"
-      :message="`Permanently delete ${user?.displayName || user?.samAccountName || 'this user'} from Active Directory?`"
-      detail="This removes the account from AD and is recorded in the audit log. It cannot be undone from here."
-      confirm-label="Delete"
-      severity="danger"
-      :busy="deleting"
-      @update:visible="(v) => !v && (deleteConfirmOpen = false)"
-      @cancel="deleteConfirmOpen = false"
-      @confirm="confirmDelete"
+    <DeleteUsersDialog
+      v-if="deleteDialogOpen"
+      v-model:visible="deleteDialogOpen"
+      :ids="[props.id]"
+      @done="onDeleted"
     />
-
-    <!-- Set account expiration -->
-    <Dialog
-      :visible="expiryOpen"
-      modal
-      header="Account expiration"
-      :style="{ width: '26rem' }"
-      :closable="!expirySaving"
-      @update:visible="(v) => !v && (expiryOpen = false)"
-    >
-      <div style="display: flex; flex-direction: column; gap: 12px">
-        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-          <Checkbox v-model="expiryNever" binary />
-          Never expires
-        </label>
-        <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)">Expires on</span>
-          <DatePicker
-            v-model="expiryDate"
-            :disabled="expiryNever"
-            show-time
-            hour-format="24"
-            show-icon
-            date-format="yy-mm-dd"
-            placeholder="Select a date"
-            fluid
-          />
-        </div>
-        <Message v-if="expiryError" severity="error" :closable="false">{{ expiryError }}</Message>
-      </div>
-      <template #footer>
-        <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="expirySaving"
-          @click="expiryOpen = false"
-        />
-        <Button
-          label="Save"
-          icon="pi pi-check"
-          :loading="expirySaving"
-          :disabled="!expiryNever && !expiryDate"
-          @click="saveExpiry"
-        />
-      </template>
-    </Dialog>
-
-    <!-- Password expiration: never-expires flag + "expire now". AD has no
-         per-user password-expiry date, so there's no date picker here. -->
-    <Dialog
-      :visible="pwdExpiryOpen"
-      modal
-      header="Password expiration"
-      :style="{ width: '27rem' }"
-      :closable="!pwdSaving && !pwdExpiringNow"
-      @update:visible="(v) => !v && (pwdExpiryOpen = false)"
-    >
-      <div style="display: flex; flex-direction: column; gap: 14px">
-        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px">
-          <Checkbox v-model="pwdNever" binary :disabled="pwdSaving" />
-          Password never expires
-        </label>
-        <div style="font-size: 12px; color: var(--text-3)">
-          Currently expires:
-          <strong style="color: var(--text-2)">{{
-            user?.passwordNeverExpires
-              ? 'never'
-              : user?.passwordExpiresAt
-                ? fmtAbsolute(user.passwordExpiresAt)
-                : 'per domain policy'
-          }}</strong>
-        </div>
-
-        <div
-          v-if="canResetPassword"
-          style="
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            border-top: 1px solid var(--border-1);
-            padding-top: 12px;
-          "
-        >
-          <span style="font-size: 12px; color: var(--text-3)">
-            Expire the password now — the user must set a new one at next sign-in.
-          </span>
-          <Button
-            label="Expire now"
-            icon="pi pi-clock"
-            severity="warn"
-            outlined
-            size="small"
-            :loading="pwdExpiringNow"
-            :disabled="pwdNever || pwdSaving"
-            style="align-self: flex-start"
-            @click="expirePasswordNow"
-          />
-        </div>
-
-        <Message v-if="pwdExpiryError" severity="error" :closable="false">{{
-          pwdExpiryError
-        }}</Message>
-      </div>
-      <template #footer>
-        <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="pwdSaving || pwdExpiringNow"
-          @click="pwdExpiryOpen = false"
-        />
-        <Button
-          label="Save"
-          icon="pi pi-check"
-          :loading="pwdSaving"
-          :disabled="!pwdNeverDirty || pwdExpiringNow"
-          @click="savePwdNeverExpires"
-        />
-      </template>
-    </Dialog>
 
     <SignInEventDetailDialog
       v-if="auth.actor?.directoryId"
@@ -2684,209 +1994,6 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   display: flex;
   flex-direction: column;
   gap: 14px;
-  /* --detail-sticky-offset is set inline (reactive to hero height) so
-     the sticky tab bar pins flush with the hero's current bottom edge,
-     including mid-shrink-animation. */
-  /* Disable browser scroll anchoring inside the detail page. When the
-     hero shrinks during the compact transition, anchoring would auto-
-     adjust scrollTop to "stabilize" content — but that fights our
-     detection and produces a flicker loop right at the trigger point. */
-  overflow-anchor: none;
-}
-
-.detail-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-/* Hero ------------------------------------------------------------------- */
-.detail-hero {
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: linear-gradient(
-    180deg,
-    color-mix(in oklab, var(--accent) 5%, var(--surface)),
-    var(--surface)
-  );
-  display: grid;
-  grid-template-columns: auto 1fr;
-  align-items: start;
-  gap: 16px;
-  min-width: 0;
-  position: sticky;
-  top: 0;
-  z-index: 6;
-  transition:
-    padding 200ms ease,
-    gap 200ms ease,
-    border-radius 200ms ease,
-    box-shadow 200ms ease;
-}
-
-/* Compact state: padding tightens, avatar shrinks via the reactive
-   :size prop on Avatar (animated by Avatar's own width/height
-   transition), and the secondary rows below the name collapse to
-   zero. Corners square off and the bottom border drops so the hero
-   merges seamlessly into the sticky tab bar below — they read as
-   one pinned banner. The drop shadow on the tab bar carries the
-   "content scrolls under" signal for the merged unit. */
-.detail-hero.is-compact {
-  padding: 6px 14px;
-  align-items: center;
-  gap: 10px;
-  border-radius: 0;
-  border-bottom: 0;
-  box-shadow: none;
-}
-
-.detail-hero-main {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.detail-hero-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-}
-
-.detail-hero-name {
-  margin: 0;
-  font-size: 22px;
-  font-weight: 600;
-  letter-spacing: -0.015em;
-  color: var(--text);
-  transition: font-size 200ms ease;
-}
-
-.detail-hero.is-compact .detail-hero-name {
-  font-size: 14px;
-}
-
-/* Secondary rows collapse together via max-height + opacity. */
-.detail-hero-title,
-.detail-hero-upn,
-.detail-hero-actions-row,
-.copybtn-inline {
-  overflow: hidden;
-  max-height: 60px;
-  opacity: 1;
-  transition:
-    max-height 200ms ease,
-    opacity 150ms ease,
-    margin 200ms ease;
-}
-
-.detail-hero.is-compact .detail-hero-title,
-.detail-hero.is-compact .detail-hero-upn,
-.detail-hero.is-compact .detail-hero-actions-row,
-.detail-hero.is-compact .copybtn-inline {
-  max-height: 0;
-  opacity: 0;
-  margin: 0;
-  pointer-events: none;
-}
-
-.detail-hero-title {
-  color: var(--text-2);
-  font-size: 13px;
-  margin-top: 4px;
-}
-
-.detail-hero-upn {
-  color: var(--text-3);
-  font-size: 12.5px;
-  margin-top: 2px;
-}
-
-.detail-hero-actions-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  margin-top: 8px;
-}
-
-.copybtn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  height: 26px;
-  padding: 0 10px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--text-2);
-  font-size: 12px;
-  cursor: pointer;
-  font-family: var(--font-sans);
-  max-width: 100%;
-  overflow: hidden;
-}
-
-.copybtn:hover {
-  color: var(--text);
-  border-color: var(--border-strong);
-  background: var(--surface-3);
-}
-
-.copybtn .mono {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.copybtn .dn-short {
-  max-width: 320px;
-}
-
-/* DN copy chip: same shape as Email/Teams launchers, but the DN text
-   inside is allowed to grow (with ellipsis) so the operator can scan
-   the OU path at a glance without expanding the chip. */
-.hero-path {
-  flex: 1 1 auto;
-  min-width: 120px;
-  max-width: 100%;
-  justify-content: flex-start;
-}
-
-.hero-path .hero-path-text {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11.5px;
-  flex: 1 1 auto;
-}
-
-/* Inline copy button used at the top of the hero meta as the primary
-   identifier line. Looks like text + a copy icon — no button chrome —
-   so it doesn't visually compete with the launcher row below. */
-.copybtn-inline {
-  height: auto;
-  padding: 2px 0;
-  margin-top: 2px;
-  border: 0;
-  background: transparent;
-  color: var(--text-3);
-  font-size: 12.5px;
-}
-
-.copybtn-inline:hover {
-  background: transparent;
-  color: var(--text);
-  border-color: transparent;
-}
-
-.copybtn-inline .mono {
-  font-size: 12.5px;
 }
 
 .overview-activity {
@@ -2895,173 +2002,6 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
 
 .stale-flag {
   margin-left: 4px;
-}
-
-@media (max-width: 767.98px) {
-  .detail-hero {
-    grid-template-columns: 1fr;
-    justify-items: start;
-  }
-}
-
-/* Tab bar actions — Actions menu and refresh icon scoot to the right. */
-.ds-tabs-with-actions {
-  align-items: center;
-}
-
-.ds-tabs-spacer {
-  flex: 1 1 auto;
-}
-
-.ds-tabs-actions {
-  display: inline-flex;
-  align-items: center;
-  margin-left: 4px;
-}
-
-/* Tint the Disable item in the Actions menu so destructive intent is
-   obvious without forcing the operator to read the label twice. */
-:deep(.p-menu .menu-item-danger .p-menuitem-link) {
-  color: var(--red);
-}
-
-:deep(.p-menu .menu-item-danger .p-menuitem-icon) {
-  color: var(--red);
-}
-
-/* Tabs ------------------------------------------------------------------- */
-.ds-tabs {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: var(--detail-sticky-offset, 40px);
-  z-index: 5;
-  background: var(--surface);
-  /* Pronounced drop shadow when the tab bar pins under the compact
-     hero: makes it clear that page content scrolls beneath. Carries
-     the visual signal for the entire merged hero+tabs unit since
-     the hero's own shadow drops in compact. */
-  box-shadow: 0 10px 18px -10px rgba(0, 0, 0, 0.28);
-  /* No transition on `top`: the offset is updated continuously by
-     ResizeObserver during the hero shrink, so the tab bar follows
-     the hero's bottom edge frame-by-frame. A CSS transition here
-     would make the tab bar lag behind the hero. */
-}
-
-/* When the hero is compact, the hero's bottom border drops and its
-   side borders remain. Mirror those side borders on the tab bar so
-   the merged hero + tab bar reads as one continuous bordered
-   rectangle pinned at the top — without this, the tab bar appears
-   ~2 px wider than the hero on each side because the hero is inset
-   by its own border while the tab bar runs edge to edge. */
-.ds-tabs.hero-compact {
-  border-left: 1px solid var(--border);
-  border-right: 1px solid var(--border);
-}
-
-.ds-tab {
-  background: transparent;
-  border: 0;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 9px 12px;
-  color: var(--text-3);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  position: relative;
-  border-radius: 6px 6px 0 0;
-  font-family: var(--font-sans);
-}
-
-.ds-tab > .pi {
-  font-size: 14px;
-  line-height: 1;
-}
-
-.ds-tab:hover {
-  color: var(--text);
-}
-
-.ds-tab.active {
-  color: var(--text);
-}
-
-.ds-tab.active::after {
-  content: '';
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: -1px;
-  height: 2px;
-  background: var(--accent);
-  border-radius: 2px;
-}
-
-.ds-tab-count {
-  font-size: 11px;
-  margin-left: 6px;
-  color: var(--text-3);
-  background: var(--surface-3);
-  padding: 1px 5px;
-  border-radius: 3px;
-}
-
-.ds-tab.active .ds-tab-count {
-  color: var(--text-2);
-}
-
-/* Compact mode: the nav's ResizeObserver detects overflow and flips
-   .ds-tabs.compact, which hides the text label so each tab shrinks to
-   its icon (and count badge, if any). The icon remains the click target
-   and the button's title attribute exposes the full label on hover. */
-.ds-tabs.compact .ds-tab {
-  padding: 9px 10px;
-}
-
-.ds-tabs.compact .ds-tab-label {
-  display: none;
-}
-
-.ds-tabs.compact .ds-tab-count {
-  margin-left: 4px;
-}
-
-/* Per-tab icon-only opt-in (Overview, Debug). Same effect as the
-   compact-mode rule above, but applied unconditionally on those tabs
-   so the bar stays narrower and labels stay visible on the more
-   ambiguous tabs at narrower widths. */
-.ds-tab.icon-only {
-  padding: 9px 10px;
-}
-.ds-tab.icon-only .ds-tab-label {
-  display: none;
-}
-
-/* Measurement state: useCompactTabs.update() applies this briefly
-   inside a single rAF to read the true natural width of the bar's
-   children. The flex spacer is hidden and every other child has
-   `flex: none` so nothing shrinks; labels are forced visible so the
-   measurement reflects the expanded layout. The class is removed
-   before the next paint, so the user never sees this state. */
-.ds-tabs.measuring .ds-tabs-spacer {
-  display: none;
-}
-.ds-tabs.measuring .ds-tab,
-.ds-tabs.measuring .ds-tabs-refresh,
-.ds-tabs.measuring .ds-tabs-actions {
-  flex: none;
-}
-.ds-tabs.measuring .ds-tab-label {
-  display: inline;
-}
-/* Per-tab icon-only opt-in stays icon-only even during measurement —
-   the measurement is asking "would the always-labeled tabs fit?", so
-   the always-icon tabs should keep their compact width. */
-.ds-tabs.measuring .ds-tab.icon-only .ds-tab-label {
-  display: none;
 }
 
 /* Body ------------------------------------------------------------------- */
@@ -3115,6 +2055,11 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   vertical-align: middle;
 }
 
+.fld-problem {
+  color: var(--red);
+  font-size: 12px;
+}
+
 .readonly-val {
   cursor: default;
   color: var(--text);
@@ -3166,6 +2111,19 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   word-break: break-word;
 }
 
+/* On a phone a value beside its label would have a third of the card, so
+   each label sits above its value. */
+@media (max-width: 639.98px) {
+  .kv-grid {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 2px;
+  }
+
+  .kv-grid dd + dt {
+    margin-top: 10px;
+  }
+}
+
 /* Multi-line cells (address) want top alignment so the label sits next
    to the first line, not vertically centered with the whole block. */
 .kv-grid .kv-top {
@@ -3200,6 +2158,12 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   gap: 8px;
 }
 
+@media (max-width: 767.98px) {
+  .card-actions :deep(.p-button) {
+    min-height: var(--tap-target);
+  }
+}
+
 .groups-toolbar {
   display: flex;
   align-items: center;
@@ -3207,6 +2171,10 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   gap: 12px;
   margin-bottom: 14px;
   flex-wrap: wrap;
+}
+
+.groups-failure {
+  margin-bottom: 14px;
 }
 
 .groups-toolbar-left {
@@ -3284,8 +2252,12 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   gap: 6px;
 }
 
-.group-grid :deep(.gchip) {
+.group-grid :deep(.gchip-wrap) {
   width: 100%;
+}
+
+.group-grid :deep(.gchip) {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -3501,41 +2473,6 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   max-width: 220px;
 }
 
-/* Hero launcher links — share .copybtn styling but render as anchors. */
-.copybtn.launcher {
-  text-decoration: none;
-  color: var(--text);
-  border-color: color-mix(in oklab, var(--accent) 30%, var(--border-strong));
-  background: color-mix(in oklab, var(--accent) 8%, var(--surface-2));
-}
-
-.copybtn.launcher:hover {
-  background: color-mix(in oklab, var(--accent) 15%, var(--surface-3));
-}
-
-.freshness-foot {
-  margin: 4px 0 0;
-}
-
-/* On narrow screens auto-fit collapses naturally; nothing extra needed. */
-
-@media (max-width: 880px) {
-  .detail-hero-top {
-    flex-wrap: wrap;
-  }
-
-  .detail-hero-main {
-    flex: 1 1 100%;
-  }
-
-  .detail-hero-aside {
-    flex: 1 1 100%;
-    flex-direction: row;
-    align-items: center;
-    justify-content: flex-start;
-  }
-}
-
 /* Save bar --------------------------------------------------------------- */
 .save-bar-floating {
   /* Sticky at the bottom of the page-inner viewport so editors don't lose
@@ -3550,6 +2487,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
 
 .save-bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   margin-top: 16px;
@@ -3590,6 +2528,14 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   align-items: center;
   gap: 6px;
   margin-left: auto;
+}
+
+.save-bar-failure {
+  flex-basis: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--red);
 }
 
 .save-bar-enter-active,
@@ -3657,7 +2603,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   text-overflow: ellipsis;
 }
 
-/* Reset dialog ------------------------------------------------------------ */
+/* Dialogs ----------------------------------------------------------------- */
 .dialog-prose {
   font-size: 13px;
   margin: 0 0 8px;
@@ -3671,67 +2617,6 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
   color: var(--text-3);
   font-size: 12px;
   margin-bottom: 14px;
-}
-
-.reset-form {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-
-.move-current {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin: 0 0 10px;
-  font-size: 12px;
-}
-
-.move-current .muted {
-  color: var(--text-3);
-}
-
-.dn-line {
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 2px 6px;
-  color: var(--text-2);
-  word-break: break-all;
-}
-
-.move-tree {
-  margin: 0 0 12px;
-  min-height: 40px;
-}
-
-.form-row {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.check-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 13px;
-  color: var(--text-2);
-}
-
-.w-full {
-  width: 100%;
-}
-
-:deep(.p-password) {
-  display: block;
-  width: 100%;
-}
-
-:deep(.p-password .p-password-input) {
-  width: 100%;
 }
 
 /* MFA methods list rendered under the registration badge in the

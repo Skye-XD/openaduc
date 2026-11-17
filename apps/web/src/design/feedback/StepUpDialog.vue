@@ -7,12 +7,12 @@ import Password from 'primevue/password';
 import Message from 'primevue/message';
 import { useAuthStore } from '../../stores/auth.js';
 import { ApiError } from '../../api/client.js';
+import { ELEVATED_SESSION_LIMITS } from '@openaduc/shared';
 
 const props = defineProps<{
   visible: boolean;
-  // Optional context shown above the password field — populated when
-  // the dialog opened automatically (e.g. "your editing session
-  // expired") rather than from a click on the editing toggle.
+  /** Why the prompt is here, when the operator couldn't know: the server
+   *  refused a write, or the write says what it needs. */
   reason?: string | null;
 }>();
 const emit = defineEmits<{
@@ -22,6 +22,10 @@ const emit = defineEmits<{
 }>();
 
 const auth = useAuthStore();
+const defaultIdle = ELEVATED_SESSION_LIMITS.idleTimeout.default;
+const lifetimeMinutes = ELEVATED_SESSION_LIMITS.absoluteLifetime.default;
+const defaultLifetime =
+  lifetimeMinutes % 60 === 0 ? `${lifetimeMinutes / 60} hours` : `${lifetimeMinutes} minutes`;
 const password = ref('');
 const submitting = ref(false);
 const error = ref<string | null>(null);
@@ -36,7 +40,14 @@ watch(
   },
 );
 
+// A held Enter repeats, and an input method's Enter confirms what it composed.
+function onEnter(e: KeyboardEvent): void {
+  if (e.repeat || e.isComposing || e.keyCode === 229) return;
+  void onConfirm();
+}
+
 async function onConfirm(): Promise<void> {
+  if (submitting.value) return;
   if (!password.value) {
     error.value = 'Password required';
     return;
@@ -65,16 +76,18 @@ function onCancel(): void {
     :visible="visible"
     @update:visible="(v) => emit('update:visible', v)"
     modal
+    class="ds-sheet"
     header="Confirm your identity"
     :style="{ width: '26rem' }"
     :closable="!submitting"
   >
-    <Message v-if="reason" severity="warn" :closable="false" class="dialog-reason">
-      {{ reason }}
-    </Message>
+    <!-- Not a Message: its enter animation grows it from zero height, which
+         left the text clipped in the opening dialog. -->
+    <p v-if="reason" class="dialog-reason" role="alert">{{ reason }}</p>
     <p class="dialog-prose">
-      Re-enter your AD password to authorize sensitive actions for the next session. The server uses
-      this to bind as you when applying changes.
+      Re-enter your AD password to unlock writes. The server uses it to bind as you when applying
+      changes. Writes stay unlocked until you've been idle a while or reach a time limit (by default
+      {{ defaultIdle }} minutes idle, {{ defaultLifetime }} at most).
     </p>
     <!-- PrimeVue Dialog's onAfterEnter calls focus() which only finds
          elements with the [autofocus] attribute. Without one, it falls
@@ -83,6 +96,7 @@ function onCancel(): void {
          password field focused and ready for typing. -->
     <Password
       v-model="password"
+      :input-props="{ 'aria-label': 'Your AD password' }"
       :feedback="false"
       toggle-mask
       input-class="w-full"
@@ -90,7 +104,7 @@ function onCancel(): void {
       :disabled="submitting"
       autocomplete="current-password"
       autofocus
-      @keyup.enter="onConfirm"
+      @keydown.enter="onEnter"
     />
     <Message v-if="error" severity="error" :closable="false" class="dialog-error">{{
       error
@@ -110,7 +124,13 @@ function onCancel(): void {
 }
 
 .dialog-reason {
-  margin-bottom: 12px !important;
+  margin: 0 0 12px;
+  padding: 8px 12px;
+  border: 1px solid color-mix(in oklab, var(--amber) 22%, transparent);
+  border-radius: 6px;
+  background: var(--amber-soft);
+  color: var(--amber);
+  font-size: 13px;
 }
 
 .dialog-error {

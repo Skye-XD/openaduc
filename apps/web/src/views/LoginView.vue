@@ -15,6 +15,7 @@ import Wordmark from '../design/primitives/Wordmark.vue';
 const auth = useAuthStore();
 const router = useRouter();
 const route = useRoute();
+const sessionExpired = route.query.expired === '1';
 
 const directories = ref<PublicDirectorySummary[]>([]);
 const directoryId = ref<number | null>(null);
@@ -122,7 +123,7 @@ async function onSubmit(): Promise<void> {
           <div class="login-row">
             <label for="password" class="fld-label">Password</label>
             <Password
-              id="password"
+              input-id="password"
               v-model="password"
               :feedback="false"
               toggle-mask
@@ -132,6 +133,12 @@ async function onSubmit(): Promise<void> {
               autocomplete="current-password"
             />
           </div>
+          <Message
+            v-if="sessionExpired && !localError && !auth.error"
+            severity="info"
+            :closable="false"
+            >Your session ended. Sign in again to continue where you were.</Message
+          >
           <Message v-if="localError || auth.error" severity="error" :closable="false">{{
             localError ?? auth.error
           }}</Message>

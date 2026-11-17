@@ -1,45 +1,61 @@
 <!-- SPDX-License-Identifier: BUSL-1.1
-     Classic "Move…" dialog: pick a destination OU from the tree and
-     OK. Only users have a backend mutation in our API today; for groups
-     and computers we show the picker but disable OK with a tooltip
-     explaining why. -->
+     Classic "Move…" dialog for a user or computer: pick a destination OU
+     from the tree and OK. -->
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import WinDialog from './WinDialog.vue';
 import WinIcon from '../primitives/WinIcon.vue';
-import { api } from '../../api/index.js';
-import { ApiError } from '../../api/client.js';
-import { useAuthStore } from '../../stores/auth.js';
 import { useOldSchool } from '../stores/useOldSchool.js';
 import { useToast } from 'primevue/usetoast';
+import { undoable } from '../../design/feedback/undoToast.js';
+import { useAccountMove } from '../../design/composables/useAccountMove.js';
+import type { AccountKind } from '../../design/composables/useAccountActions.js';
 import type { DirectoryOu } from '@openaduc/shared';
 
 const props = defineProps<{
   windowId: number;
-  objectKind: 'user' | 'group' | 'computer';
+  accountKind: AccountKind;
   id: string;
   label: string;
 }>();
 const emit = defineEmits<{ (e: 'close'): void }>();
 
-const auth = useAuthStore();
 const store = useOldSchool();
 const toast = useToast();
+// Runs for an Undo too, after this dialog has closed.
+const { ous, loading, destination, atCurrent, ready, error, load, submit, ouName } = useAccountMove(
+  {
+    kind: props.accountKind,
+    onMoved: (_account, to, offer) => {
+      toast.add(
+        undoable(
+          { severity: 'success', summary: `Moved ${props.label} to ${ouName(to)}.`, life: 3000 },
+          offer,
+        ),
+      );
+      store.bumpData();
+      emit('close');
+    },
+    onFailed: ({ message }) =>
+      store.reportError(`Windows cannot move object ${props.label} because:\n${message}`),
+  },
+);
 
-const ous = ref<DirectoryOu[]>([]);
+onMounted(() => load(props.id));
+
 const expanded = ref<Set<string>>(new Set());
-const selected = ref<string | null>(null);
-const err = ref<string | null>(null);
 
-onMounted(async () => {
-  try {
-    const resp = await api.ous.list();
-    ous.value = resp.ous;
-    // Expand root level on open.
-    expanded.value = new Set(resp.ous.filter((o) => !o.parentDn).map((o) => o.distinguishedName));
-  } catch (e) {
-    err.value = e instanceof ApiError ? e.message : (e as Error).message;
+watch(ous, (list) => {
+  const byDn = new Map(list.map((o) => [o.distinguishedName.toLowerCase(), o]));
+  const open = new Set(list.filter((o) => !o.parentDn).map((o) => o.distinguishedName));
+  let parent = destination.value ? byDn.get(destination.value.toLowerCase())?.parentDn : null;
+  while (parent) {
+    const ou = byDn.get(parent.toLowerCase());
+    if (!ou || open.has(ou.distinguishedName)) break;
+    open.add(ou.distinguishedName);
+    parent = ou.parentDn;
   }
+  expanded.value = open;
 });
 
 interface OuRow {
@@ -78,24 +94,6 @@ function toggle(r: OuRow): void {
   else s.add(r.dn);
   expanded.value = s;
 }
-
-const canOk = computed(() => props.objectKind === 'user' && !!selected.value);
-
-async function ok(): Promise<void> {
-  if (props.objectKind !== 'user') return;
-  if (!selected.value) return;
-  err.value = null;
-  auth.requireEdit(async () => {
-    try {
-      await api.users.move(props.id, { targetOuDn: selected.value! });
-      toast.add({ severity: 'success', summary: `${props.label} moved.`, life: 3000 });
-      store.bumpData();
-      emit('close');
-    } catch (e) {
-      err.value = e instanceof ApiError ? e.message : (e as Error).message;
-    }
-  }, 'Moving an object requires step-up authentication.');
-}
 </script>
 
 <template>
@@ -105,8 +103,8 @@ async function ok(): Promise<void> {
     icon="ou"
     hide-apply
     ok-label="OK"
-    :can-ok="canOk"
-    @ok="ok"
+    :can-ok="ready"
+    @ok="submit"
     @cancel="emit('close')"
     @close="emit('close')"
   >
@@ -119,9 +117,9 @@ async function ok(): Promise<void> {
           v-for="r in rows"
           :key="r.dn"
           class="os-listbox-row"
-          :class="{ selected: selected === r.dn }"
+          :class="{ selected: destination === r.dn }"
           :style="{ paddingLeft: `${r.depth * 16 + 6}px` }"
-          @click="selected = r.dn"
+          @click="destination = r.dn"
           @dblclick="toggle(r)"
         >
           <span @click.stop="toggle(r)" style="width: 14px; text-align: center; cursor: pointer">
@@ -130,12 +128,13 @@ async function ok(): Promise<void> {
           <WinIcon name="ou" :size="14" />
           <span>{{ r.label }}</span>
         </div>
-        <div v-if="rows.length === 0" class="os-listbox-empty">No organizational units.</div>
+        <div v-if="loading" class="os-listbox-empty">Loading…</div>
+        <div v-else-if="rows.length === 0" class="os-listbox-empty">No organizational units.</div>
       </div>
-      <div v-if="objectKind !== 'user'" class="os-info" style="margin-top: 10px">
-        Moving {{ objectKind }} objects is not yet supported by the backend.
+      <div v-if="atCurrent" class="os-info" style="margin-top: 10px">
+        {{ label }} is already in this container.
       </div>
-      <div v-if="err" class="os-error" style="margin-top: 10px">{{ err }}</div>
+      <div v-if="error" class="os-error" style="margin-top: 10px">{{ error }}</div>
     </div>
   </WinDialog>
 </template>

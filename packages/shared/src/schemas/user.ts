@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 import { z } from 'zod';
+import { listFreshnessSchema } from './freshness.js';
+import { recycleBinStatusSchema } from './deletedUser.js';
 
 // `z.coerce.boolean()` calls JS `Boolean(v)` which returns true for any
 // non-empty string — so `?enabled=false` would coerce to `true` and silently
@@ -22,11 +24,12 @@ export const userSummarySchema = z.object({
   email: z.string().nullable(),
   department: z.string().nullable(),
   title: z.string().nullable(),
-  mobile: z.string().nullable(),
   enabled: z.boolean(),
   locked: z.boolean(),
   passwordNeverExpires: z.boolean(),
   passwordExpiresAt: z.string().nullable(),
+  // Must change password at next logon (pwdLastSet = 0).
+  passwordMustChange: z.boolean(),
   accountExpiresAt: z.string().nullable(),
   lastLogonAt: z.string().nullable(),
   // AD's `whenChanged` — the most recent attribute modification on the
@@ -78,10 +81,18 @@ export const userDetailSchema = userSummarySchema.extend({
   // here can co-exist with `locked=false` (we treat the successful bind as
   // the authoritative liveness signal).
   lockedAt: z.string().nullable(),
-  // Computed = lockedAt + domain `lockoutDuration`. Null when the account
-  // is not locked, when the domain policy is "manual unlock only"
-  // (lockoutDuration = 0), or when we couldn't read the policy.
+  // Computed = lockedAt + the lockout duration that applies: the user's
+  // fine-grained password policy (PSO) if one does, else the domain's. Null
+  // when the account is not locked, when that policy keeps lockouts until
+  // someone unlocks the account (`lockedUntilUnlocked`), or when it couldn't
+  // be read (a PSO usually can't be without Domain Admin rights).
   autoUnlockAt: z.string().nullable(),
+  // Locked, and the policy that applies has no lockout duration (0, or AD's
+  // "never"), so the lockout lasts until someone unlocks the account.
+  lockedUntilUnlocked: z.boolean(),
+  // AD `badPwdCount`: failed sign-ins since the last good one. Each DC keeps
+  // its own count (it isn't replicated), so this is the answering DC's.
+  badPasswordCount: z.number().int().nullable(),
   // Additional typed AD attributes promoted into the Identity grid. All
   // sourced from rawAttributes at the route layer; we don't cache them as
   // separate columns because the detail view always live-refreshes first.
@@ -93,6 +104,9 @@ export const userDetailSchema = userSummarySchema.extend({
   // practice every AD setup we've seen stores a single multi-line string
   // (newline-separated). Treat as scalar; the UI uses a textarea for it.
   homePostalAddress: z.string().nullable(),
+  // The work address's street lines, which ADUC's Address tab edits as
+  // "Street"; one multi-line string, like homePostalAddress.
+  streetAddress: z.string().nullable(),
   description: z.string().nullable(),
   company: z.string().nullable(),
   // AD address attributes use single-letter names: c=country code,
@@ -102,6 +116,20 @@ export const userDetailSchema = userSummarySchema.extend({
   l: z.string().nullable(),
   st: z.string().nullable(),
   postalCode: z.string().nullable(),
+  // Attributes the property pages show by name. Typed fields, so readers
+  // without view:raw_attributes still get them.
+  cn: z.string().nullable(),
+  physicalDeliveryOfficeName: z.string().nullable(),
+  postOfficeBox: z.string().nullable(),
+  profilePath: z.string().nullable(),
+  scriptPath: z.string().nullable(),
+  homeDirectory: z.string().nullable(),
+  pager: z.string().nullable(),
+  facsimileTelephoneNumber: z.string().nullable(),
+  info: z.string().nullable(),
+  // The `SMTP:` (primary) entry of proxyAddresses, prefix stripped; null
+  // when the account has no proxyAddresses.
+  primarySmtpAddress: z.string().nullable(),
   // Multi-valued AD attributes; empty array if absent on the entry.
   otherMailbox: z.array(z.string()),
   otherHomePhone: z.array(z.string()),
@@ -111,12 +139,14 @@ export const userDetailSchema = userSummarySchema.extend({
   // prefix stripped for display.
   emailAliases: z.array(z.string()),
   // directReports DNs resolved against user_cache_records. Entries with a
-  // null id are users not currently in the cache — render the DN, no link.
+  // null id (and null enabled) are users not currently in the cache —
+  // render the DN, no link.
   directReports: z.array(
     z.object({
       id: z.string().nullable(),
       distinguishedName: z.string(),
       displayName: z.string().nullable(),
+      enabled: z.boolean().nullable(),
     }),
   ),
   groupMemberships: z.array(
@@ -167,13 +197,18 @@ export const userDetailSchema = userSummarySchema.extend({
           status: z.enum(['success', 'p1_required', 'forbidden', 'not_found']).nullable(),
         })
         .nullable(),
+      /** The integration's Temporary Access Pass feature is on, so Issue TAP is offered. */
+      temporaryAccessPass: z.boolean(),
+      /** The integration's licenses feature is on, so the page shows the user's licenses. */
+      licenses: z.boolean(),
     })
     .nullable(),
   // Every populated LDAP attribute on the user entry, with binary blobs
-  // (objectGUID, photos, etc.) stripped at the provider layer. Each value is
-  // a string or string[] in practice, but the schema is loose because AD
-  // doesn't constrain the set we'll see across customer directories.
-  rawAttributes: z.record(z.unknown()),
+  // (objectGUID, photos, etc.) and secrets stripped at the provider layer.
+  // Each value is a string or string[] in practice, but the schema is loose
+  // because AD doesn't constrain the set we'll see across customer
+  // directories. Null for callers without view:raw_attributes.
+  rawAttributes: z.record(z.string(), z.unknown()).nullable(),
 });
 export type UserDetail = z.infer<typeof userDetailSchema>;
 
@@ -201,7 +236,7 @@ export const userSearchQuerySchema = z.object({
   // Filter to direct members of this group (objectGUID). Multiple instances
   // of the param mean "AND" — must be in every listed group.
   inGroupId: z
-    .union([z.string().uuid(), z.array(z.string().uuid())])
+    .union([z.guid(), z.array(z.guid())])
     .optional()
     .transform((v) => (v === undefined ? undefined : Array.isArray(v) ? v : [v])),
   // Case-insensitive department match. Exact equality, not substring — the
@@ -210,7 +245,7 @@ export const userSearchQuerySchema = z.object({
   department: z.string().max(256).optional(),
   // Filter by manager (objectGUID of the manager user). The cache stores
   // manager_dn but the route resolves the GUID → DN before querying.
-  managerId: z.string().uuid().optional(),
+  managerId: z.guid().optional(),
   page: z.coerce.number().int().min(1).default(1),
   // Cap raised to 50_000 so the web client can load the full dataset in
   // one request and filter/sort entirely in the browser. Mirrors the
@@ -228,9 +263,10 @@ export const userSearchQuerySchema = z.object({
       'passwordExpiresAt',
       'accountExpiresAt',
       'modifiedAtSource',
-      // `status` orders by a derived priority: locked → disabled → expired
-      // → pwd-expired → pwd-expiring → active. The route translates it into
-      // a CASE expression; ASC = most-attention-needed first.
+      // `status` orders by a derived priority: disabled → locked →
+      // pwd-expired → account expired → must change → pwd-expiring →
+      // active, as the SPA ranks them. The route translates it into a CASE
+      // expression; ASC = most-attention-needed first.
       'status',
     ])
     .default('displayName'),
@@ -243,6 +279,7 @@ export const userSearchResponseSchema = z.object({
   total: z.number().int(),
   page: z.number().int(),
   pageSize: z.number().int(),
+  freshness: listFreshnessSchema,
 });
 export type UserSearchResponse = z.infer<typeof userSearchResponseSchema>;
 
@@ -257,85 +294,34 @@ export type UnlockUserRequest = z.infer<typeof unlockUserRequestSchema>;
 
 export const confirmPasswordSchema = z.object({}).strict();
 
+// The API's floor for a new password, whatever the domain's policy allows.
+export const RESET_PASSWORD_MIN_LENGTH = 8;
+
 export const resetPasswordRequestSchema = z.object({
-  newPassword: z.string().min(8).max(1024),
+  newPassword: z.string().min(RESET_PASSWORD_MIN_LENGTH).max(1024),
   forceChangeAtNextLogin: z.boolean().default(true),
-  // Optionally set the "password never expires" flag as part of the reset.
-  // Omitted → leave the flag untouched (legacy callers). Mutually exclusive
-  // with forceChangeAtNextLogin (AD can't do both) — when true, the server
-  // ignores the force-change request.
-  passwordNeverExpires: z.boolean().optional(),
+  // Also clear a lockout, in the same directory modify as the password.
+  unlock: z.boolean().default(false),
 });
 export type ResetPasswordRequest = z.infer<typeof resetPasswordRequestSchema>;
 
-// Toggle the per-user DONT_EXPIRE_PASSWORD flag (userAccountControl bit
-// 0x10000). `true` makes the password never expire regardless of domain
-// policy; `false` puts it back under the normal max-password-age policy.
-// "Expire now (must change at next logon)" takes no body — it just sets
-// pwdLastSet=0 — so it needs no request schema here.
-export const passwordNeverExpiresRequestSchema = z.object({
-  neverExpires: z.boolean(),
-});
-export type PasswordNeverExpiresRequest = z.infer<typeof passwordNeverExpiresRequestSchema>;
+// When the account stops working (AD `accountExpires`), or null for never.
+// A date already past expires the account at once, as ADUC allows.
+export const accountExpiryRequestSchema = z
+  .object({
+    expiresAt: z.iso
+      .datetime({ offset: true })
+      // FILETIME counts from 1601.
+      .refine((v) => Date.parse(v) > Date.UTC(1601, 0, 1), { message: 'must be after 1601' })
+      .nullable(),
+  })
+  .strict();
+export type AccountExpiryRequest = z.infer<typeof accountExpiryRequestSchema>;
 
 export const groupMembershipChangeSchema = z.object({
-  groupId: z.string().uuid(),
+  groupId: z.guid(),
 });
 export type GroupMembershipChangeRequest = z.infer<typeof groupMembershipChangeSchema>;
-
-// ---- Create user --------------------------------------------------------
-//
-// Provisions a brand-new AD account. Per the deployment's chosen policy the
-// account is created DISABLED with no password (a single LDAP `add`); the
-// operator sets a password and enables it afterwards via the existing
-// reset-password / enable actions. So there is no password field here.
-//
-// sAMAccountName is the hard constraint: AD caps it at 20 chars and rejects a
-// set of reserved characters (" [ ] : ; | = + * ? < > / \ , and whitespace).
-// The other fields are free-form; the CN (RDN) is derived server-side from
-// displayName → "given surname" → sAMAccountName and LDAP-escaped there.
-const samAccountNameSchema = z
-  .string()
-  .trim()
-  .min(1, 'logon name is required')
-  .max(20, 'logon name must be 20 characters or fewer')
-  .regex(/^[^\s"[\]:;|=+*?<>/\\,]+$/, 'logon name contains a reserved character');
-
-export const userCreateRequestSchema = z.object({
-  // Target OU DN. The server validates it against the cached directory_ous
-  // table for the active provider before issuing the add.
-  parentDn: z.string().min(1).max(1024),
-  samAccountName: samAccountNameSchema,
-  // UPN is optional but recommended; when present it must look like a@b.
-  userPrincipalName: z
-    .string()
-    .trim()
-    .max(256)
-    .regex(/^[^@\s]+@[^@\s]+$/, 'UPN must be in the form user@domain')
-    .optional()
-    .or(z.literal('').transform(() => undefined)),
-  givenName: z.string().trim().max(64).optional(),
-  surname: z.string().trim().max(64).optional(),
-  displayName: z.string().trim().max(256).optional(),
-  email: z
-    .string()
-    .trim()
-    .email()
-    .max(256)
-    .optional()
-    .or(z.literal('').transform(() => undefined)),
-});
-export type UserCreateRequest = z.infer<typeof userCreateRequestSchema>;
-
-export const userCreateResponseSchema = z.object({
-  ok: z.boolean(),
-  // objectGUID of the freshly created account, so the client can navigate
-  // straight to its detail page (to set a password / enable it).
-  id: z.string(),
-  distinguishedName: z.string(),
-  samAccountName: z.string(),
-});
-export type UserCreateResponse = z.infer<typeof userCreateResponseSchema>;
 
 // User attribute patch — keys match the camelCase fields on UserDetail.
 // Each field is optional; null clears the attribute; a non-empty string
@@ -371,9 +357,11 @@ export const userUpdateRequestSchema = z.object({
       employeeNumber: editableStringField.optional(),
       ipPhone: editableStringField.optional(),
       homePhone: editableStringField.optional(),
-      // homePostalAddress and description are multi-line freeform fields;
-      // bump the limit so paragraph-style values don't get rejected.
+      // homePostalAddress, streetAddress and description are multi-line
+      // freeform fields; bump the limit so paragraph-style values don't get
+      // rejected.
       homePostalAddress: z.string().max(1024).nullable().optional(),
+      streetAddress: z.string().max(1024).nullable().optional(),
       description: z.string().max(1024).nullable().optional(),
       company: editableStringField.optional(),
       c: z.string().max(8).nullable().optional(),
@@ -381,9 +369,6 @@ export const userUpdateRequestSchema = z.object({
       l: editableStringField.optional(),
       st: editableStringField.optional(),
       postalCode: editableStringField.optional(),
-      // Account expiration: an ISO datetime sets the expiry; null clears it
-      // (never expires). Omit to leave unchanged.
-      accountExpiresAt: z.string().datetime({ offset: true }).nullable().optional(),
       otherMailbox: editableArrayField.optional(),
       otherHomePhone: editableArrayField.optional(),
       otherMobile: editableArrayField.optional(),
@@ -392,6 +377,163 @@ export const userUpdateRequestSchema = z.object({
     .refine((p) => Object.keys(p).length > 0, { message: 'patch must contain at least one field' }),
 });
 export type UserUpdateRequest = z.infer<typeof userUpdateRequestSchema>;
+
+// ---- Rename ------------------------------------------------------------
+//
+// A rename touches the identity attributes the general attribute PATCH
+// deliberately leaves out: the RDN (cn, which AD mirrors into `name`),
+// sAMAccountName, userPrincipalName, and the primary SMTP address. They get
+// their own endpoint and capability because they change how the person
+// signs in and where mail is delivered, and because cn needs a modifyDN
+// rather than a modify.
+
+// AD's rules for a pre-Windows 2000 name: none of
+// " / \ [ ] : ; | = , + * ? < > @, not only dots and spaces, and no
+// trailing dot. A user's logon name is at most 20 characters; a group's
+// may be longer.
+const SAM_FORBIDDEN = /["/\\[\]:;|=,+*?<>@]/;
+// eslint-disable-next-line no-control-regex -- matching them is the point
+export const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+export function samAccountNameSchemaOf(maxLength: number) {
+  return z
+    .string()
+    .trim()
+    .min(1)
+    .max(maxLength)
+    .refine((v) => !SAM_FORBIDDEN.test(v), {
+      message: 'cannot contain " / \\ [ ] : ; | = , + * ? < > @',
+    })
+    .refine((v) => !CONTROL_CHARS.test(v), { message: 'cannot contain control characters' })
+    .refine((v) => !/^[. ]+$/.test(v), { message: 'cannot be only dots and spaces' })
+    .refine((v) => !v.endsWith('.'), { message: 'cannot end with a dot' });
+}
+export const samAccountNameSchema = samAccountNameSchemaOf(20);
+
+export const userPrincipalNameSchema = z
+  .string()
+  .trim()
+  .max(256)
+  .regex(/^[^\s@]+@[^\s@]+$/, { message: 'must look like name@suffix' });
+
+export const userRenameRequestSchema = z
+  .object({
+    givenName: z.string().trim().max(64).nullable().optional(),
+    surname: z.string().trim().max(64).nullable().optional(),
+    displayName: z.string().trim().min(1).max(256).optional(),
+    // The RDN value. AD caps cn at 64 characters.
+    cn: z.string().trim().min(1).max(64).optional(),
+    samAccountName: samAccountNameSchema.optional(),
+    userPrincipalName: userPrincipalNameSchema.optional(),
+    email: z.string().trim().email().max(256).nullable().optional(),
+    // Only consulted when `email` changes on an account that already has
+    // proxyAddresses: the new address becomes the primary SMTP and the old
+    // primary is demoted to an alias (true) or dropped (false). Accounts
+    // without proxyAddresses only get `mail` updated.
+    keepOldEmailAsAlias: z.boolean().default(true),
+  })
+  .strict()
+  .refine((r) => Object.keys(r).some((k) => k !== 'keepOldEmailAsAlias'), {
+    message: 'rename must change at least one field',
+  });
+export type UserRenameRequest = z.input<typeof userRenameRequestSchema>;
+
+// ---- Delete ------------------------------------------------------------
+//
+// Only disabled accounts can be deleted, and never AD's own accounts. The
+// server re-checks both against the live entry immediately before the
+// delete, so a stale list in the browser can't delete someone who was
+// re-enabled in the meantime.
+
+export const userDeleteRequestSchema = z
+  .object({
+    // Must match the account's current sAMAccountName (case-insensitive).
+    // Makes every delete name its target explicitly, so a wrong id in the
+    // URL fails instead of deleting the wrong person.
+    confirmSamAccountName: z.string().min(1).max(256),
+    // Required to delete an account that contains other objects (e.g.
+    // Exchange ActiveSync devices): those go with it in a tree delete.
+    allowTreeDelete: z.boolean().optional(),
+  })
+  .strict();
+export type UserDeleteRequest = z.infer<typeof userDeleteRequestSchema>;
+
+export const userDeleteBlockReasonSchema = z.enum([
+  // Still enabled — disable first.
+  'enabled',
+  // isCriticalSystemObject=TRUE (Guest, krbtgt, DefaultAccount, ...).
+  'critical_system_object',
+  // Well-known RID below 1000 — the accounts AD creates for itself.
+  'builtin_account',
+  // Not in the cache (deleted elsewhere, or the id is wrong).
+  'not_found',
+]);
+export type UserDeleteBlockReason = z.infer<typeof userDeleteBlockReasonSchema>;
+
+export const userDeletePreflightRequestSchema = z
+  .object({ ids: z.array(z.guid()).min(1).max(1000) })
+  .strict();
+export type UserDeletePreflightRequest = z.infer<typeof userDeletePreflightRequestSchema>;
+
+export const userDeletePreflightResponseSchema = z.object({
+  // Null when the operator's bind can't read the Optional Features
+  // container; the UI then says restore may not be possible.
+  recycleBin: recycleBinStatusSchema.nullable(),
+  users: z.array(
+    z.object({
+      id: z.string(),
+      samAccountName: z.string().nullable(),
+      displayName: z.string().nullable(),
+      distinguishedName: z.string().nullable(),
+      enabled: z.boolean().nullable(),
+      // adminCount=1. Deletable, but the dialog flags it.
+      privileged: z.boolean(),
+      // Objects inside the account, deleted with it. Null = couldn't tell.
+      childObjects: z.number().int().nullable(),
+      blockedReason: userDeleteBlockReasonSchema.nullable(),
+    }),
+  ),
+});
+export type UserDeletePreflightResponse = z.infer<typeof userDeletePreflightResponseSchema>;
+
+// ---- Match a pasted list ------------------------------------------------
+//
+// Each entry (an email, logon name, UPN or display name) is matched against
+// the cached users. Duplicate entries come back once.
+export const MAX_USER_MATCH_ENTRIES = 1000;
+
+export const userMatchRequestSchema = z
+  .object({
+    entries: z.array(z.string().max(512)).min(1).max(MAX_USER_MATCH_ENTRIES),
+  })
+  .strict();
+export type UserMatchRequest = z.infer<typeof userMatchRequestSchema>;
+
+export const userMatchCandidateSchema = z.object({
+  id: z.string(),
+  samAccountName: z.string(),
+  userPrincipalName: z.string().nullable(),
+  displayName: z.string().nullable(),
+  email: z.string().nullable(),
+  department: z.string().nullable(),
+  title: z.string().nullable(),
+  enabled: z.boolean(),
+  distinguishedName: z.string(),
+});
+export type UserMatchCandidate = z.infer<typeof userMatchCandidateSchema>;
+
+export const userMatchResultSchema = z.discriminatedUnion('status', [
+  z.object({ entry: z.string(), status: z.literal('matched'), user: userMatchCandidateSchema }),
+  z.object({
+    entry: z.string(),
+    status: z.literal('ambiguous'),
+    candidates: z.array(userMatchCandidateSchema),
+  }),
+  z.object({ entry: z.string(), status: z.literal('unmatched') }),
+]);
+export type UserMatchResult = z.infer<typeof userMatchResultSchema>;
+
+export const userMatchResponseSchema = z.object({ results: z.array(userMatchResultSchema) });
+export type UserMatchResponse = z.infer<typeof userMatchResponseSchema>;
 
 // ---- Directory policy --------------------------------------------------
 //
@@ -419,6 +561,8 @@ export const directoryPolicySchema = z.object({
   minPwdLength: z.number().int().nullable(),
   // `pwdHistoryLength` — how many past passwords AD remembers.
   pwdHistoryLength: z.number().int().nullable(),
+  // Whether passwords must meet AD's complexity rules (`pwdProperties`).
+  complexityRequired: z.boolean().nullable(),
   // ISO timestamp of when this policy was last fetched from AD.
   fetchedAt: z.string(),
 });

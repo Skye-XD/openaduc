@@ -8,6 +8,9 @@
 // like to pull up two users side-by-side in the real console.
 import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
+import type { AccountKind } from '../../design/composables/useAccountActions.js';
+import { useOuTree } from '../../design/composables/useOuTree.js';
+import { buildConsoleTree } from '../consoleTree.js';
 
 export type SelectedKind = 'root' | 'savedQueries' | 'domain' | 'ou' | 'container' | 'builtin';
 
@@ -24,22 +27,18 @@ export type DialogSpec =
   | { kind: 'group-properties'; id: string }
   | { kind: 'computer-properties'; id: string }
   | { kind: 'reset-password'; id: string; samAccountName: string }
-  | { kind: 'move'; objectKind: 'user' | 'group' | 'computer'; id: string; label: string }
+  | { kind: 'rename-user'; id: string }
+  | { kind: 'delete-user'; id: string; label: string }
+  | { kind: 'new-user'; parentDn: string }
+  | { kind: 'copy-user'; id: string }
+  | { kind: 'new-group'; parentDn: string }
+  | { kind: 'delete-group'; id: string; label: string }
+  | { kind: 'move'; accountKind: AccountKind; id: string; label: string }
+  | { kind: 'reset-computer'; id: string; label: string }
   | { kind: 'add-to-group'; userId: string; userLabel: string }
-  | {
-      kind: 'confirm';
-      title: string;
-      message: string;
-      okLabel?: string;
-      destructive?: boolean;
-      onOk: () => void | Promise<void>;
-    }
+  | { kind: 'message'; title: string; message: string }
   | { kind: 'about' }
-  | { kind: 'find' }
-  // New-user wizard. `parentDn` is the OU the account will be created in
-  // (the currently-selected container, or null when none is selected —
-  // the dialog then asks the operator to pick one from the tree first).
-  | { kind: 'new-user'; parentDn: string | null; parentLabel: string };
+  | { kind: 'find' };
 
 /** Backwards-compatible alias for the original union name. */
 export type OpenDialog = DialogSpec | null;
@@ -55,7 +54,7 @@ export interface DialogWindow {
 }
 
 export interface SelectedRow {
-  kind: 'user' | 'group' | 'computer' | 'gpo';
+  kind: 'user' | 'group' | 'computer' | 'gpo' | 'container';
   id: string;
   /** Friendly label used by status bar / context menu headers. */
   label: string;
@@ -65,7 +64,7 @@ export interface SelectedRow {
  * Reasonable default dimensions for each dialog kind. Roughly matches
  * the proportions of the real MMC counterparts: Properties dialogs are
  * tall enough to render the General/Account tabs without scroll, the
- * pickers are wider, and Confirm is a tight little prompt.
+ * pickers are wider, and a message box is a tight little prompt.
  */
 function defaultSizeFor(kind: DialogSpec['kind']): { width: number; height: number } {
   switch (kind) {
@@ -74,19 +73,29 @@ function defaultSizeFor(kind: DialogSpec['kind']): { width: number; height: numb
     case 'computer-properties':
       return { width: 540, height: 560 };
     case 'reset-password':
-      return { width: 440, height: 340 };
+      return { width: 440, height: 440 };
+    case 'rename-user':
+      return { width: 460, height: 400 };
+    case 'delete-user':
+    case 'delete-group':
+      return { width: 460, height: 270 };
+    case 'new-user':
+      return { width: 480, height: 560 };
+    case 'copy-user':
+      return { width: 480, height: 640 };
+    case 'new-group':
+      return { width: 440, height: 400 };
     case 'move':
       return { width: 460, height: 500 };
     case 'add-to-group':
       return { width: 520, height: 480 };
     case 'find':
       return { width: 580, height: 500 };
-    case 'confirm':
+    case 'message':
+    case 'reset-computer':
       return { width: 420, height: 220 };
     case 'about':
       return { width: 460, height: 260 };
-    case 'new-user':
-      return { width: 520, height: 560 };
   }
 }
 
@@ -100,6 +109,10 @@ export const useOldSchool = defineStore('oldSchool', () => {
   });
 
   const selectedRows = ref<SelectedRow[]>([]);
+
+  // The console tree, shared by the tree pane and the contents list.
+  const { ous, loading: treeLoading, error: treeError, load: loadTree } = useOuTree();
+  const consoleTree = computed(() => buildConsoleTree(ous.value));
 
   // Every open dialog renders as a free-floating window. The topmost
   // (highest z) is the focused one; clicking on any window raises it.
@@ -193,6 +206,11 @@ export const useOldSchool = defineStore('oldSchool', () => {
     windows.value = next;
   }
 
+  /** A failure, in a message box that stays until the operator clicks OK, as ADUC does. */
+  function reportError(message: string): void {
+    openDialog({ kind: 'message', title: 'Active Directory Domain Services', message });
+  }
+
   function bumpData(): void {
     dataVersion.value += 1;
   }
@@ -204,6 +222,10 @@ export const useOldSchool = defineStore('oldSchool', () => {
   return {
     selectedNode,
     selectedRows,
+    consoleTree,
+    treeLoading,
+    treeError,
+    loadTree,
     windows,
     anyDialog,
     dataVersion,
@@ -214,6 +236,7 @@ export const useOldSchool = defineStore('oldSchool', () => {
     focusWindow,
     moveWindow,
     resizeWindow,
+    reportError,
     bumpData,
   };
 });

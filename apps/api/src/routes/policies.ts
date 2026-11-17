@@ -10,9 +10,10 @@ import {
   type GroupPolicyListResponse,
   type GroupPolicySummary,
 } from '@openaduc/shared';
+import { rawAttributesFor } from '../lib/rawAttributes.js';
 import { NotFound } from '../plugins/errorHandler.js';
 
-const idParamSchema = z.object({ id: z.string().uuid() });
+const idParamSchema = z.object({ id: z.guid() });
 
 /**
  * Group Policy routes — read-only, cache-backed.
@@ -31,7 +32,7 @@ const idParamSchema = z.object({ id: z.string().uuid() });
 export async function registerPolicyRoutes(app: FastifyInstance): Promise<void> {
   // ---- GET /api/policies/groups ----------------------------------------
   app.get('/api/policies/groups', {
-    preHandler: app.requireCapability('read:group'),
+    config: { policy: { capability: 'read:group', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<GroupPolicyListResponse> => {
       const provider = await app.services.providers.buildForRequest(req);
 
@@ -68,7 +69,7 @@ export async function registerPolicyRoutes(app: FastifyInstance): Promise<void> 
   // `:id` is the AD-assigned objectGUID (canonical UUID), matching the
   // identifier the list response surfaces.
   app.get('/api/policies/groups/:id', {
-    preHandler: app.requireCapability('read:group'),
+    config: { policy: { capability: 'read:group', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<{ policy: GroupPolicyDetail }> => {
       const { id } = idParamSchema.parse(req.params);
       const provider = await app.services.providers.buildForRequest(req);
@@ -98,7 +99,10 @@ export async function registerPolicyRoutes(app: FastifyInstance): Promise<void> 
       const detail: GroupPolicyDetail = {
         ...summary,
         functionalityVersion: policy.functionality_version,
-        rawAttributes: policy.raw_attributes_json as Record<string, unknown>,
+        rawAttributes: rawAttributesFor(
+          req.actor?.session.capabilities,
+          policy.raw_attributes_json as Record<string, unknown>,
+        ),
         links: links.map(rowToLink),
         fetchedAt:
           (policy.synced_at instanceof Date

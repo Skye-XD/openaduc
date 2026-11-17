@@ -16,39 +16,48 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import Toast from 'primevue/toast';
 import { useThemeStore } from '../design/stores/useTheme.js';
 import { useOldSchool } from './stores/useOldSchool.js';
+import { useAuthStore } from '../stores/auth.js';
 import OuTreePane from './panes/OuTreePane.vue';
 import ContentsListPane from './panes/ContentsListPane.vue';
 import WinIcon from './primitives/WinIcon.vue';
+import ElevatedStatusSection from './primitives/ElevatedStatusSection.vue';
 import UserPropertiesDialog from './dialogs/UserPropertiesDialog.vue';
 import GroupPropertiesDialog from './dialogs/GroupPropertiesDialog.vue';
 import ComputerPropertiesDialog from './dialogs/ComputerPropertiesDialog.vue';
 import ResetPasswordDialog from './dialogs/ResetPasswordDialog.vue';
 import MoveDialog from './dialogs/MoveDialog.vue';
+import ResetComputerDialog from './dialogs/ResetComputerDialog.vue';
+import RenameUserDialog from './dialogs/RenameUserDialog.vue';
+import DeleteUserDialog from './dialogs/DeleteUserDialog.vue';
+import NewGroupDialog from './dialogs/NewGroupDialog.vue';
+import NewUserDialog from './dialogs/NewUserDialog.vue';
+import DeleteGroupDialog from './dialogs/DeleteGroupDialog.vue';
 import AddToGroupDialog from './dialogs/AddToGroupDialog.vue';
-import ConfirmDialog from './dialogs/ConfirmDialog.vue';
+import MessageBoxDialog from './dialogs/MessageBoxDialog.vue';
+import AppToast from '../design/feedback/AppToast.vue';
 import AboutDialog from './dialogs/AboutDialog.vue';
 import FindDialog from './dialogs/FindDialog.vue';
-import NewUserDialog from './dialogs/NewUserDialog.vue';
-import { useAuthStore } from '../stores/auth.js';
 
 const theme = useThemeStore();
 const store = useOldSchool();
-const auth = useAuthStore();
 const router = useRouter();
+const auth = useAuthStore();
 
-// "New User" is admin-only (write:user.create). The account is created into
-// the currently-selected OU; other container kinds (domain root, the built-in
-// CN=Users container) aren't in the OU cache the server validates against, so
-// we only enable creation when an OU is selected.
-const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
-function openNewUser(): void {
-  const node = store.selectedNode;
-  const parentDn = node.kind === 'ou' ? node.dn : null;
-  store.openDialog({ kind: 'new-user', parentDn, parentLabel: node.label });
-}
+// New Group creates in the selected OU, as ADUC's toolbar button does.
+const newGroupParentDn = computed(() =>
+  store.selectedNode.kind === 'ou' && auth.hasCapability('write:group.create')
+    ? store.selectedNode.dn
+    : null,
+);
+
+// New User does the same.
+const newUserParentDn = computed(() =>
+  store.selectedNode.kind === 'ou' && auth.hasCapability('write:user.create')
+    ? store.selectedNode.dn
+    : null,
+);
 
 // --- Menu state -------------------------------------------------------
 type MenuId = 'file' | 'action' | 'view' | 'help' | null;
@@ -317,12 +326,22 @@ function exitOldSchool(): void {
           class="os-tool-btn"
           type="button"
           title="New User"
-          :disabled="!canCreateUser"
-          @click="openNewUser"
+          :disabled="!newUserParentDn"
+          @click="
+            newUserParentDn && store.openDialog({ kind: 'new-user', parentDn: newUserParentDn })
+          "
         >
           <WinIcon name="newuser" :size="14" />
         </button>
-        <button class="os-tool-btn" type="button" title="New Group" disabled>
+        <button
+          class="os-tool-btn"
+          type="button"
+          title="New Group"
+          :disabled="!newGroupParentDn"
+          @click="
+            newGroupParentDn && store.openDialog({ kind: 'new-group', parentDn: newGroupParentDn })
+          "
+        >
           <WinIcon name="newgroup" :size="14" />
         </button>
         <button class="os-tool-btn" type="button" title="New Computer" disabled>
@@ -341,11 +360,12 @@ function exitOldSchool(): void {
       <div class="os-statusbar">
         <div class="os-statusbar-section" :title="statusLeft">{{ statusLeft }}</div>
         <div class="os-statusbar-section" :title="statusRight">{{ statusRight }}</div>
+        <ElevatedStatusSection />
       </div>
     </div>
 
     <!-- Dialogs (mounted in the same root so Toast renders on top) -->
-    <Toast position="top-right" />
+    <AppToast position="top-right" />
 
     <!-- Every open dialog is a free-floating window in the windows[]
          list. Each iteration renders its own component; the v-for
@@ -377,10 +397,55 @@ function exitOldSchool(): void {
         :sam-account-name="w.dialog.samAccountName"
         @close="store.closeWindow(w.id)"
       />
+      <RenameUserDialog
+        v-else-if="w.dialog.kind === 'rename-user'"
+        :window-id="w.id"
+        :id="w.dialog.id"
+        @close="store.closeWindow(w.id)"
+      />
+      <DeleteUserDialog
+        v-else-if="w.dialog.kind === 'delete-user'"
+        :window-id="w.id"
+        :id="w.dialog.id"
+        :label="w.dialog.label"
+        @close="store.closeWindow(w.id)"
+      />
+      <NewUserDialog
+        v-else-if="w.dialog.kind === 'new-user'"
+        :window-id="w.id"
+        :parent-dn="w.dialog.parentDn"
+        @close="store.closeWindow(w.id)"
+      />
+      <NewUserDialog
+        v-else-if="w.dialog.kind === 'copy-user'"
+        :window-id="w.id"
+        :copy-from="w.dialog.id"
+        @close="store.closeWindow(w.id)"
+      />
+      <NewGroupDialog
+        v-else-if="w.dialog.kind === 'new-group'"
+        :window-id="w.id"
+        :parent-dn="w.dialog.parentDn"
+        @close="store.closeWindow(w.id)"
+      />
+      <DeleteGroupDialog
+        v-else-if="w.dialog.kind === 'delete-group'"
+        :window-id="w.id"
+        :id="w.dialog.id"
+        :label="w.dialog.label"
+        @close="store.closeWindow(w.id)"
+      />
       <MoveDialog
         v-else-if="w.dialog.kind === 'move'"
         :window-id="w.id"
-        :object-kind="w.dialog.objectKind"
+        :account-kind="w.dialog.accountKind"
+        :id="w.dialog.id"
+        :label="w.dialog.label"
+        @close="store.closeWindow(w.id)"
+      />
+      <ResetComputerDialog
+        v-else-if="w.dialog.kind === 'reset-computer'"
+        :window-id="w.id"
         :id="w.dialog.id"
         :label="w.dialog.label"
         @close="store.closeWindow(w.id)"
@@ -392,14 +457,11 @@ function exitOldSchool(): void {
         :user-label="w.dialog.userLabel"
         @close="store.closeWindow(w.id)"
       />
-      <ConfirmDialog
-        v-else-if="w.dialog.kind === 'confirm'"
+      <MessageBoxDialog
+        v-else-if="w.dialog.kind === 'message'"
         :window-id="w.id"
         :title="w.dialog.title"
         :message="w.dialog.message"
-        :ok-label="w.dialog.okLabel"
-        :destructive="w.dialog.destructive"
-        :on-ok="w.dialog.onOk"
         @close="store.closeWindow(w.id)"
       />
       <FindDialog
@@ -410,13 +472,6 @@ function exitOldSchool(): void {
       <AboutDialog
         v-else-if="w.dialog.kind === 'about'"
         :window-id="w.id"
-        @close="store.closeWindow(w.id)"
-      />
-      <NewUserDialog
-        v-else-if="w.dialog.kind === 'new-user'"
-        :window-id="w.id"
-        :parent-dn="w.dialog.parentDn"
-        :parent-label="w.dialog.parentLabel"
         @close="store.closeWindow(w.id)"
       />
     </template>

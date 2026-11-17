@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: BUSL-1.1
-import type { FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { DirectoryUnavailableError } from '../providers/types.js';
 import type { AuditService, AuditEventInput } from './audit.js';
+
+// Errors withAudit has already written a failure row for, so the error
+// handler doesn't write a second one.
+const auditedErrors = new WeakSet<object>();
+export const wasAudited = (err: unknown): boolean =>
+  typeof err === 'object' && err !== null && auditedErrors.has(err);
 
 // Build the request-scoped audit fields once per route handler. Routes spread
 // this into recordEvent calls so source_ip / user_agent / correlation_id /
-// session_id / actor_* are uniformly captured.
+// session_id / actor_* are uniformly captured. provider_id defaults to the
+// session's directory, which decides whose auditors see the row; a route
+// acting on another directory overrides it, and an installation-wide config
+// change sets it to null so every directory's auditors see it.
 export interface RequestAuditContext {
   sourceIp: string;
   userAgent: string | null;
@@ -12,6 +22,7 @@ export interface RequestAuditContext {
   sessionId: string | null;
   actorUserId: string | null;
   actorDisplayName: string | null;
+  providerId: number | null;
 }
 
 export function auditContextFromRequest(req: FastifyRequest): RequestAuditContext {
@@ -23,6 +34,7 @@ export function auditContextFromRequest(req: FastifyRequest): RequestAuditContex
     sessionId: actor?.session.id ?? null,
     actorUserId: actor?.session.actorUserId ?? null,
     actorDisplayName: actor?.session.actorDisplayName ?? null,
+    providerId: req.directoryId,
   };
 }
 
@@ -40,7 +52,7 @@ export function auditContextFromRequest(req: FastifyRequest): RequestAuditContex
  * the wrapper records a failure audit and re-throws.
  */
 export async function withAudit<T extends WriteOpResult>(
-  audit: AuditService,
+  audit: Pick<AuditService, 'recordEvent'>,
   base: Omit<AuditEventInput, 'action' | 'result'> & {
     action: string;
     targetType?: AuditEventInput['targetType'];
@@ -65,24 +77,33 @@ export async function withAudit<T extends WriteOpResult>(
           : 'success';
 
   const errorCode =
-    opError instanceof Error
-      ? (opError as Error).name
-      : opResult && opResult.ok === false
-        ? (opResult.errorCode ?? null)
-        : null;
+    opError instanceof DirectoryUnavailableError
+      ? 'directory_unavailable'
+      : opError instanceof Error
+        ? (opError as Error).name
+        : opResult && opResult.ok === false
+          ? (opResult.errorCode ?? null)
+          : null;
 
   const before = opResult?.before ?? null;
   const after = opResult?.after ?? null;
+  // Keep the directory's own reason for a refusal with the failed row.
+  const errorMessage = opResult?.ok === false ? opResult.errorMessage : null;
 
   await audit.recordEvent({
     ...base,
+    ...(opResult?.targetId ? { targetId: opResult.targetId } : {}),
+    ...(errorMessage ? { metadata: { ...base.metadata, errorMessage } } : {}),
     result,
     errorCode,
     before,
     after,
   });
 
-  if (opError !== undefined) throw opError;
+  if (opError !== undefined) {
+    if (typeof opError === 'object' && opError !== null) auditedErrors.add(opError);
+    throw opError;
+  }
   return opResult as T;
 }
 
@@ -91,4 +112,40 @@ export interface WriteOpResult {
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
   errorCode?: string | null;
+  /** Why the directory refused, recorded with a failed row. */
+  errorMessage?: string | null;
+  /** The target's id when only the operation learns it, as a create does. */
+  targetId?: string | null;
+}
+
+/**
+ * Record that the operator looked at a user, when the directory's settings
+ * ask for it. Deduped per session and user on a short window, so reloads
+ * (the refresh after a write included) don't pile up `user.view` rows next
+ * to the action they followed. Never fails the read it describes.
+ */
+export async function recordUserView(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  providerId: number,
+  user: { id: string; distinguishedName: string },
+): Promise<void> {
+  if (
+    !(await app.services.settings.get<boolean>('audit.account_view_enabled', true)) ||
+    !app.services.audit.shouldRecordView(req.actor?.session.id ?? null, 'user', user.id)
+  ) {
+    return;
+  }
+  await app.services.audit
+    .recordEvent({
+      ...auditContextFromRequest(req),
+      action: 'user.view',
+      result: 'success',
+      actorAuthMethod: 'ad-password',
+      providerId,
+      targetType: 'user',
+      targetId: user.id,
+      targetDn: user.distinguishedName,
+    })
+    .catch((err) => req.log.error({ err }, 'audit insert failed for user.view'));
 }

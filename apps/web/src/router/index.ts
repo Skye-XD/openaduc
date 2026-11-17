@@ -34,6 +34,23 @@ const routes: RouteRecordRaw[] = [
     component: () => import('../views/DeletedUsersView.vue'),
   },
   {
+    path: '/users/import',
+    name: 'user-import',
+    component: () => import('../views/UserImportView.vue'),
+  },
+  {
+    path: '/users/import/jobs/:id',
+    name: 'user-import-job',
+    component: () => import('../views/ImportJobView.vue'),
+    props: true,
+  },
+  {
+    path: '/users/import/jobs/:id/roster',
+    name: 'user-import-roster',
+    component: () => import('../views/ClassRosterView.vue'),
+    props: true,
+  },
+  {
     path: '/users/:id',
     name: 'user-detail',
     component: () => import('../views/UserDetailView.vue'),
@@ -130,7 +147,7 @@ async function ensureSetupChecked(): Promise<void> {
   if (setupChecked) return;
   try {
     const status = await api.setup.status();
-    setupNeeded = !status.onboardingCompletedAt;
+    setupNeeded = !status.onboardingComplete;
   } catch {
     // If the status endpoint fails, assume setup is needed so the user lands
     // somewhere actionable rather than seeing a broken login page.

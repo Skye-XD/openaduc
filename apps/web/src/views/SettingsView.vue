@@ -7,8 +7,9 @@ import PageHeader from '../design/primitives/PageHeader.vue';
 import DirectoryTab from './settings/DirectoryTab.vue';
 import PolicyTab from './settings/PolicyTab.vue';
 import IntegrationsTab from './settings/IntegrationsTab.vue';
+import RolesTab from './settings/RolesTab.vue';
 
-type TabId = 'directory' | 'policy' | 'integrations';
+type TabId = 'directory' | 'roles' | 'policy' | 'integrations';
 
 interface TabSpec {
   id: TabId;
@@ -31,6 +32,7 @@ const allTabs: TabSpec[] = [
     icon: 'pi pi-server',
     capability: 'configure:directory',
   },
+  { id: 'roles', label: 'Roles', icon: 'pi pi-users', capability: 'configure:security' },
   { id: 'policy', label: 'Policy & audit', icon: 'pi pi-shield', capability: 'configure:security' },
   { id: 'integrations', label: 'Entra ID', icon: 'pi pi-share-alt' },
 ];
@@ -81,6 +83,7 @@ function selectTab(id: TabId): void {
 
     <div class="settings-content">
       <DirectoryTab v-if="activeTab === 'directory'" />
+      <RolesTab v-else-if="activeTab === 'roles'" />
       <PolicyTab v-else-if="activeTab === 'policy'" />
       <IntegrationsTab v-else-if="activeTab === 'integrations'" />
     </div>
@@ -92,47 +95,6 @@ function selectTab(id: TabId): void {
   display: flex;
   flex-direction: column;
   gap: 16px;
-}
-
-.ds-tabs {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--border);
-}
-
-.ds-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: transparent;
-  border: 0;
-  padding: 9px 14px;
-  color: var(--text-3);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  position: relative;
-  border-radius: 6px 6px 0 0;
-  font-family: var(--font-sans);
-}
-
-.ds-tab:hover {
-  color: var(--text);
-}
-
-.ds-tab.active {
-  color: var(--text);
-}
-
-.ds-tab.active::after {
-  content: '';
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: -1px;
-  height: 2px;
-  background: var(--accent);
-  border-radius: 2px;
 }
 
 .settings-content {

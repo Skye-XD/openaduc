@@ -11,24 +11,28 @@ import { useToast } from 'primevue/usetoast';
 import {
   api,
   type DirectorySummary,
-  type EntraFeatureKey,
   type EntraIntegrationPut,
   type EntraIntegrationSummary,
 } from '../../api/index.js';
+import { LICENSE_PERMISSIONS, TAP_PERMISSIONS, type EntraFeatureKey } from '@openaduc/shared';
+import LicenseBadgeNote from '../../design/primitives/LicenseBadgeNote.vue';
 import { ApiError } from '../../api/client.js';
 import { useAuthStore } from '../../stores/auth.js';
 import Card from '../../design/primitives/Card.vue';
 import EmptyState from '../../design/primitives/EmptyState.vue';
 import StepUpDialog from '../../design/feedback/StepUpDialog.vue';
+import ConfirmDialog from '../../design/feedback/ConfirmDialog.vue';
+import { useConfirm } from '../../design/composables/useConfirm.js';
 import { fmtRelative } from '../../design/lib/format.js';
 
 // Settings → Entra ID tab. Configures the Microsoft Entra (Graph)
-// integration on a per-directory basis.
+// integration of the directory the operator is signed in to; the API
+// refuses any other directory's.
 //
-// The form for each directory is opened in a modal dialog rather than
-// inline cards: the field set is non-trivial (tenant ID, client ID,
-// secret rotation, four feature toggles, webhook URL, permissions help)
-// and the modal keeps the parent list compact.
+// The form is opened in a modal dialog rather than an inline card: the
+// field set is non-trivial (tenant ID, client ID, secret rotation, four
+// feature toggles, webhook URL, permissions help) and the modal keeps the
+// tab compact.
 
 const auth = useAuthStore();
 const toast = useToast();
@@ -40,20 +44,18 @@ interface DirectoryEntra {
   integration: EntraIntegrationSummary | null;
 }
 
-const rows = ref<DirectoryEntra[]>([]);
+const row = ref<DirectoryEntra | null>(null);
 const loading = ref(true);
 
 async function load(): Promise<void> {
   loading.value = true;
   try {
     const r = await api.directories.list();
-    const dirs = r.directories.filter((d) => d.configured);
-    // Pull each directory's Entra integration in parallel — the API
-    // returns null on directories that have nothing configured yet.
-    const integrations = await Promise.all(
-      dirs.map((d) => api.directories.entra.get(d.id).then((res) => res.integration)),
-    );
-    rows.value = dirs.map((d, i) => ({ directory: d, integration: integrations[i] ?? null }));
+    const own = r.directories.find((d) => d.configured && d.id === auth.actor?.directoryId);
+    // The API returns null when nothing is configured yet.
+    row.value = own
+      ? { directory: own, integration: (await api.directories.entra.get(own.id)).integration }
+      : null;
   } catch (err) {
     toast.add({
       severity: 'error',
@@ -72,6 +74,9 @@ onMounted(load);
 
 const editOpen = ref(false);
 const editStepUpOpen = ref(false);
+// What to run once the operator passes step-up: saving or removing.
+let afterStepUp: () => Promise<void> = submitEdit;
+const { ask: askToRemove, dialog: removeDialog } = useConfirm();
 const editError = ref<string | null>(null);
 const editSubmitting = ref(false);
 const editTarget = ref<DirectoryEntra | null>(null);
@@ -84,6 +89,8 @@ interface FeatureRow {
   description: string;
   /** Permission needed in Entra, surfaced in the help block when toggled on. */
   permissionNote?: string;
+  /** What turning it on puts at stake, stated where it's turned on. */
+  risk?: string;
 }
 
 const FEATURES: FeatureRow[] = [
@@ -127,6 +134,25 @@ const FEATURES: FeatureRow[] = [
     description:
       'Daily scan for accounts whose password expires in 3, 7, or 14 days. Sends an Adaptive Card to the admin Teams channel.',
   },
+  {
+    key: 'temporaryAccessPass',
+    label: 'Temporary Access Pass',
+    description:
+      'Adds Issue Temporary Access Pass to user pages, for operators with the Issue TAP capability, within the tenant’s Temporary Access Pass policy. The pass is shown once and never stored.',
+    permissionNote: `${Object.values(TAP_PERMISSIONS)
+      .map((p) => p.name)
+      .join(', ')} (Application)`,
+    risk: 'Whoever can issue a Temporary Access Pass can sign in as that user. OpenADUC refuses members of privileged AD groups, of groups mapped to its Admin role, and anyone holding or eligible for a Microsoft Entra role.',
+  },
+  {
+    key: 'licenses',
+    label: 'Licenses',
+    description:
+      'Shows a user’s Microsoft licenses, each from a group or assigned directly, with any error assigning it; the licenses a group grants on its page; and a badge on licensed groups wherever a group is picked. Read-only: licenses are still assigned in Entra.',
+    permissionNote: `${Object.values(LICENSE_PERMISSIONS)
+      .map((p) => p.name)
+      .join(', ')} (Application)`,
+  },
 ];
 
 const editForm = reactive({
@@ -142,6 +168,8 @@ const editForm = reactive({
     mfaRegistration: false,
     teamsAdminWebhook: false,
     passwordExpiryNotifications: false,
+    temporaryAccessPass: false,
+    licenses: false,
   } as Record<EntraFeatureKey, boolean>,
   // Empty = no change. Use the explicit "Clear" button to remove an existing one.
   teamsWebhookUrl: '',
@@ -176,6 +204,8 @@ function openEdit(row: DirectoryEntra): void {
     mfaRegistration: ex?.features.mfaRegistration ?? false,
     teamsAdminWebhook: ex?.features.teamsAdminWebhook ?? false,
     passwordExpiryNotifications: ex?.features.passwordExpiryNotifications ?? false,
+    temporaryAccessPass: ex?.features.temporaryAccessPass ?? false,
+    licenses: ex?.features.licenses ?? false,
   };
   editForm.teamsWebhookUrl = '';
   editForm.teamsWebhookUrlClear = false;
@@ -184,6 +214,7 @@ function openEdit(row: DirectoryEntra): void {
 
 function startSave(): void {
   if (!auth.elevated) {
+    afterStepUp = submitEdit;
     editStepUpOpen.value = true;
     return;
   }
@@ -229,6 +260,15 @@ async function submitEdit(): Promise<void> {
   }
 }
 
+function startTest(): void {
+  if (!auth.elevated) {
+    afterStepUp = runTest;
+    editStepUpOpen.value = true;
+    return;
+  }
+  void runTest();
+}
+
 async function runTest(): Promise<void> {
   if (!editTarget.value) return;
   editTestResult.value = null;
@@ -246,6 +286,7 @@ async function runTest(): Promise<void> {
     const r = await api.directories.entra.test(editTarget.value.directory.id);
     editTestResult.value = { ok: r.ok, message: r.message };
   } catch (err) {
+    if (auth.retryAfterStepUp(err, runTest)) return;
     editTestResult.value = {
       ok: false,
       message: err instanceof ApiError ? err.message : 'Test failed',
@@ -257,17 +298,23 @@ async function runTest(): Promise<void> {
 
 async function disableIntegration(): Promise<void> {
   if (!editTarget.value || !editTarget.value.integration) return;
-  if (
-    !window.confirm(
-      'Remove this Entra integration? Cached photos and sign-in data will be deleted.',
-    )
-  ) {
-    return;
-  }
+  const ok = await askToRemove({
+    title: 'Remove Entra integration?',
+    message: 'Cached photos and sign-in data will be deleted.',
+    confirmLabel: 'Remove',
+    severity: 'danger',
+  });
+  if (!ok) return;
   if (!auth.elevated) {
+    afterStepUp = removeIntegration;
     editStepUpOpen.value = true;
     return;
   }
+  await removeIntegration();
+}
+
+async function removeIntegration(): Promise<void> {
+  if (editSubmitting.value || !editTarget.value?.integration) return;
   editSubmitting.value = true;
   try {
     await api.directories.entra.remove(editTarget.value.directory.id);
@@ -308,25 +355,26 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
       <div>
         <h2 class="int-title">Entra ID</h2>
         <p class="int-sub">
-          Connect Microsoft Entra (Graph) per AD directory to enrich users with photos, sign-in
-          activity, and MFA state, and to post admin notifications to Teams.
+          Connect Microsoft Entra (Graph) to the directory you're signed in to, to enrich users with
+          photos, sign-in activity, and MFA state, and to post admin notifications to Teams. To
+          configure another directory, sign in to it.
         </p>
       </div>
     </header>
 
-    <!-- Entra integration: one card per configured AD directory -->
+    <!-- Entra integration of the signed-in directory -->
     <Card
       title="Microsoft Entra ID (Microsoft Graph)"
-      :sub="'Photos, sign-in activity, and Teams notifications. Configure per directory.'"
+      sub="Photos, sign-in activity, and Teams notifications."
     >
       <div v-if="loading" class="int-loading">Loading…</div>
       <EmptyState
-        v-else-if="rows.length === 0"
+        v-else-if="!row"
         title="No directories configured"
         sub="Add an Active Directory in the Configuration tab first — Entra integrations attach to an existing directory."
       />
       <ul v-else class="entra-list">
-        <li v-for="row in rows" :key="row.directory.id" class="entra-row">
+        <li class="entra-row">
           <div class="entra-row-main">
             <div class="entra-row-name">
               <strong>{{ row.directory.displayName ?? row.directory.name }}</strong>
@@ -418,6 +466,26 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
             <li>
               <code>Directory.Read.All</code> &mdash; tenant identity (used by the test connection)
             </li>
+            <li>
+              <code>{{ TAP_PERMISSIONS.issue.name }}</code> &mdash; Temporary Access Pass only.
+              Narrower than <code>{{ TAP_PERMISSIONS.issue.alsoMetBy[0] }}</code
+              >, which also manages every other sign-in method.
+            </li>
+            <li>
+              <code>{{ TAP_PERMISSIONS.policy.name }}</code> &mdash; the tenant’s Temporary Access
+              Pass policy
+            </li>
+            <li>
+              <code>{{ TAP_PERMISSIONS.roles.name }}</code> &mdash; Entra roles a user holds or is
+              eligible for, so Temporary Access Pass refuses them
+            </li>
+            <li>
+              <code>{{ LICENSE_PERMISSIONS.groups.name }}</code> &mdash; the licenses groups grant
+            </li>
+            <li>
+              <code>{{ LICENSE_PERMISSIONS.organization.name }}</code> &mdash; the tenant’s
+              subscriptions, to name a license Microsoft’s product list lacks, and its last sync
+            </li>
           </ul>
           <p class="entra-help">
             <a v-if="editConsentUrl" :href="editConsentUrl" target="_blank" rel="noopener">
@@ -437,6 +505,12 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
                 <span v-if="f.permissionNote" class="entra-feature-perm"
                   >requires {{ f.permissionNote }}</span
                 >
+                <span v-if="f.risk" class="entra-feature-risk">
+                  <i class="pi pi-exclamation-triangle" aria-hidden="true" /> {{ f.risk }}
+                </span>
+                <LicenseBadgeNote
+                  v-if="f.key === 'licenses' && editTarget?.integration?.features.licenses"
+                />
               </label>
             </li>
           </ul>
@@ -488,7 +562,7 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
               severity="secondary"
               :loading="editTestRunning"
               :disabled="!editTarget.integration"
-              @click="runTest"
+              @click="startTest"
             />
             <Message
               v-if="editTestResult"
@@ -499,8 +573,8 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
               {{ editTestResult.message }}
             </Message>
             <span v-else class="entra-help">
-              Acquires a token and reads <code>/organization</code>. Saved creds only — save first
-              if you've changed the secret.
+              Acquires a token, reads <code>/organization</code> and checks the permissions the
+              turned-on features need. Saved creds only — save first if you've changed the secret.
             </span>
           </div>
         </section>
@@ -523,7 +597,8 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
       </template>
     </Dialog>
 
-    <StepUpDialog v-model:visible="editStepUpOpen" @ok="submitEdit" />
+    <StepUpDialog v-model:visible="editStepUpOpen" @ok="afterStepUp()" />
+    <ConfirmDialog v-bind="removeDialog" />
   </div>
 </template>
 
@@ -771,6 +846,12 @@ function lastTestText(integration: EntraIntegrationSummary | null): string {
   font-size: 11px;
   color: var(--text-3);
   font-style: italic;
+}
+
+.entra-feature-risk {
+  font-size: 12px;
+  color: #b56b00;
+  line-height: 1.5;
 }
 
 .entra-test-row {

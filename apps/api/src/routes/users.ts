@@ -1,45 +1,74 @@
 // SPDX-License-Identifier: BUSL-1.1
-import type { FastifyInstance } from 'fastify';
-import { sql } from 'kysely';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { sql, type RawBuilder, type Selectable } from 'kysely';
 import {
-  groupMembershipChangeSchema,
-  passwordNeverExpiresRequestSchema,
+  accountExpiryRequestSchema,
+  bulkAccountPreviewRequestSchema,
+  bulkAccountPreviewSchema,
+  bulkGroupMembershipPreviewRequestSchema,
+  bulkGroupMembershipPreviewSchema,
+  bulkUserAttributesPreviewRequestSchema,
+  bulkUserAttributesPreviewSchema,
+  csvRow,
+  moveRequestSchema,
   resetPasswordRequestSchema,
-  userCreateRequestSchema,
   userDetailSchema,
-  userMoveRequestSchema,
+  userDeletePreflightRequestSchema,
+  userDeleteRequestSchema,
+  userMatchRequestSchema,
+  userMatchResponseSchema,
+  userRenameRequestSchema,
   userSearchQuerySchema,
   userSearchResponseSchema,
   userUpdateRequestSchema,
+  type BulkAccountPreview,
+  type BulkGroupMembershipPreview,
+  type BulkUserAttributesPreview,
+  type RecycleBinStatus,
+  type UserDeletePreflightResponse,
   type UserDetail,
+  type UserMatchResponse,
+  type UserMatchResult,
   type UserSearchResponse,
 } from '@openaduc/shared';
 import { z } from 'zod';
-import { NotFound, Unauthorized } from '../plugins/errorHandler.js';
-import type { DirectoryProvider } from '../providers/types.js';
-import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
-import { visibleRawAttributes } from '../lib/rawAttributes.js';
+import { describeDeleteBlock, userDeleteBlockReason } from '../lib/userDeletion.js';
+import { lockoutDurationFor, lockoutEnd } from '../lib/lockout.js';
+import { lookupsFor, matchEntries } from '../lib/userMatch.js';
+import {
+  AppError,
+  BadRequest,
+  Conflict,
+  NotFound,
+  StepUpRequired,
+  Unauthorized,
+} from '../plugins/errorHandler.js';
+import { StepUpBindFailedError, type DirectoryProvider } from '../providers/types.js';
+import { auditContextFromRequest, recordUserView, withAudit } from '../services/auditContext.js';
+import { entraFeatureOn } from '../services/entraIntegration.js';
+import { previewAccountChange } from '../services/bulkAccountChange.js';
+import { previewAttributes } from '../services/bulkAttributes.js';
+import { refuseBulkRequest } from '../services/bulkJobs/errors.js';
+import { previewGroupMembership } from '../services/groupMembershipPreview.js';
+import { findCachedOu, userMoveRefusal } from '../services/ouCache.js';
+import { findCachedUser, forgetDeletedUsers } from '../services/userCache.js';
+import { UserAttributeRefusal, writeUserAttributes } from '../services/userAttributeWrite.js';
+import {
+  DISABLE_USER,
+  ENABLE_USER,
+  expireAccountAt,
+  moveUserTo,
+  UNLOCK_USER,
+  writeUserAccount,
+} from '../services/userAccountWrite.js';
+import { rawArrayValues, rawAttributesFor, rawScalarValue } from '../lib/rawAttributes.js';
+import { listFreshness } from '../services/listFreshness.js';
+import type { UserCacheRecordsTable } from '../db/types.js';
+import { directoryRefusal } from './directoryRefusal.js';
+import { changeMembership } from './groupMembership.js';
+import { ctx } from './writeContext.js';
 
-const idParamSchema = z.object({ id: z.string().uuid() });
-
-// ---- CSV helpers --------------------------------------------------------
-//
-// Minimal RFC 4180 quoting: wrap in double quotes when the value contains
-// quote, comma, or newline; double up internal quotes. Null/undefined render
-// empty.
-function csvCell(value: unknown): string {
-  if (value === null || value === undefined) return '';
-  let s = value instanceof Date ? value.toISOString() : String(value);
-  // A value from the directory that starts like a formula would run in the spreadsheet
-  // that opens the export; a leading apostrophe makes it text.
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
-
-function csvRow(cells: unknown[]): string {
-  return cells.map(csvCell).join(',');
-}
+const idParamSchema = z.object({ id: z.guid() });
 
 const CSV_COLUMNS = [
   'objectGuid',
@@ -65,7 +94,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
   // overzealous export can't churn the DB; we return the cap-reached
   // signal in a header so the UI can warn the operator.
   app.get('/api/users/export.csv', {
-    preHandler: app.requireCapability('export:user'),
+    config: { policy: { capability: 'export:user', stepUp: false, directory: 'caller' } },
     handler: async (req, reply) => {
       const q = userSearchQuerySchema.parse(req.query);
       const provider = await app.services.providers.buildForRequest(req);
@@ -179,6 +208,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
             computeExpiresAt(
               r.password_never_expires,
               r.password_expires_at,
+              r.password_expiry_computed,
               r.password_last_set_at,
               maxAgeDays,
             ),
@@ -225,7 +255,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- GET /api/users (cache search) -----------------------------------
   app.get('/api/users', {
-    preHandler: app.requireCapability('read:user'),
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<UserSearchResponse> => {
       const q = userSearchQuerySchema.parse(req.query);
       const provider = await app.services.providers.buildForRequest(req);
@@ -235,6 +265,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       // expiring-soon SQL filter and the user response both consume this
       // value so the page count and per-row date stay in sync.
       const maxAgeDays = await resolveMaxPwdAgeDays(provider);
+      const expiry = effectiveExpirySql(maxAgeDays);
 
       let baseQuery = app.db
         .selectFrom('user_cache_records')
@@ -267,6 +298,9 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       // Disabled accounts are excluded from "needs attention" entirely — an
       // operator can find them via the dedicated `enabled=false` filter, but
       // they shouldn't drown the daily-action list.
+      //
+      // The dashboard rechecks a row after fixing it with `needsAttention`
+      // in apps/web/src/design/lib/attention.ts; keep the two in step.
       if (q.issues === true) {
         const horizonDays = q.issuesWithinDays ?? 14;
         const horizon = new Date(Date.now() + horizonDays * 24 * 60 * 60 * 1000);
@@ -278,22 +312,16 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
               eb('account_expires_at', 'is not', null),
               eb('account_expires_at', '<=', horizon),
             ]),
+            // AD holds must-change back while the password never expires.
+            eb.and([
+              eb('password_must_change', '=', true),
+              eb('password_never_expires', '=', false),
+            ]),
             // Password expiring or expired (excluding never-expires accounts).
             eb.and([
               eb('password_never_expires', '=', false),
-              maxAgeDays && maxAgeDays > 0
-                ? eb.and([
-                    eb('password_last_set_at', 'is not', null),
-                    eb(
-                      sql<Date>`password_last_set_at + (${maxAgeDays}::int * interval '1 day')`,
-                      '<=',
-                      horizon,
-                    ),
-                  ])
-                : eb.and([
-                    eb('password_expires_at', 'is not', null),
-                    eb('password_expires_at', '<=', horizon),
-                  ]),
+              eb(expiry, 'is not', null),
+              eb(expiry, '<=', horizon),
             ]),
           ]),
         );
@@ -312,19 +340,10 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         baseQuery = baseQuery
           .where('password_never_expires', '=', false)
           .where('enabled', '=', true);
-        if (maxAgeDays && maxAgeDays > 0) {
-          // computed expiry = password_last_set_at + maxAgeDays
-          const expiryExpr = sql<Date>`password_last_set_at + (${maxAgeDays}::int * interval '1 day')`;
-          baseQuery = baseQuery
-            .where('password_last_set_at', 'is not', null)
-            .where(expiryExpr, '>=', now)
-            .where(expiryExpr, '<=', horizon);
-        } else {
-          baseQuery = baseQuery
-            .where('password_expires_at', 'is not', null)
-            .where('password_expires_at', '>=', now)
-            .where('password_expires_at', '<=', horizon);
-        }
+        baseQuery = baseQuery
+          .where(expiry, 'is not', null)
+          .where(expiry, '>=', now)
+          .where(expiry, '<=', horizon);
       }
 
       // "Stale logon" filter — account hasn't logged in for ≥ N days, or never.
@@ -424,8 +443,9 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       };
       const orderDir = q.sortDir === 'desc' ? 'desc' : 'asc';
 
-      // `status` is a derived sort: order by a priority CASE so locked
-      // accounts come first, disabled second, etc. The literal numbers are
+      // `status` is a derived sort: order by a priority CASE in the order
+      // the SPA ranks what stops sign-in (design/lib/signIn.ts), so the list
+      // and each user's badge agree. The literal numbers are
       // safe (no user input reaches the SQL), and the rest of the search
       // remains parameterized.
       let orderedQuery;
@@ -433,12 +453,14 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         orderedQuery = baseQuery.selectAll().orderBy(
           sql<number>`
               case
-                when locked then 1
-                when not enabled then 2
-                when account_expires_at is not null and account_expires_at < now() then 3
-                when password_never_expires then 6
-                when password_expires_at is not null and password_expires_at < now() then 4
-                when password_expires_at is not null and password_expires_at < now() + interval '14 days' then 5
+                when not enabled then 1
+                when locked then 2
+                when not password_never_expires and not password_must_change
+                  and ${expiry} <= now() then 3
+                when account_expires_at <= now() then 4
+                when password_must_change and not password_never_expires then 5
+                when not password_never_expires
+                  and ${expiry} <= now() + interval '14 days' then 6
                 else 7
               end
             `,
@@ -446,7 +468,9 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         );
       } else {
         const orderColumn = SORT_MAP[q.sort] ?? 'display_name';
-        orderedQuery = baseQuery.selectAll().orderBy(sql.ref(orderColumn), orderDir);
+        orderedQuery = baseQuery
+          .selectAll()
+          .orderBy(orderColumn === 'password_expires_at' ? expiry : sql.ref(orderColumn), orderDir);
       }
 
       const [rows, totalRow] = await Promise.all([
@@ -482,21 +506,16 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       })();
 
       const result: UserSearchResponse = {
+        freshness: await listFreshness(app.db, provider.id, 'users'),
         rows: rows.map((r) => ({
-          id: r.object_guid,
-          samAccountName: r.sam_account_name ?? '',
-          userPrincipalName: r.user_principal_name,
-          displayName: r.display_name,
-          email: r.email,
-          department: r.department,
-          title: r.title,
-          mobile: r.mobile,
-          enabled: r.enabled,
+          ...cachedUserIdentity(r),
           locked: r.locked,
           passwordNeverExpires: r.password_never_expires,
+          passwordMustChange: r.password_must_change,
           passwordExpiresAt: computeExpiresAt(
             r.password_never_expires,
             r.password_expires_at,
+            r.password_expiry_computed,
             r.password_last_set_at,
             maxAgeDays,
           ),
@@ -510,28 +529,116 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         pageSize: q.pageSize,
       };
 
-      // Optional search auditing.
-      if (await app.services.settings.get<boolean>('audit.search_enabled', false)) {
-        await app.services.audit
-          .recordEvent({
-            ...auditContextFromRequest(req),
-            action: 'user.search',
-            result: 'success',
-            actorAuthMethod: 'ad-password',
-            providerId: provider.id,
-            targetType: 'user',
-            metadata: { query: q, returned: result.rows.length, total: result.total },
-          })
-          .catch((err) => req.log.error({ err }, 'audit insert failed for user.search'));
-      }
+      await recordSearchAudit(app, req, provider.id, {
+        query: q,
+        returned: result.rows.length,
+        total: result.total,
+      });
 
       return userSearchResponseSchema.parse(result);
     },
   });
 
+  // ---- POST /api/users/match -------------------------------------------
+  // A read sent as POST: a list of 1,000 entries doesn't fit a query string.
+  app.post('/api/users/match', {
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
+    handler: async (req): Promise<UserMatchResponse> => {
+      const body = userMatchRequestSchema.parse(req.body);
+      const provider = await app.services.providers.buildForRequest(req);
+      const lookups = lookupsFor(body.entries);
+      if (lookups.length > MAX_USER_MATCH_LOOKUPS) {
+        throw BadRequest('Too many entries. Match up to 1,000 at a time.');
+      }
+
+      // Postgres folds case for both the lookups and the cached values, so
+      // the two always agree (JS and Postgres lowercase some letters
+      // differently).
+      const folded = new Map(
+        lookups.length === 0
+          ? []
+          : (
+              await sql<{ lookup: string; key: string }>`
+                select lookup, lower(lookup) as key from unnest(${lookups}::text[]) as lookup
+              `.execute(app.db)
+            ).rows.map((r) => [r.lookup, r.key]),
+      );
+      const keys = [...new Set(folded.values())];
+      const smtpKeys = keys.filter((k) => k.includes('@')).map((k) => `smtp:${k}`);
+      const proxies = sql`raw_attributes_json -> 'proxyAddresses'`;
+      const proxyList = sql`jsonb_array_elements_text(
+        case jsonb_typeof(${proxies})
+          when 'array' then ${proxies}
+          when 'string' then jsonb_build_array(${proxies})
+          else '[]'::jsonb
+        end
+      )`;
+
+      const rows =
+        keys.length === 0
+          ? []
+          : await app.db
+              .selectFrom('user_cache_records')
+              .where('provider_id', '=', provider.id)
+              .where('deleted_at', 'is', null)
+              .where((eb) =>
+                eb.or([
+                  inKeys('sam_account_name', keys),
+                  inKeys('user_principal_name', keys),
+                  inKeys('email', keys),
+                  inKeys('display_name', keys),
+                  ...(smtpKeys.length > 0
+                    ? [
+                        sql<boolean>`exists (
+                          select 1 from ${proxyList} as p(address)
+                          where lower(p.address) = any(${smtpKeys}::text[])
+                        )`,
+                      ]
+                    : []),
+                ]),
+              )
+              .selectAll()
+              .select([
+                sql<string[]>`array_remove(array[
+                  lower(sam_account_name), lower(user_principal_name), lower(email)
+                ], null) || array(
+                  select lower(substr(p.address, 6)) from ${proxyList} as p(address)
+                  where lower(p.address) like 'smtp:%'
+                )`.as('identifier_keys'),
+                sql<string | null>`lower(display_name)`.as('display_name_key'),
+              ])
+              .execute();
+
+      const results = matchEntries(
+        body.entries,
+        rows.map((r) => ({
+          ...cachedUserIdentity(r),
+          distinguishedName: r.distinguished_name,
+          identifierKeys: r.identifier_keys,
+          displayNameKey: r.display_name_key,
+        })),
+        (lookup) => folded.get(lookup)!,
+      );
+
+      const count = (status: UserMatchResult['status']) =>
+        results.filter((r) => r.status === status).length;
+      await recordSearchAudit(app, req, provider.id, {
+        pastedEntries: body.entries.length,
+        matched: count('matched'),
+        ambiguous: count('ambiguous'),
+        unmatched: count('unmatched'),
+        matchedUserIds: [
+          ...new Set(results.flatMap((r) => (r.status === 'matched' ? [r.user.id] : []))),
+        ],
+      });
+
+      return userMatchResponseSchema.parse({ results });
+    },
+  });
+
   // ---- GET /api/users/:id (live refresh from AD) ------------------------
   app.get('/api/users/:id', {
-    preHandler: app.requireCapability('read:user'),
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<{ user: UserDetail }> => {
       const { id } = idParamSchema.parse(req.params);
       const provider = await app.services.providers.buildForRequest(req);
@@ -558,19 +665,22 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
 
       const maxAgeDays = await resolveMaxPwdAgeDays(provider);
 
-      // Lockout policy: only fetch when there's a chance the user is or was
-      // locked. The vast majority of detail loads return early with a null
-      // policy fetch.
+      // Lockout policy: only fetch when the user is locked. The vast
+      // majority of detail loads skip it.
       const lockoutFiletime = refreshed.user.lockedAt;
-      let autoUnlockAt: Date | null = null;
+      let lockout: ReturnType<typeof lockoutEnd> = {
+        autoUnlockAt: null,
+        lockedUntilUnlocked: false,
+      };
       if (refreshed.user.locked && lockoutFiletime) {
         try {
-          const policy = await provider.getDomainPolicy();
-          if (policy.lockoutDurationMs && policy.lockoutDurationMs > 0) {
-            autoUnlockAt = new Date(lockoutFiletime.getTime() + policy.lockoutDurationMs);
-          }
+          const duration = await lockoutDurationFor(refreshed.user.resultantPsoDn, {
+            domain: async () => (await provider.getDomainPolicy()).lockoutDurationMs,
+            pso: (dn) => provider.getPsoLockoutDuration(dn),
+          });
+          lockout = lockoutEnd(lockoutFiletime, duration);
         } catch (err) {
-          req.log.warn({ err }, 'failed to load domain policy for autoUnlockAt');
+          req.log.warn({ err }, 'failed to load lockout policy for autoUnlockAt');
         }
       }
 
@@ -626,11 +736,15 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         enabled: refreshed.user.enabled,
         locked: refreshed.user.locked,
         lockedAt: dateOrNull(refreshed.user.lockedAt),
-        autoUnlockAt: dateOrNull(autoUnlockAt),
+        autoUnlockAt: dateOrNull(lockout.autoUnlockAt),
+        lockedUntilUnlocked: lockout.lockedUntilUnlocked,
+        badPasswordCount: refreshed.user.badPasswordCount,
         passwordNeverExpires: refreshed.user.passwordNeverExpires,
+        passwordMustChange: refreshed.user.passwordMustChange,
         passwordExpiresAt: computeExpiresAt(
           refreshed.user.passwordNeverExpires,
           refreshed.user.passwordExpiresAt,
+          refreshed.user.passwordExpiryComputed ?? false,
           refreshed.user.passwordLastSetAt,
           maxAgeDays,
         ),
@@ -653,6 +767,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         ipPhone: rawScalarValue(raw['ipPhone']),
         homePhone: rawScalarValue(raw['homePhone']),
         homePostalAddress: rawScalarValue(raw['homePostalAddress']),
+        streetAddress: rawScalarValue(raw['streetAddress']),
         description: rawScalarValue(raw['description']),
         company: rawScalarValue(raw['company']),
         c: rawScalarValue(raw['c']),
@@ -660,6 +775,16 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         l: rawScalarValue(raw['l']),
         st: rawScalarValue(raw['st']),
         postalCode: rawScalarValue(raw['postalCode']),
+        cn: rawScalarValue(raw['cn']),
+        physicalDeliveryOfficeName: refreshed.user.office ?? null,
+        postOfficeBox: rawScalarValue(raw['postOfficeBox']),
+        profilePath: rawScalarValue(raw['profilePath']),
+        scriptPath: rawScalarValue(raw['scriptPath']),
+        homeDirectory: rawScalarValue(raw['homeDirectory']),
+        pager: rawScalarValue(raw['pager']),
+        facsimileTelephoneNumber: rawScalarValue(raw['facsimileTelephoneNumber']),
+        info: rawScalarValue(raw['info']),
+        primarySmtpAddress: primarySmtpAddress(raw['proxyAddresses']),
         otherMailbox: rawArrayValues(raw['otherMailbox']),
         otherHomePhone: rawArrayValues(raw['otherHomePhone']),
         otherMobile: rawArrayValues(raw['otherMobile']),
@@ -715,35 +840,20 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
                         status: parseEnrichmentStatus(entraEnrichment.mfa_last_status),
                       }
                     : null,
+                temporaryAccessPass: entraFeatureOn(integration, 'temporaryAccessPass'),
+                licenses: entraFeatureOn(integration, 'licenses'),
               }
             : null,
-        rawAttributes: visibleRawAttributes(
-          refreshed.user.rawAttributes,
+        rawAttributes: rawAttributesFor(
           req.actor?.session.capabilities,
+          refreshed.user.rawAttributes,
         ),
       };
 
-      // Account view audit (configurable). Deduped per session+target on a
-      // short window so reloads — including the post-write refresh — don't
-      // pile up additional `user.view` rows next to the action they
-      // followed. The first view per session per user still records.
-      if (
-        (await app.services.settings.get<boolean>('audit.account_view_enabled', true)) &&
-        app.services.audit.shouldRecordView(req.actor?.session.id ?? null, 'user', detail.id)
-      ) {
-        await app.services.audit
-          .recordEvent({
-            ...auditContextFromRequest(req),
-            action: 'user.view',
-            result: 'success',
-            actorAuthMethod: 'ad-password',
-            providerId: provider.id,
-            targetType: 'user',
-            targetId: detail.id,
-            targetDn: detail.distinguishedName,
-          })
-          .catch((err) => req.log.error({ err }, 'audit insert failed for user.view'));
-      }
+      await recordUserView(app, req, provider.id, {
+        id: detail.id,
+        distinguishedName: detail.distinguishedName,
+      });
 
       return { user: userDetailSchema.parse(detail) };
     },
@@ -751,7 +861,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- PATCH /api/users/:id (write-as-user attribute update) -----------
   app.patch('/api/users/:id', {
-    preHandler: [app.requireCapability('write:user.attributes'), app.requireStepUp],
+    config: { policy: { capability: 'write:user.attributes', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const body = userUpdateRequestSchema.parse(req.body);
@@ -765,32 +875,18 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
       if (!beforeRefresh) throw NotFound('user not found');
 
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.update',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-          metadata: { fields: Object.keys(body.patch) },
-        },
-        async () => {
-          const r = await provider.updateUserAttributes(
-            { kind: 'objectGuid', value: id },
-            body.patch,
-            ctx(actor, req),
-          );
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
-      );
+      const result = await writeUserAttributes(
+        app.services,
+        provider,
+        beforeRefresh.user,
+        body.patch,
+        ctx(actor, req),
+        auditContextFromRequest(req),
+      ).catch((err: unknown) => {
+        if (err instanceof UserAttributeRefusal)
+          throw app.httpErrors.unprocessableEntity(err.message);
+        throw err;
+      });
 
       if (!result.ok) {
         if (result.errorCode === 'permission_denied') {
@@ -799,9 +895,6 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         throw app.httpErrors.badGateway(`update failed: ${result.errorCode ?? 'unknown'}`);
       }
 
-      // Refresh cache so subsequent reads show the new values.
-      await app.services.userLiveRefresh.refresh(provider, id);
-
       return {
         ok: true,
         before: result.before,
@@ -810,169 +903,9 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  // ---- POST /api/users (provision a new, disabled account) -------------
-  // Creates the account DISABLED with no password (a single LDAP add). The
-  // operator sets a password and enables it afterwards via the reset-password
-  // and enable routes. Admin-only (write:user.create) + step-up.
-  app.post('/api/users', {
-    preHandler: [app.requireCapability('write:user.create'), app.requireStepUp],
-    handler: async (req) => {
-      const body = userCreateRequestSchema.parse(req.body);
-      const actor = req.actor!;
-      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
-      const provider = await app.services.providers.buildForRequest(req);
-
-      // The target OU must exist in our cache for this provider. AD would
-      // reject an unknown parent too, but this yields a clean 400.
-      const parent = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', body.parentDn.toLowerCase())
-        .select(['distinguished_name'])
-        .executeTakeFirst();
-      if (!parent) {
-        throw app.httpErrors.badRequest('target OU not found in directory cache');
-      }
-
-      const displayName =
-        body.displayName?.trim() ||
-        [body.givenName?.trim(), body.surname?.trim()].filter(Boolean).join(' ').trim() ||
-        body.samAccountName;
-      // For the audit trail only — the provider computes and escapes the
-      // real RDN. Unescaped here is fine; it's metadata, not a wire DN.
-      const candidateDn = `CN=${displayName},${parent.distinguished_name}`;
-
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.create',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetDn: candidateDn,
-          metadata: {
-            samAccountName: body.samAccountName,
-            parentDn: parent.distinguished_name,
-            ...(body.userPrincipalName ? { userPrincipalName: body.userPrincipalName } : {}),
-          },
-        },
-        async () => {
-          const r = await provider.createUser(
-            {
-              parentDn: parent.distinguished_name,
-              samAccountName: body.samAccountName,
-              userPrincipalName: body.userPrincipalName,
-              givenName: body.givenName,
-              surname: body.surname,
-              displayName: body.displayName,
-              email: body.email,
-            },
-            ctx(actor, req),
-          );
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-            user: r.user ?? null,
-          };
-        },
-      );
-
-      if (!result.ok) {
-        if (result.errorCode === 'permission_denied') {
-          throw app.httpErrors.forbidden('directory rejected the create (insufficient rights)');
-        }
-        if (result.errorCode === 'policy_violation') {
-          throw app.httpErrors.conflict('a user with that name already exists at that location');
-        }
-        throw app.httpErrors.badGateway(`create failed: ${result.errorCode ?? 'unknown'}`);
-      }
-
-      const user = result.user;
-      if (!user) {
-        throw app.httpErrors.badGateway('provider returned no user after create');
-      }
-
-      // Seed the cache so search / the OU browser show the account
-      // immediately rather than waiting for the next sync. Best-effort —
-      // the scheduled sync is the backstop.
-      await app.services.userLiveRefresh.refresh(provider, user.objectGuid).catch(() => undefined);
-
-      return {
-        ok: true,
-        id: user.objectGuid,
-        distinguishedName: user.distinguishedName,
-        samAccountName: user.samAccountName ?? body.samAccountName,
-      };
-    },
-  });
-
-  // ---- DELETE /api/users/:id (permanently delete the account) ----------
-  // Admin-only (write:user.delete) + step-up. Soft-deletes the cache row on
-  // success so the account drops out of the UI immediately.
-  app.delete('/api/users/:id', {
-    preHandler: [app.requireCapability('write:user.delete'), app.requireStepUp],
-    handler: async (req) => {
-      const { id } = idParamSchema.parse(req.params);
-      const actor = req.actor!;
-      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
-      const provider = await app.services.providers.buildForRequest(req);
-
-      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-      if (!beforeRefresh) throw NotFound('user not found');
-
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.delete',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-          metadata: { samAccountName: beforeRefresh.user.samAccountName },
-        },
-        async () => {
-          const r = await provider.deleteUser({ kind: 'objectGuid', value: id }, ctx(actor, req));
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
-      );
-
-      if (!result.ok) {
-        if (result.errorCode === 'permission_denied') {
-          throw app.httpErrors.forbidden(
-            'directory rejected the delete (insufficient rights, or the account is protected from accidental deletion)',
-          );
-        }
-        if (result.errorCode === 'not_found') throw NotFound('user not found');
-        throw app.httpErrors.badGateway(`delete failed: ${result.errorCode ?? 'unknown'}`);
-      }
-
-      // Soft-delete the cache row so the account disappears from search / the
-      // OU browser at once (the full sync's prune is the backstop).
-      await app.db
-        .updateTable('user_cache_records')
-        .set({ deleted_at: new Date().toISOString() })
-        .where('provider_id', '=', provider.id)
-        .where('object_guid', '=', id)
-        .execute();
-
-      return { ok: true };
-    },
-  });
-
   // ---- POST /api/users/:id/unlock --------------------------------------
   app.post('/api/users/:id/unlock', {
-    preHandler: [app.requireCapability('write:user.unlock'), app.requireStepUp],
+    config: { policy: { capability: 'write:user.unlock', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const actor = req.actor!;
@@ -981,44 +914,20 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       }
       const provider = await app.services.providers.buildForRequest(req);
 
-      // Pre-write live refresh — fails closed if the directory is unreachable.
-      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-      if (!beforeRefresh) throw NotFound('user not found');
-
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.unlock',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-        },
-        async () => {
-          const r = await provider.unlockUser({ kind: 'objectGuid', value: id }, ctx(actor, req));
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
+      const written = await writeUserAccount(
+        app.services,
+        provider,
+        UNLOCK_USER,
+        id,
+        ctx(actor, req),
+        auditContextFromRequest(req),
       );
-
+      if (!written) throw NotFound('user not found');
+      const { result } = written;
       if (!result.ok) {
         throw app.httpErrors.badGateway(`unlock failed: ${result.errorCode ?? 'unknown'}`);
       }
-
-      // Refresh cache once more so subsequent reads show the unlocked state.
-      await app.services.userLiveRefresh.refresh(provider, id);
-
-      return {
-        ok: true,
-        before: result.before,
-        after: result.after,
-      };
+      return { ok: true, before: result.before, after: result.after };
     },
   });
 
@@ -1026,21 +935,65 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
   // Both routes share the same write-as-user shape as unlock. Implementation
   // delegated to a small helper to avoid copy/paste.
   app.post('/api/users/:id/disable', {
-    preHandler: [app.requireCapability('write:user.enableDisable'), app.requireStepUp],
+    config: {
+      policy: { capability: 'write:user.enableDisable', stepUp: true, directory: 'caller' },
+    },
     handler: async (req) => toggleEnabled(req, app, true),
   });
 
   app.post('/api/users/:id/enable', {
-    preHandler: [app.requireCapability('write:user.enableDisable'), app.requireStepUp],
+    config: {
+      policy: { capability: 'write:user.enableDisable', stepUp: true, directory: 'caller' },
+    },
     handler: async (req) => toggleEnabled(req, app, false),
+  });
+
+  // ---- POST /api/users/:id/account-expiry ------------------------------
+  // Expiry decides whether the account works, as enabling does: AD keeps
+  // accountExpires and userAccountControl in the same property set
+  // (Account Restrictions), so it takes the same capability.
+  app.post('/api/users/:id/account-expiry', {
+    config: {
+      policy: { capability: 'write:user.enableDisable', stepUp: true, directory: 'caller' },
+    },
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const body = accountExpiryRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const written = await writeUserAccount(
+        app.services,
+        provider,
+        expireAccountAt(body.expiresAt === null ? null : new Date(body.expiresAt)),
+        id,
+        ctx(actor, req),
+        auditContextFromRequest(req),
+      );
+      if (!written) throw NotFound('user not found');
+      const { result } = written;
+      if (!result.ok) {
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden('directory rejected the change');
+        }
+        throw app.httpErrors.badGateway(
+          `setting account expiry failed: ${result.errorCode ?? 'unknown'}`,
+        );
+      }
+      return { ok: true, before: result.before, after: result.after };
+    },
   });
 
   // ---- POST /api/users/:id/reset-password ------------------------------
   app.post('/api/users/:id/reset-password', {
-    preHandler: [app.requireCapability('write:user.resetPassword'), app.requireStepUp],
+    config: {
+      policy: { capability: 'write:user.resetPassword', stepUp: true, directory: 'caller' },
+    },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const body = resetPasswordRequestSchema.parse(req.body);
+      if (body.unlock) await app.requireCapability(req, 'write:user.unlock');
       const actor = req.actor!;
       if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
       const provider = await app.services.providers.buildForRequest(req);
@@ -1058,10 +1011,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
           targetType: 'user',
           targetId: beforeRefresh.user.objectGuid,
           targetDn: beforeRefresh.user.distinguishedName,
-          metadata: {
-            forceChangeAtNextLogin: body.forceChangeAtNextLogin,
-            passwordNeverExpires: body.passwordNeverExpires,
-          },
+          metadata: { forceChangeAtNextLogin: body.forceChangeAtNextLogin, unlock: body.unlock },
         },
         async () => {
           const r = await provider.resetPassword(
@@ -1069,7 +1019,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
             {
               newPassword: body.newPassword,
               forceChangeAtNextLogin: body.forceChangeAtNextLogin,
-              passwordNeverExpires: body.passwordNeverExpires,
+              unlock: body.unlock,
             },
             ctx(actor, req),
           );
@@ -1099,202 +1049,364 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     },
   });
 
-  // ---- POST /api/users/:id/password-never-expires ----------------------
-  // Body: { neverExpires: boolean }. Flips the per-user DONT_EXPIRE_PASSWORD
-  // flag. This is the only per-user handle on password expiry (the expiry
-  // date itself is domain policy), so it lives under write:user.attributes.
-  app.post('/api/users/:id/password-never-expires', {
-    preHandler: [app.requireCapability('write:user.attributes'), app.requireStepUp],
-    handler: async (req) => {
-      const { id } = idParamSchema.parse(req.params);
-      const { neverExpires } = passwordNeverExpiresRequestSchema.parse(req.body);
-      const actor = req.actor!;
-      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
-      const provider = await app.services.providers.buildForRequest(req);
-
-      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-      if (!beforeRefresh) throw NotFound('user not found');
-
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.password.neverExpires',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-          metadata: { neverExpires },
-        },
-        async () => {
-          const r = await provider.setPasswordNeverExpires(
-            { kind: 'objectGuid', value: id },
-            neverExpires,
-            ctx(actor, req),
-          );
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
-      );
-
-      if (!result.ok) {
-        if (result.errorCode === 'permission_denied') {
-          throw app.httpErrors.forbidden('directory rejected the change');
-        }
-        throw app.httpErrors.badGateway(
-          `set password-never-expires failed: ${result.errorCode ?? 'unknown'}`,
-        );
-      }
-      await app.services.userLiveRefresh.refresh(provider, id);
-      return { ok: true, before: result.before, after: result.after };
-    },
-  });
-
-  // ---- POST /api/users/:id/expire-password -----------------------------
-  // No body. Sets pwdLastSet=0 → "must change password at next logon".
-  // Password lifecycle, so gated by write:user.resetPassword.
-  app.post('/api/users/:id/expire-password', {
-    preHandler: [app.requireCapability('write:user.resetPassword'), app.requireStepUp],
-    handler: async (req) => {
-      const { id } = idParamSchema.parse(req.params);
-      const actor = req.actor!;
-      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
-      const provider = await app.services.providers.buildForRequest(req);
-
-      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-      if (!beforeRefresh) throw NotFound('user not found');
-
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.password.expire',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-        },
-        async () => {
-          const r = await provider.expirePasswordNow(
-            { kind: 'objectGuid', value: id },
-            ctx(actor, req),
-          );
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
-      );
-
-      if (!result.ok) {
-        if (result.errorCode === 'permission_denied') {
-          throw app.httpErrors.forbidden('directory rejected the change');
-        }
-        if (result.errorCode === 'policy_violation') {
-          throw app.httpErrors.badRequest(
-            'password is set to never expire; turn that off before expiring it',
-          );
-        }
-        throw app.httpErrors.badGateway(`expire password failed: ${result.errorCode ?? 'unknown'}`);
-      }
-      await app.services.userLiveRefresh.refresh(provider, id);
-      return { ok: true, before: result.before, after: result.after };
-    },
-  });
-
   // ---- POST /api/users/:id/groups (add) + DELETE (remove) --------------
-  // Body: { password, groupId }. The server resolves the group's DN by
-  // its objectGuid via the cache, then asks the provider to do the modify.
+  // Body: { groupId }. The same change as /api/groups/:id/groups, for a
+  // user.
   app.post('/api/users/:id/groups', {
-    preHandler: [app.requireCapability('write:group.membership'), app.requireStepUp],
-    handler: async (req) => modifyMembership(req, app, 'add'),
+    config: { policy: { capability: 'write:group.membership', stepUp: true, directory: 'caller' } },
+    handler: async (req) => changeMembership(app, req, 'user', 'add'),
   });
 
   app.delete('/api/users/:id/groups', {
-    preHandler: [app.requireCapability('write:group.membership'), app.requireStepUp],
-    handler: async (req) => modifyMembership(req, app, 'remove'),
+    config: { policy: { capability: 'write:group.membership', stepUp: true, directory: 'caller' } },
+    handler: async (req) => changeMembership(app, req, 'user', 'remove'),
+  });
+
+  // ---- POST /api/users/bulk-groups/preview ------------------------------
+  // What adding the selected users to groups, or removing them, would
+  // change, from the cache, before the job starts. A read sent as POST:
+  // 10,000 ids don't fit a query string.
+  app.post('/api/users/bulk-groups/preview', {
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
+    handler: async (req): Promise<BulkGroupMembershipPreview> => {
+      const body = bulkGroupMembershipPreviewRequestSchema.parse(req.body);
+      const preview = await previewGroupMembership(
+        app.db,
+        req.directoryId!,
+        body,
+        await app.services.authorization.roleGroups(),
+      );
+      if (!preview) throw NotFound('group not found');
+      return bulkGroupMembershipPreviewSchema.parse(preview);
+    },
+  });
+
+  // ---- POST /api/users/bulk-update/preview ------------------------------
+  // What editing the selected users' attributes would change, and each
+  // field's values across them, from the cache, before the job starts.
+  app.post('/api/users/bulk-update/preview', {
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
+    handler: async (req): Promise<BulkUserAttributesPreview> => {
+      const body = bulkUserAttributesPreviewRequestSchema.parse(req.body);
+      const preview = await previewAttributes(app.db, req.directoryId!, body).catch(
+        refuseBulkRequest,
+      );
+      return bulkUserAttributesPreviewSchema.parse(preview);
+    },
+  });
+
+  // ---- POST /api/users/bulk-account/preview -----------------------------
+  // What moving the selected users, setting when their accounts expire,
+  // making them change their password or clearing "password never
+  // expires" would change, from the cache, before the job starts.
+  app.post('/api/users/bulk-account/preview', {
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
+    handler: async (req): Promise<BulkAccountPreview> => {
+      const body = bulkAccountPreviewRequestSchema.parse(req.body);
+      const preview = await previewAccountChange(app.db, req.directoryId!, body).catch(
+        refuseBulkRequest,
+      );
+      return bulkAccountPreviewSchema.parse(preview);
+    },
   });
 
   // ---- POST /api/users/:id/move (modifyDN to a new parent OU) ----------
   // Body: { targetOuDn }. The server validates that the OU exists for this
   // provider in the cache before issuing the modify; the AD provider then
-  // re-checks via its own bind. Idempotent — if the user is already under
-  // the requested OU, the provider returns ok with a no-op.
+  // re-checks via its own bind. Idempotent — a user already under the
+  // requested OU isn't written, and the no-op is audited as `unchanged`.
   app.post('/api/users/:id/move', {
-    preHandler: [app.requireCapability('write:user.move'), app.requireStepUp],
+    config: { policy: { capability: 'write:user.move', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
-      const body = userMoveRequestSchema.parse(req.body);
+      const body = moveRequestSchema.parse(req.body);
       const actor = req.actor!;
       if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
       const provider = await app.services.providers.buildForRequest(req);
 
-      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-      if (!beforeRefresh) throw NotFound('user not found');
-
-      // Confirm the target OU is one we know about for this provider. This
-      // gates against typos and against pointing the move at a container the
-      // sync hasn't seen — the AD bind would refuse those anyway, but
-      // failing fast here gives a cleaner 400.
-      const targetOu = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', body.targetOuDn.toLowerCase())
-        .select(['distinguished_name', 'name'])
-        .executeTakeFirst();
+      // The AD bind would refuse an OU the sync hasn't seen too, but failing
+      // here first gives a cleaner 400; a missing user is still a 404.
+      const targetOu = await findCachedOu(app.db, provider.id, body.targetOuDn);
       if (!targetOu) {
+        if (!(await app.services.userLiveRefresh.refresh(provider, id))) {
+          throw NotFound('user not found');
+        }
         throw app.httpErrors.badRequest('target OU not found in directory cache');
       }
+      const refused = userMoveRefusal(targetOu);
+      if (refused) {
+        throw new AppError({ statusCode: 422, code: 'unprocessable_entity', message: refused });
+      }
 
-      const result = await withAudit(
-        app.services.audit,
-        {
-          ...auditContextFromRequest(req),
-          action: 'user.move',
-          actorAuthMethod: 'ad-password',
-          providerId: provider.id,
-          targetType: 'user',
-          targetId: beforeRefresh.user.objectGuid,
-          targetDn: beforeRefresh.user.distinguishedName,
-          metadata: { targetOuDn: targetOu.distinguished_name, targetOuName: targetOu.name },
-        },
-        async () => {
-          const r = await provider.moveUser(
-            { kind: 'objectGuid', value: id },
-            targetOu.distinguished_name,
-            ctx(actor, req),
-          );
-          return {
-            ok: r.ok,
-            before: r.before ?? null,
-            after: r.after ?? null,
-            errorCode: r.reason ?? null,
-          };
-        },
+      const move = moveUserTo(targetOu);
+      const written = await writeUserAccount(
+        app.services,
+        provider,
+        move,
+        id,
+        ctx(actor, req),
+        auditContextFromRequest(req),
       );
-
+      if (!written) throw NotFound('user not found');
+      const { result, user } = written;
       if (!result.ok) {
         if (result.errorCode === 'permission_denied') {
           throw app.httpErrors.forbidden('directory rejected the move');
+        }
+        if (result.errorCode === 'conflict') {
+          throw Conflict(move.refused('conflict', user) ?? 'the name is taken in that OU');
         }
         if (result.errorCode === 'not_found') {
           throw app.httpErrors.notFound('user not found in directory');
         }
         throw app.httpErrors.badGateway(`move failed: ${result.errorCode ?? 'unknown'}`);
       }
+      return { ok: true, before: result.before, after: result.after };
+    },
+  });
 
-      // Refresh cache so the new distinguished_name lands in user_cache_records.
+  // ---- POST /api/users/:id/rename --------------------------------------
+  // Name parts, RDN, logon names and primary email in one operation. Body
+  // carries only the fields that change; see userRenameRequestSchema.
+  app.post('/api/users/:id/rename', {
+    config: { policy: { capability: 'write:user.rename', stepUp: true, directory: 'caller' } },
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const body = userRenameRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
+      if (!beforeRefresh) throw NotFound('user not found');
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.rename',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetId: beforeRefresh.user.objectGuid,
+          targetDn: beforeRefresh.user.distinguishedName,
+          metadata: {
+            fields: Object.keys(body).filter((k) => k !== 'keepOldEmailAsAlias'),
+            keepOldEmailAsAlias: body.keepOldEmailAsAlias,
+          },
+        },
+        async () => {
+          const r = await provider.renameUser(
+            { kind: 'objectGuid', value: id },
+            body,
+            ctx(actor, req),
+          );
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+            errorMessage: r.errorMessage ?? null,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        const detail = result.errorMessage ? `: ${result.errorMessage}` : '';
+        if (result.errorCode === 'conflict') {
+          throw app.httpErrors.conflict(result.errorMessage ?? 'name already in use');
+        }
+        if (result.errorCode === 'permission_denied') {
+          throw app.httpErrors.forbidden(`directory rejected the rename${detail}`);
+        }
+        if (result.errorCode === 'not_found') throw NotFound('user not found');
+        throw app.httpErrors.badGateway(`rename failed${detail}`);
+      }
+
       await app.services.userLiveRefresh.refresh(provider, id);
       return { ok: true, before: result.before, after: result.after };
+    },
+  });
+
+  // ---- POST /api/users/delete-preflight --------------------------------
+  // What the delete dialog shows before the operator confirms: which of the
+  // selected accounts can be deleted, why the rest can't, and whether the
+  // Recycle Bin will let them be restored. Reads the cache; the delete
+  // itself re-checks the live entry.
+  app.post('/api/users/delete-preflight', {
+    config: { policy: { capability: 'write:user.delete', stepUp: true, directory: 'caller' } },
+    handler: async (req): Promise<UserDeletePreflightResponse> => {
+      const body = userDeletePreflightRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const rows = await app.db
+        .selectFrom('user_cache_records')
+        .where('provider_id', '=', provider.id)
+        .where('deleted_at', 'is', null)
+        .where('object_guid', 'in', body.ids)
+        .select([
+          'object_guid',
+          'sam_account_name',
+          'display_name',
+          'distinguished_name',
+          'enabled',
+          'sid',
+          'raw_attributes_json',
+        ])
+        .execute();
+      const byId = new Map(rows.map((r) => [r.object_guid, r]));
+
+      // The cache keeps accounts deleted or moved out of the base DN outside
+      // OpenADUC (no sync removes them yet), so confirm each one is still
+      // there rather than offer a delete that can only fail. If AD can't be
+      // asked, the delete's own live read still catches them.
+      try {
+        const ids = [...byId.keys()];
+        const live = ids.length > 0 ? await provider.findObjects({ dns: [], guids: ids }) : [];
+        const present = new Set(live.map((o) => o.objectGuid.toLowerCase()));
+        const gone = ids.filter((id) => !present.has(id.toLowerCase()));
+        await forgetDeletedUsers(app.db, provider.id, gone);
+        for (const id of gone) byId.delete(id);
+      } catch (err) {
+        req.log.warn({ err }, 'live check unavailable for delete preflight');
+      }
+
+      // Recycle Bin state needs the operator's bind (Optional Features is
+      // usually unreadable to a minimal service account). Not knowing it
+      // shouldn't block a delete, so anything but a dead step-up session
+      // degrades to null.
+      let recycleBin: RecycleBinStatus | null = null;
+      try {
+        recycleBin = await provider.getRecycleBinStatus(ctx(actor, req));
+      } catch (err) {
+        if (err instanceof StepUpBindFailedError) {
+          throw StepUpRequired('password_rejected');
+        }
+        req.log.warn({ err }, 'recycle bin status unavailable for delete preflight');
+      }
+
+      // What a tree delete would take with it. Read on the operator's bind,
+      // like the delete itself; unreadable counts come back null.
+      let childCounts = new Map<string, number | null>();
+      try {
+        childCounts = await provider.countChildObjects(
+          [...byId.values()].map((r) => r.distinguished_name),
+          ctx(actor, req),
+        );
+      } catch (err) {
+        if (err instanceof StepUpBindFailedError) {
+          throw StepUpRequired('password_rejected');
+        }
+        req.log.warn({ err }, 'child object count unavailable for delete preflight');
+      }
+
+      return {
+        recycleBin,
+        users: body.ids.map((id) => {
+          const row = byId.get(id);
+          if (!row) {
+            return {
+              id,
+              samAccountName: null,
+              displayName: null,
+              distinguishedName: null,
+              enabled: null,
+              privileged: false,
+              childObjects: null,
+              blockedReason: 'not_found' as const,
+            };
+          }
+          const raw = row.raw_attributes_json ?? {};
+          return {
+            id,
+            samAccountName: row.sam_account_name,
+            displayName: row.display_name,
+            distinguishedName: row.distinguished_name,
+            enabled: row.enabled,
+            privileged: rawScalarValue(raw['adminCount']) === '1',
+            childObjects: childCounts.get(row.distinguished_name) ?? null,
+            blockedReason: userDeleteBlockReason({
+              enabled: row.enabled,
+              sid: row.sid,
+              rawAttributes: raw,
+            }),
+          };
+        }),
+      };
+    },
+  });
+
+  // ---- DELETE /api/users/:id -------------------------------------------
+  // Disabled accounts only. Body: { confirmSamAccountName }.
+  app.delete('/api/users/:id', {
+    config: { policy: { capability: 'write:user.delete', stepUp: true, directory: 'caller' } },
+    handler: async (req) => {
+      const { id } = idParamSchema.parse(req.params);
+      const body = userDeleteRequestSchema.parse(req.body);
+      const actor = req.actor!;
+      if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
+      const provider = await app.services.providers.buildForRequest(req);
+
+      const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
+      if (!beforeRefresh) throw NotFound('user not found');
+      const live = beforeRefresh.user;
+      if (
+        !live.samAccountName ||
+        live.samAccountName.toLowerCase() !== body.confirmSamAccountName.trim().toLowerCase()
+      ) {
+        throw app.httpErrors.badRequest('confirmation does not match the account’s logon name');
+      }
+      // Refuse before writing an audit row: nothing was attempted. The
+      // provider repeats this check on its own read right before the delete.
+      const blocked = userDeleteBlockReason(live);
+      if (blocked) throw app.httpErrors.conflict(`cannot delete: ${describeDeleteBlock(blocked)}`);
+
+      const result = await withAudit(
+        app.services.audit,
+        {
+          ...auditContextFromRequest(req),
+          action: 'user.delete',
+          actorAuthMethod: 'ad-password',
+          providerId: provider.id,
+          targetType: 'user',
+          targetId: live.objectGuid,
+          targetDn: live.distinguishedName,
+          metadata: {
+            samAccountName: live.samAccountName,
+            allowTreeDelete: body.allowTreeDelete === true,
+          },
+        },
+        async () => {
+          const r = await provider.deleteUser({ kind: 'objectGuid', value: id }, ctx(actor, req), {
+            allowTreeDelete: body.allowTreeDelete === true,
+          });
+          return {
+            ok: r.ok,
+            before: r.before ?? null,
+            after: r.after ?? null,
+            errorCode: r.reason ?? null,
+            errorMessage: r.errorMessage ?? null,
+            treeDelete: r.treeDelete ?? false,
+          };
+        },
+      );
+
+      if (!result.ok) {
+        throw directoryRefusal(app, result, {
+          verb: 'delete',
+          notFound: 'user not found',
+          forbidden:
+            'directory refused the delete — you may lack the Delete right, or the account is protected from accidental deletion',
+        });
+      }
+
+      // Drop the account from list views now rather than at the next full
+      // sync. A restore upserts the row, which clears deleted_at again.
+      await forgetDeletedUsers(app.db, provider.id, [live.objectGuid]);
+
+      return { ok: true, treeDelete: result.treeDelete };
     },
   });
 }
@@ -1311,33 +1423,16 @@ async function toggleEnabled(
   if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
   const provider = await app.services.providers.buildForRequest(req);
 
-  const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-  if (!beforeRefresh) throw NotFound('user not found');
-
-  const result = await withAudit(
-    app.services.audit,
-    {
-      ...auditContextFromRequest(req),
-      action: disable ? 'user.disable' : 'user.enable',
-      actorAuthMethod: 'ad-password',
-      providerId: provider.id,
-      targetType: 'user',
-      targetId: beforeRefresh.user.objectGuid,
-      targetDn: beforeRefresh.user.distinguishedName,
-    },
-    async () => {
-      const r = await (disable
-        ? provider.disableUser({ kind: 'objectGuid', value: id }, ctx(actor, req))
-        : provider.enableUser({ kind: 'objectGuid', value: id }, ctx(actor, req)));
-      return {
-        ok: r.ok,
-        before: r.before ?? null,
-        after: r.after ?? null,
-        errorCode: r.reason ?? null,
-      };
-    },
+  const written = await writeUserAccount(
+    app.services,
+    provider,
+    disable ? DISABLE_USER : ENABLE_USER,
+    id,
+    ctx(actor, req),
+    auditContextFromRequest(req),
   );
-
+  if (!written) throw NotFound('user not found');
+  const { result } = written;
   if (!result.ok) {
     if (result.errorCode === 'permission_denied') {
       throw app.httpErrors.forbidden('directory rejected the change');
@@ -1346,109 +1441,51 @@ async function toggleEnabled(
       `${disable ? 'disable' : 'enable'} failed: ${result.errorCode ?? 'unknown'}`,
     );
   }
-  await app.services.userLiveRefresh.refresh(provider, id);
   return { ok: true, before: result.before, after: result.after };
 }
 
-async function modifyMembership(
-  req: import('fastify').FastifyRequest,
-  app: import('fastify').FastifyInstance,
-  op: 'add' | 'remove',
-): Promise<{ ok: true; before: unknown; after: unknown }> {
-  const { id } = idParamSchema.parse(req.params);
-  const body = groupMembershipChangeSchema.parse(req.body);
-  const actor = req.actor!;
-  if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
-  const provider = await app.services.providers.buildForRequest(req);
+// Splitting comma lists server-side can turn 1,000 entries into more
+// lookups; this bounds the query's key array.
+const MAX_USER_MATCH_LOOKUPS = 5_000;
 
-  const beforeRefresh = await app.services.userLiveRefresh.refresh(provider, id);
-  if (!beforeRefresh) throw NotFound('user not found');
-
-  // Validate the group id belongs to this provider before bothering AD.
-  const groupRow = await app.db
-    .selectFrom('group_cache_records')
-    .select(['object_guid', 'distinguished_name', 'name'])
-    .where('provider_id', '=', provider.id)
-    .where('object_guid', '=', body.groupId)
-    .executeTakeFirst();
-  if (!groupRow) throw NotFound('group not found');
-
-  const result = await withAudit(
-    app.services.audit,
-    {
-      ...auditContextFromRequest(req),
-      action: op === 'add' ? 'user.group.add' : 'user.group.remove',
-      actorAuthMethod: 'ad-password',
-      providerId: provider.id,
-      targetType: 'user',
-      targetId: beforeRefresh.user.objectGuid,
-      targetDn: beforeRefresh.user.distinguishedName,
-      metadata: {
-        groupId: body.groupId,
-        groupDn: groupRow.distinguished_name,
-        groupName: groupRow.name,
-      },
-    },
-    async () => {
-      const r = await (op === 'add'
-        ? provider.addUserToGroup(
-            { kind: 'objectGuid', value: id },
-            { kind: 'objectGuid', value: body.groupId },
-            ctx(actor, req),
-          )
-        : provider.removeUserFromGroup(
-            { kind: 'objectGuid', value: id },
-            { kind: 'objectGuid', value: body.groupId },
-            ctx(actor, req),
-          ));
-      return {
-        ok: r.ok,
-        before: r.before ?? null,
-        after: r.after ?? null,
-        errorCode: r.reason ?? null,
-      };
-    },
-  );
-
-  if (!result.ok) {
-    if (result.errorCode === 'permission_denied') {
-      throw app.httpErrors.forbidden('directory rejected the change');
-    }
-    if (result.errorCode === 'not_found') {
-      throw app.httpErrors.notFound('user or group not found in directory');
-    }
-    throw app.httpErrors.badGateway(`group ${op} failed: ${result.errorCode ?? 'unknown'}`);
-  }
-
-  // Refresh the user's cache so memberOf reflects the change on next read,
-  // and reconcile direct-membership rows so the GET response shows the
-  // change without waiting for the next full sync.
-  const after = await app.services.userLiveRefresh.refresh(provider, id);
-  if (after) {
-    await app.services.userLiveRefresh.reconcileDirectMemberships(
-      provider.id,
-      id,
-      after.user.memberOfDns,
-    );
-  }
-  return { ok: true, before: result.before, after: result.after };
+/** `lower(column)` is one of `keys` (already lowercased by Postgres). */
+function inKeys(column: string, keys: string[]): RawBuilder<boolean> {
+  return sql<boolean>`lower(${sql.ref(column)}) = any(${keys}::text[])`;
 }
 
-/**
- * Build the write-context object the AD provider expects. The bind password
- * comes from the in-process credential cache (populated by step-up). The
- * non-null assertions are safe because requireStepUp gates these handlers.
- */
-function ctx(
-  actor: NonNullable<import('fastify').FastifyRequest['actor']>,
-  req: import('fastify').FastifyRequest,
-): { actorUserId: string; actorUsername: string; actorPassword: string; correlationId: string } {
+/** The fields every user listing shares, from a cache row. */
+function cachedUserIdentity(r: Selectable<UserCacheRecordsTable>) {
   return {
-    actorUserId: actor.session.actorUserId,
-    actorUsername: actor.session.actorUsername!,
-    actorPassword: actor.elevatedPassword!,
-    correlationId: req.correlationId,
+    id: r.object_guid,
+    samAccountName: r.sam_account_name ?? '',
+    userPrincipalName: r.user_principal_name,
+    displayName: r.display_name,
+    email: r.email,
+    department: r.department,
+    title: r.title,
+    enabled: r.enabled,
   };
+}
+
+/** Records a user search when the `audit.search_enabled` setting is on. */
+async function recordSearchAudit(
+  app: FastifyInstance,
+  req: FastifyRequest,
+  providerId: number,
+  metadata: Record<string, unknown>,
+): Promise<void> {
+  if (!(await app.services.settings.get<boolean>('audit.search_enabled', false))) return;
+  await app.services.audit
+    .recordEvent({
+      ...auditContextFromRequest(req),
+      action: 'user.search',
+      result: 'success',
+      actorAuthMethod: 'ad-password',
+      providerId,
+      targetType: 'user',
+      metadata,
+    })
+    .catch((err) => req.log.error({ err }, 'audit insert failed for user.search'));
 }
 
 function dateOrNull(v: Date | string | null): string | null {
@@ -1484,32 +1521,6 @@ function parseMfaMethods(v: unknown): string[] {
  * `maxAgeDays` is supplied by the caller via `resolveMaxPwdAgeDays(provider)`
  * so the domain-policy lookup happens once per request rather than per row.
  */
-/** Read a single string value from a raw LDAP attribute (last value wins). */
-function rawScalarValue(v: unknown): string | null {
-  if (v === null || v === undefined) return null;
-  if (Array.isArray(v)) {
-    if (v.length === 0) return null;
-    return rawScalarValue(v[v.length - 1]);
-  }
-  if (typeof v === 'string') return v.length > 0 ? v : null;
-  return String(v);
-}
-
-/** Read every string value from a raw LDAP attribute as an array. */
-function rawArrayValues(v: unknown): string[] {
-  if (v === null || v === undefined) return [];
-  const arr = Array.isArray(v) ? v : [v];
-  const out: string[] = [];
-  for (const x of arr) {
-    if (typeof x === 'string') {
-      if (x.length > 0) out.push(x);
-    } else if (x !== null && x !== undefined) {
-      out.push(String(x));
-    }
-  }
-  return out;
-}
-
 /**
  * Compute email aliases from the proxyAddresses attribute.
  *
@@ -1522,6 +1533,12 @@ function rawArrayValues(v: unknown): string[] {
  * `*.onmicrosoft.com` (and the routing variant `*.mail.onmicrosoft.com`)
  * — those are tenant-internal addresses the operator can't act on.
  */
+/** The primary (`SMTP:`) proxy address, prefix stripped, or null. */
+function primarySmtpAddress(v: unknown): string | null {
+  const primary = rawArrayValues(v).find((entry) => entry.startsWith('SMTP:'));
+  return primary ? primary.slice(5) : null;
+}
+
 function deriveEmailAliases(v: unknown): string[] {
   return rawArrayValues(v)
     .filter((entry) => !entry.startsWith('SMTP:'))
@@ -1539,7 +1556,7 @@ async function resolveDirectReports(
   app: import('fastify').FastifyInstance,
   providerId: number,
   dns: string[],
-): Promise<{ id: string | null; distinguishedName: string; displayName: string | null }[]> {
+): Promise<UserDetail['directReports']> {
   if (dns.length === 0) return [];
   const dnsLower = dns.map((d) => d.toLowerCase());
   const rows = await app.db
@@ -1547,13 +1564,14 @@ async function resolveDirectReports(
     .where('provider_id', '=', providerId)
     .where('deleted_at', 'is', null)
     .where(sql<string>`lower(distinguished_name)`, 'in', dnsLower)
-    .select(['object_guid', 'distinguished_name', 'display_name', 'sam_account_name'])
+    .select(['object_guid', 'distinguished_name', 'display_name', 'sam_account_name', 'enabled'])
     .execute();
-  const byDn = new Map<string, { id: string; displayName: string | null }>();
+  const byDn = new Map<string, { id: string; displayName: string | null; enabled: boolean }>();
   for (const r of rows) {
     byDn.set(r.distinguished_name.toLowerCase(), {
       id: r.object_guid,
       displayName: r.display_name ?? r.sam_account_name ?? null,
+      enabled: r.enabled,
     });
   }
   return dns.map((dn) => {
@@ -1562,6 +1580,7 @@ async function resolveDirectReports(
       id: hit?.id ?? null,
       distinguishedName: dn,
       displayName: hit?.displayName ?? null,
+      enabled: hit?.enabled ?? null,
     };
   });
 }
@@ -1578,13 +1597,7 @@ async function resolveManager(
   dn: string | null,
 ): Promise<{ id: string | null; distinguishedName: string; displayName: string | null } | null> {
   if (!dn) return null;
-  const row = await app.db
-    .selectFrom('user_cache_records')
-    .where('provider_id', '=', providerId)
-    .where('deleted_at', 'is', null)
-    .where(sql<string>`lower(distinguished_name)`, '=', dn.toLowerCase())
-    .select(['object_guid', 'display_name', 'sam_account_name'])
-    .executeTakeFirst();
+  const row = await findCachedUser(app.db, providerId, { dn });
   return {
     id: row?.object_guid ?? null,
     distinguishedName: dn,
@@ -1595,10 +1608,15 @@ async function resolveManager(
 function computeExpiresAt(
   passwordNeverExpires: boolean,
   cachedExpiresAt: Date | string | null,
+  expiryComputed: boolean,
   passwordLastSetAt: Date | string | null,
   maxAgeDays: number | null,
 ): string | null {
   if (passwordNeverExpires) return null;
+  // AD's own computation (stored by sync) respects fine-grained policies,
+  // including ones that never expire (null).
+  if (expiryComputed || cachedExpiresAt) return dateOrNull(cachedExpiresAt);
+  // Rows synced before it was stored: derive from the domain policy.
   if (maxAgeDays && maxAgeDays > 0 && passwordLastSetAt) {
     const last =
       passwordLastSetAt instanceof Date ? passwordLastSetAt : new Date(passwordLastSetAt);
@@ -1618,11 +1636,21 @@ function computeExpiresAt(
  * three call sites in this file (search, export, detail) hit the cache for
  * the typical concurrent request burst rather than re-querying the DC.
  *
- * Known gap: this is the *domain default*. Fine-grained password policies
- * (PSOs) targeting specific users/groups override `maxPwdAge` at the user
- * level — those users will show the domain expiry, not their PSO expiry,
- * until PSO resolution lands.
+ * Only a fallback now: sync stores AD's computed expiry, which already
+ * accounts for fine-grained password policies (PSOs).
  */
+/**
+ * SQL for a user's password expiry, the same rule as computeExpiresAt: the
+ * value AD computed (stored by sync; null when a fine-grained policy never
+ * expires), or for rows synced before that was stored, pwdLastSet + the
+ * domain's maximum age.
+ */
+function effectiveExpirySql(maxAgeDays: number | null) {
+  return maxAgeDays && maxAgeDays > 0
+    ? sql<Date | null>`case when password_expiry_computed then password_expires_at else coalesce(password_expires_at, password_last_set_at + (${maxAgeDays}::int * interval '1 day')) end`
+    : sql<Date | null>`password_expires_at`;
+}
+
 async function resolveMaxPwdAgeDays(provider: DirectoryProvider): Promise<number | null> {
   try {
     const policy = await provider.getDomainPolicy();

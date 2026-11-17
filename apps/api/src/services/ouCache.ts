@@ -3,6 +3,8 @@ import { sql, type Kysely } from 'kysely';
 import type { DB } from '../db/types.js';
 import type { DirectoryOu } from '../providers/types.js';
 import { stringifyForJsonb } from '../lib/jsonbSafe.js';
+import { rawFlag } from '../lib/rawAttributes.js';
+import { memberOfArray, rawValuesArray } from './userCache.js';
 
 /**
  * Upsert an OU into the cache. The unique key is
@@ -49,57 +51,27 @@ export async function markOusStale(
     SET stale_at = ${now}
     WHERE provider_id = ${providerId}
       AND stale_at IS NULL
-      AND lower(distinguished_name) NOT IN (${sql.join(Array.from(seenDnsLower))})
+      AND lower(distinguished_name) <> ALL(${Array.from(seenDnsLower)}::text[])
   `.execute(db);
 }
 
 /**
- * Soft-delete OUs absent from a completed full crawl. A finished crawl is
- * authoritative, so any cached OU we didn't see no longer exists under the
- * base DN (deleted in AD, or moved out of scope) — drop it from the tree.
- * `upsertOu` clears `deleted_at` again if the OU reappears, so this self-heals.
- *
- * Guard: never prune when the crawl returned zero OUs — that's almost always
- * a failed/empty crawl, and we must not wipe the whole tree. In that case fall
- * back to the non-destructive stale-flagging. Returns the number pruned.
- */
-export async function pruneOus(
-  db: Kysely<DB>,
-  providerId: number,
-  seenDnsLower: Set<string>,
-): Promise<number> {
-  const now = new Date().toISOString();
-  if (seenDnsLower.size === 0) {
-    await markOusStale(db, providerId, seenDnsLower);
-    return 0;
-  }
-  const res = await sql<{ count: string }>`
-    WITH pruned AS (
-      UPDATE directory_ous
-      SET deleted_at = ${now}, stale_at = ${now}
-      WHERE provider_id = ${providerId}
-        AND deleted_at IS NULL
-        AND lower(distinguished_name) NOT IN (${sql.join(Array.from(seenDnsLower))})
-      RETURNING 1
-    )
-    SELECT COUNT(*)::text AS count FROM pruned
-  `.execute(db);
-  const row = res.rows[0];
-  return row ? Number(row.count) : 0;
-}
-
-/**
- * Wipe and rebuild the user_group_memberships join table from
- * `memberOf` arrays in user cache rows. Volumes here are small enough
- * (low tens of thousands) that this is simpler than incremental
- * patching and always correct.
+ * Wipe and rebuild the membership join tables: user_group_memberships from
+ * `memberOf` arrays in user cache rows, group_group_memberships from
+ * `member` arrays in group cache rows. Volumes here are small enough (low
+ * tens of thousands) that this is simpler than incremental patching and
+ * always correct.
  */
 export async function rebuildMemberships(
   db: Kysely<DB>,
   providerId: number,
 ): Promise<{ count: number }> {
-  await db.deleteFrom('user_group_memberships').where('provider_id', '=', providerId).execute();
-  const result = await sql<{ count: string }>`
+  // One transaction: readers see the old memberships or the new ones,
+  // never an empty table between the delete and the insert.
+  return db.transaction().execute(async (trx) => {
+    await trx.deleteFrom('user_group_memberships').where('provider_id', '=', providerId).execute();
+    await trx.deleteFrom('group_group_memberships').where('provider_id', '=', providerId).execute();
+    const users = await sql<{ count: string }>`
     WITH inserted AS (
       INSERT INTO user_group_memberships (provider_id, user_object_guid, group_object_guid, direct, synced_at)
       SELECT
@@ -109,15 +81,7 @@ export async function rebuildMemberships(
         true,
         now()
       FROM user_cache_records u
-      CROSS JOIN LATERAL jsonb_array_elements_text(
-        CASE
-          WHEN jsonb_typeof(u.raw_attributes_json -> 'memberOf') = 'array'
-            THEN u.raw_attributes_json -> 'memberOf'
-          WHEN u.raw_attributes_json ? 'memberOf'
-            THEN jsonb_build_array(u.raw_attributes_json -> 'memberOf')
-          ELSE '[]'::jsonb
-        END
-      ) AS member_dn
+      CROSS JOIN LATERAL jsonb_array_elements_text(${memberOfArray('u.raw_attributes_json')}) AS member_dn
       JOIN group_cache_records g
         ON g.provider_id = u.provider_id
         AND lower(g.distinguished_name) = lower(member_dn)
@@ -128,7 +92,69 @@ export async function rebuildMemberships(
       RETURNING 1
     )
     SELECT COUNT(*)::text AS count FROM inserted
-  `.execute(db);
-  const row = result.rows[0];
-  return { count: row ? Number(row.count) : 0 };
+  `.execute(trx);
+    const groups = await sql<{ count: string }>`
+    WITH inserted AS (
+      INSERT INTO group_group_memberships (provider_id, group_object_guid, member_group_object_guid, synced_at)
+      SELECT g.provider_id, g.object_guid, m.object_guid, now()
+      FROM group_cache_records g
+      CROSS JOIN LATERAL jsonb_array_elements_text(${rawValuesArray('g.raw_attributes_json', 'member')}) AS member_dn
+      JOIN group_cache_records m
+        ON m.provider_id = g.provider_id
+        AND lower(m.distinguished_name) = lower(member_dn)
+      WHERE g.provider_id = ${providerId}
+        AND g.deleted_at IS NULL
+        AND m.deleted_at IS NULL
+      ON CONFLICT DO NOTHING
+      RETURNING 1
+    )
+    SELECT COUNT(*)::text AS count FROM inserted
+  `.execute(trx);
+    return { count: Number(users.rows[0]?.count ?? 0) + Number(groups.rows[0]?.count ?? 0) };
+  });
+}
+
+export interface CachedOu {
+  distinguished_name: string;
+  name: string;
+  raw_attributes_json: Record<string, unknown>;
+}
+
+/**
+ * A live OU from the cache, matched case-insensitively, with its DN as AD
+ * spells it; null when OpenADUC doesn't know it, or the last full sync
+ * didn't see it. Routes use this to refuse an OU the sync hasn't seen
+ * before asking AD.
+ */
+export async function findCachedOu(
+  db: Kysely<DB>,
+  providerId: number,
+  dn: string,
+): Promise<CachedOu | null> {
+  const row = await db
+    .selectFrom('directory_ous')
+    .select(['distinguished_name', 'name', 'raw_attributes_json'])
+    .where('provider_id', '=', providerId)
+    .where('deleted_at', 'is', null)
+    .where('stale_at', 'is', null)
+    .where(sql<string>`lower(distinguished_name)`, '=', dn.toLowerCase())
+    .executeTakeFirst();
+  return row ?? null;
+}
+
+/** The Domain Controllers OU, at the root of a domain. */
+const DOMAIN_CONTROLLERS = /^OU=Domain Controllers(,DC=[^,]+)+$/i;
+
+/**
+ * Why users can't be moved into this OU, or null. Domain Controllers is
+ * AD's own (isCriticalSystemObject; the DN for rows synced before that
+ * was read), and the domain's policy for DCs applies there. AD's other
+ * system containers (CN=System, CN=Builtin, ...) aren't OUs, so aren't in
+ * the cache to begin with.
+ */
+export function userMoveRefusal(ou: CachedOu): string | null {
+  return rawFlag(ou.raw_attributes_json['isCriticalSystemObject']) ||
+    DOMAIN_CONTROLLERS.test(ou.distinguished_name)
+    ? `${ou.name} is a system OU AD keeps for its own objects; users can’t be moved there.`
+    : null;
 }

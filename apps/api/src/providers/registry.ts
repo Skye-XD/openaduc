@@ -45,7 +45,11 @@ export class ProviderFactory {
    */
   async buildForRequest(req: FastifyRequest): Promise<ActiveDirectoryProvider> {
     if (!req.actor) throw Unauthorized('authentication required');
-    const directoryId = req.actor.session.directoryId;
+    return this.buildForDirectory(req.actor.session.directoryId);
+  }
+
+  /** As buildForRequest, for work that outlives its request (bulk jobs). */
+  async buildForDirectory(directoryId: number): Promise<ActiveDirectoryProvider> {
     const creds = await this.directoryConfig.getSyncBindCreds(directoryId);
     if (!creds) {
       throw Unauthorized(
@@ -71,6 +75,7 @@ export class ProviderFactory {
       name: meta.name,
       baseDn: meta.baseDn,
       ldapUrls: meta.ldapUrls,
+      tlsMode: meta.tlsMode,
       tlsRejectUnauthorized: meta.tlsRejectUnauthorized ?? this.env.AD_TLS_REJECT_UNAUTHORIZED,
       tlsCaPath: this.env.AD_TLS_CA_PATH,
       operationTimeoutMs: this.env.AD_OPERATION_TIMEOUT_MS,

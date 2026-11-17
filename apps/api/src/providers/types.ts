@@ -1,4 +1,16 @@
 // SPDX-License-Identifier: BUSL-1.1
+import type {
+  GroupScope,
+  ImportPerson,
+  GroupType,
+  NamingLookups,
+  NewUserOrganisationField,
+  TakenNames,
+  UserCreateStep,
+} from '@openaduc/shared';
+import type { GroupDeleteFacts } from '../lib/groupDeletion.js';
+import type { RoleGroup } from '../lib/groupPrivilege.js';
+
 // Provider abstraction over LDAP/AD/Entra. The MVP only ships an Active
 // Directory implementation, but routes/services depend on this interface so
 // future providers (generic LDAP, Entra ID/Graph) can drop in without rewrites.
@@ -12,6 +24,21 @@ export type DirectoryObjectIdentifier =
   | { kind: 'distinguishedName'; value: string }
   | { kind: 'samAccountName'; value: string }
   | { kind: 'userPrincipalName'; value: string };
+
+export interface PeopleLookups {
+  employeeIds: readonly string[];
+  identifiers: readonly string[];
+}
+
+/** Any object, as found by its GUID or DN. */
+export interface DirectoryObjectRef {
+  objectGuid: string;
+  distinguishedName: string;
+  /** displayName, else name. */
+  name: string;
+  isOu: boolean;
+  isCriticalSystemObject: boolean;
+}
 
 export interface DirectoryUser {
   objectGuid: string;
@@ -27,6 +54,11 @@ export interface DirectoryUser {
   mobile: string | null;
   title: string | null;
   department: string | null;
+  /**
+   * physicalDeliveryOfficeName, typed because it's kept out of
+   * rawAttributes (SKIP_RAW_ATTRS). The cache keeps it in its own column.
+   */
+  office?: string | null;
   managerDn: string | null;
   enabled: boolean;
   locked: boolean;
@@ -37,17 +69,34 @@ export interface DirectoryUser {
    * attribute yet — useful for "last locked at" display either way.
    */
   lockedAt: Date | null;
+  /**
+   * DN of the fine-grained password policy (PSO) that applies, from AD's
+   * constructed msDS-ResultantPSO; null when none does or it wasn't asked
+   * for or readable.
+   */
+  resultantPsoDn: string | null;
   // Reflects the DONT_EXPIRE_PASSWORD bit (0x10000) of userAccountControl.
   // True for service accounts and other accounts AD will never force a
   // password rotation on.
   passwordNeverExpires: boolean;
   passwordLastSetAt: Date | null;
+  /** From AD's msDS-UserPasswordExpiryTimeComputed: respects fine-grained password policies. */
   passwordExpiresAt: Date | null;
+  /**
+   * AD sent msDS-UserPasswordExpiryTimeComputed, so passwordExpiresAt is
+   * its answer (null = never expires) rather than unknown. Only full reads
+   * request it.
+   */
+  passwordExpiryComputed?: boolean;
+  /** pwdLastSet = 0: must change password at next logon. */
+  passwordMustChange: boolean;
   accountExpiresAt: Date | null;
   lastLogonAt: Date | null;
   // FILETIME of the most recent failed authentication attempt (AD's
   // `badPasswordTime`). Per-DC, replicated late — treat as approximate.
   lastBadPasswordAt: Date | null;
+  /** AD's `badPwdCount`, as the answering DC counts it (not replicated). */
+  badPasswordCount: number | null;
   createdAtSource: Date | null;
   modifiedAtSource: Date | null;
   // Direct group memberships only. Nested are derived elsewhere.
@@ -55,6 +104,11 @@ export interface DirectoryUser {
   // Raw LDAP attributes for the audit trail / debugging. Sensitive values are
   // not included by the implementation (e.g. unicodePwd).
   rawAttributes: Record<string, unknown>;
+}
+
+export interface UserTokenGroups {
+  sids: string[];
+  groups: DirectoryGroup[];
 }
 
 export interface DirectoryOu {
@@ -82,6 +136,8 @@ export interface DirectoryGroup {
   groupScope: string | null;
   // Direct member DNs.
   memberDns: string[];
+  // The groups it is directly a member of.
+  memberOfDns: string[];
   rawAttributes: Record<string, unknown>;
 }
 
@@ -281,7 +337,7 @@ export interface MutationResult {
   ok: boolean;
   before?: Record<string, unknown>;
   after?: Record<string, unknown>;
-  reason?: 'not_found' | 'permission_denied' | 'policy_violation' | 'directory_error';
+  reason?: 'not_found' | 'permission_denied' | 'policy_violation' | 'conflict' | 'directory_error';
   errorMessage?: string;
 }
 
@@ -300,6 +356,7 @@ export interface UserAttributePatch {
   ipPhone?: string | null | undefined;
   homePhone?: string | null | undefined;
   homePostalAddress?: string | null | undefined;
+  streetAddress?: string | null | undefined;
   description?: string | null | undefined;
   company?: string | null | undefined;
   c?: string | null | undefined;
@@ -307,48 +364,20 @@ export interface UserAttributePatch {
   l?: string | null | undefined;
   st?: string | null | undefined;
   postalCode?: string | null | undefined;
+  countryCode?: string | null | undefined;
+  physicalDeliveryOfficeName?: string | null | undefined;
   managerDn?: string | null | undefined;
-  // Date or ISO string sets the expiry; null clears it (never expires). The
-  // AD provider converts to an `accountExpires` FILETIME.
-  accountExpiresAt?: Date | string | null | undefined;
   // Multi-valued attributes — null or empty array clears, non-empty replaces.
   otherMailbox?: string[] | null | undefined;
   otherHomePhone?: string[] | null | undefined;
   otherMobile?: string[] | null | undefined;
+  postOfficeBox?: string[] | null | undefined;
 }
 
 export interface ResetPasswordInput {
   newPassword: string;
   forceChangeAtNextLogin: boolean;
-  // When set, also flip the DONT_EXPIRE_PASSWORD flag in the same operation.
-  // undefined leaves the flag untouched; true/false sets/clears it. true wins
-  // over forceChangeAtNextLogin (the two are mutually exclusive in AD).
-  passwordNeverExpires?: boolean | undefined;
-}
-
-// Input for provisioning a new account. The account is created disabled with
-// no password (a single LDAP `add`); password + enable happen afterwards via
-// resetPassword/enableUser. The CN (RDN) is derived by the implementation
-// from displayName → "givenName surname" → samAccountName.
-export interface UserCreateInput {
-  parentDn: string;
-  samAccountName: string;
-  userPrincipalName?: string | undefined;
-  givenName?: string | undefined;
-  surname?: string | undefined;
-  displayName?: string | undefined;
-  email?: string | undefined;
-}
-
-// Input for creating a group. `scope` + `category` map to the AD `groupType`
-// bitmask; the CN (RDN) is the group name.
-export interface GroupCreateInput {
-  parentDn: string;
-  name: string;
-  samAccountName: string;
-  description?: string | undefined;
-  scope: 'global' | 'domainLocal' | 'universal';
-  category: 'security' | 'distribution';
+  unlock: boolean;
 }
 
 export interface SyncInput {
@@ -377,6 +406,8 @@ export interface DirectoryDomainPolicy {
   minPwdLength: number | null;
   /** Number of past passwords AD remembers. */
   pwdHistoryLength: number | null;
+  /** `pwdProperties` DOMAIN_PASSWORD_COMPLEX: passwords must meet AD's complexity rules. */
+  complexityRequired: boolean | null;
 }
 
 export interface DirectoryProvider {
@@ -393,12 +424,24 @@ export interface DirectoryProvider {
    * changes); callers should not need to throttle.
    */
   getDomainPolicy(): Promise<DirectoryDomainPolicy>;
+  /** A PSO's lockout duration in ms (0 = until unlocked), or null if it can't be read. */
+  getPsoLockoutDuration(psoDn: string): Promise<number | null>;
 
+  /** Any object in the directory by GUID or DN, read as the service account. */
+  findObject(identifier: DirectoryObjectIdentifier): Promise<DirectoryObjectRef | null>;
   getUser(identifier: DirectoryObjectIdentifier): Promise<DirectoryUser | null>;
   searchUsers(query: DirectoryUserSearchQuery): Promise<DirectoryUser[]>;
   getGroup(identifier: DirectoryObjectIdentifier): Promise<DirectoryGroup | null>;
   searchGroups(query: DirectoryGroupSearchQuery): Promise<DirectoryGroup[]>;
   getUserGroups(userId: DirectoryObjectIdentifier): Promise<DirectoryGroup[]>;
+  /**
+   * Every security group the user is in, nested and primary included (AD's
+   * tokenGroups): their SIDs, and the groups found for them from the
+   * domain's root, read without their members. A SID from another domain
+   * has no group here. Null when the user isn't found or AD returns no
+   * tokenGroups (it always has the primary group).
+   */
+  getUserTokenGroups(userId: DirectoryObjectIdentifier): Promise<UserTokenGroups | null>;
   getGroupMembers(groupId: DirectoryObjectIdentifier): Promise<DirectoryUser[]>;
   getComputer(identifier: DirectoryObjectIdentifier): Promise<DirectoryComputer | null>;
   searchComputers(query: DirectoryComputerSearchQuery): Promise<DirectoryComputer[]>;
@@ -406,6 +449,13 @@ export interface DirectoryProvider {
   getComputerGroups(computerId: DirectoryObjectIdentifier): Promise<DirectoryGroup[]>;
 
   syncUsers(input: SyncInput): AsyncIterable<DirectoryUser>;
+  /**
+   * Current direct members of a group, read from the users' side (memberOf),
+   * which doesn't hit the group's 1500-value range limit on `member`.
+   */
+  syncGroupMembers(groupDn: string): AsyncIterable<DirectoryUser>;
+  /** Every user locked out right now (honours the lockout duration), paged. */
+  syncLockedUsers(): AsyncIterable<DirectoryUser>;
   syncGroups(input: SyncInput): AsyncIterable<DirectoryGroup>;
   syncComputers(input: SyncInput): AsyncIterable<DirectoryComputer>;
   syncOus(input: SyncInput): AsyncIterable<DirectoryOu>;
@@ -430,15 +480,29 @@ export interface DirectoryProvider {
     ctx: WriteContext,
   ): Promise<MutationResult>;
   enableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
+  /** Set `accountExpires` to when the account stops working, or null for never. */
+  setAccountExpiry(
+    userId: DirectoryObjectIdentifier,
+    expiresAt: Date | null,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
   disableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
-  // Flip the per-user "password never expires" flag (DONT_EXPIRE_PASSWORD).
+  /**
+   * Make the user change their password at next sign-in (`pwdLastSet` 0),
+   * or stop asking them to (-1, which AD turns into now: the password's
+   * age restarts, as AD keeps no earlier value to go back to).
+   */
+  setPasswordMustChange(
+    userId: DirectoryObjectIdentifier,
+    mustChange: boolean,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  /** Set or clear "password never expires" (DONT_EXPIRE_PASSWORD in `userAccountControl`). */
   setPasswordNeverExpires(
     userId: DirectoryObjectIdentifier,
     neverExpires: boolean,
     ctx: WriteContext,
   ): Promise<MutationResult>;
-  // Expire the password immediately (pwdLastSet=0 → must change at next logon).
-  expirePasswordNow(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
   updateUserAttributes(
     userId: DirectoryObjectIdentifier,
     patch: UserAttributePatch,
@@ -454,6 +518,17 @@ export interface DirectoryProvider {
     groupId: DirectoryObjectIdentifier,
     ctx: WriteContext,
   ): Promise<MutationResult>;
+  // Nest a group in another (or take it out) through the parent's `member`.
+  addGroupToGroup(
+    memberGroupId: DirectoryObjectIdentifier,
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  removeGroupFromGroup(
+    memberGroupId: DirectoryObjectIdentifier,
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
   // Move a user to a new parent OU (LDAP modifyDN keeping the existing RDN).
   // Idempotent: if already under `targetOuDn`, returns ok with a no-op.
   moveUser(
@@ -461,24 +536,113 @@ export interface DirectoryProvider {
     targetOuDn: string,
     ctx: WriteContext,
   ): Promise<MutationResult>;
-  // Create a new (disabled, password-less) user under `input.parentDn`.
-  // Same write-as-operator model as the other writes. Returns the resulting
-  // DirectoryUser so the route can seed its cache row without waiting for
-  // the next sync.
-  createUser(
-    input: UserCreateInput,
+  enableComputer(computerId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
+  disableComputer(
+    computerId: DirectoryObjectIdentifier,
     ctx: WriteContext,
-  ): Promise<MutationResult & { user?: DirectoryUser }>;
-  // Permanently delete a user (LDAP delete of the account entry). AD refuses
-  // if the object is protected from accidental deletion (a deny ACE) —
-  // surfaced as permission_denied so the route can explain it.
-  deleteUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult>;
-  // Create a group under `input.parentDn`. Returns the created DirectoryGroup
-  // (read back) so the route can seed the cache without waiting for a sync.
+  ): Promise<MutationResult>;
+  moveComputer(
+    computerId: DirectoryObjectIdentifier,
+    targetOuDn: string,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  // ADUC's Reset Account: set the computer's password to its default (see
+  // defaultComputerPassword) so the machine can rejoin under the same name.
+  // Disable, move and reset refuse a domain controller or critical computer
+  // (computerWriteBlock) with `policy_violation`, checked on this bind.
+  resetComputerAccount(
+    computerId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  // Rename a person: name parts, the RDN (cn, via modifyDN in place),
+  // sAMAccountName, userPrincipalName and primary email. Checks the new
+  // logon names, address and RDN are free before writing; returns
+  // `conflict` naming the clash otherwise.
+  renameUser(
+    userId: DirectoryObjectIdentifier,
+    input: UserRenameInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult>;
+  // Delete a disabled user. Re-checks against the live entry that the
+  // account is disabled and isn't one of AD's own accounts, and returns
+  // `policy_violation` if not. A user with child objects (Exchange
+  // ActiveSync devices, for one) needs a tree delete, which removes them
+  // too; that only happens with `allowTreeDelete`, otherwise it's refused.
+  deleteUser(
+    userId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+    options?: { allowTreeDelete?: boolean },
+  ): Promise<MutationResult & { treeDelete?: boolean }>;
+  /** How many objects sit anywhere under each DN (null where unreadable). */
+  countChildObjects(dns: string[], ctx: WriteContext): Promise<Map<string, number | null>>;
+  // Who already holds a new object's names: `cn` among the direct children
+  // of `parentDn`, `samAccountName` anywhere in the domain. Reads with the
+  // service account.
+  findNameHolders(input: NewObjectNames): Promise<NameHolders>;
+  // The names already held that a new account named from `lookups` could
+  // collide with: sAMAccountName, UPN, mail and SMTP proxy addresses
+  // anywhere in the domain, and CNs in each OU. Reads with the service account.
+  findTakenNames(lookups: NamingLookups): Promise<TakenNames>;
+  // The users holding any of these employee IDs, or any of these values
+  // as mail, an SMTP proxy address, UPN or sAMAccountName, anywhere in the
+  // domain. Reads with the service account.
+  findPeople(lookups: PeopleLookups): Promise<ImportPerson[]>;
+  // The objects that exist of these, by DN or objectGUID, in one search.
+  // Reads with the service account.
+  findObjects(refs: {
+    dns: readonly string[];
+    guids: readonly string[];
+  }): Promise<DirectoryObjectRef[]>;
+  // The forest's extra UPN suffixes (uPNSuffixes on the Partitions
+  // container), not including the domain's own DNS name.
+  getUpnSuffixes(): Promise<string[]>;
+  // Whether the schema defines an attribute with this lDAPDisplayName (an
+  // Exchange-extended schema's msExchUsageLocation, say). Reads with the
+  // service account.
+  hasSchemaAttribute(ldapDisplayName: string): Promise<boolean>;
+  // Create a group at `input.dn`. Checks both names are free on the
+  // operator's bind first and returns `conflict` naming the holder
+  // otherwise. Returns the new group so the cache can show it at once,
+  // unless it couldn't be read back after the add.
   createGroup(
     input: GroupCreateInput,
     ctx: WriteContext,
   ): Promise<MutationResult & { group?: DirectoryGroup }>;
+  // Create a user at `input.dn` and run `steps` in order (AD's: add it
+  // disabled, set its password and must-change, add it to `finish.groups`,
+  // enable it). Checks its names are free on the operator's bind first and
+  // returns `conflict` naming the holder otherwise. A step failing after
+  // the add stops there, leaving the account disabled; a group that can't
+  // be added doesn't stop the others, and one that no longer exists is
+  // left out.
+  createUser(
+    input: UserCreateInput,
+    steps: readonly UserCreateStep[],
+    finish: UserCreateFinish,
+    ctx: WriteContext,
+  ): Promise<UserCreateResult>;
+  // What shows whether an account is as a create left it. Reads with the
+  // service account.
+  getAccountFingerprint(identifier: DirectoryObjectIdentifier): Promise<AccountFingerprint | null>;
+  // Run `steps`, the ones a create left undone, on the account it made.
+  finishUserCreate(
+    userId: DirectoryObjectIdentifier,
+    steps: readonly UserCreateStep[],
+    finish: UserCreateFinish,
+    ctx: WriteContext,
+  ): Promise<UserCreateResult>;
+  // What decides whether a group may be deleted besides its own entry:
+  // its parent groups and how many accounts have it as primary group.
+  // Reads with the service account.
+  getGroupDeleteFacts(group: DirectoryGroup): Promise<GroupDeleteFacts>;
+  // Delete a group. Re-checks against the live entry, on the operator's
+  // bind, that nothing blocks it (see groupDeleteBlock) and returns
+  // `policy_violation` with the reason if something does.
+  deleteGroup(
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+    roleGroups: readonly RoleGroup[],
+  ): Promise<MutationResult>;
   // Create a new OU as a direct child of `parentDn`. Returns the resulting
   // DirectoryOu so the route can update its cache row in place rather than
   // waiting for the next sync.
@@ -537,6 +701,108 @@ export interface DirectoryProvider {
     objectGuid: string,
     ctx: WriteContext,
   ): Promise<DirectoryDeletedComputer | null>;
+}
+
+export interface UserRenameInput {
+  // undefined skips a field; null clears it (givenName, surname, email).
+  givenName?: string | null | undefined;
+  surname?: string | null | undefined;
+  displayName?: string | undefined;
+  cn?: string | undefined;
+  samAccountName?: string | undefined;
+  userPrincipalName?: string | undefined;
+  email?: string | null | undefined;
+  keepOldEmailAsAlias: boolean;
+}
+
+export interface NewObjectNames {
+  parentDn: string;
+  cn?: string | undefined;
+  samAccountName?: string | undefined;
+}
+
+// Who holds a name: null when nobody does. `dn` is null for a holder
+// outside the configured base DN, which isn't disclosed.
+export interface NameHolders {
+  cn: { dn: string | null } | null;
+  samAccountName: { dn: string | null } | null;
+}
+
+export interface GroupCreateInput {
+  /** The new group's DN, built with childDn. */
+  dn: string;
+  cn: string;
+  samAccountName: string;
+  description: string | null;
+  scope: GroupScope;
+  type: GroupType;
+}
+
+export interface UserCreateInput {
+  /** The new account's DN, built with childDn. */
+  dn: string;
+  cn: string;
+  samAccountName: string;
+  userPrincipalName: string;
+  givenName: string;
+  surname: string;
+  displayName: string;
+  mail: string | null;
+  otherMailbox: string | null;
+  mobile: string | null;
+  telephoneNumber: string | null;
+  /** Organisation attributes with a value; the rest are left unset. */
+  organisation: Partial<Record<NewUserOrganisationField, string>>;
+  /** The manager's DN. */
+  manager: string | null;
+  /** What an import also writes; the create form doesn't. */
+  initials?: string | null;
+  employeeId?: string | null;
+  description?: string | null;
+  /** Written to msExchUsageLocation, which only a schema that has it can take. */
+  usageLocation?: string | null;
+}
+
+/** What the steps after the add need. */
+export interface UserCreateFinish {
+  password: string;
+  mustChange: boolean;
+  /** DNs of the groups the groups step adds the account to. */
+  groups: readonly string[];
+}
+
+/** How the groups step went, group by group. */
+export interface GroupsStepResult {
+  added: string[];
+  failed: { dn: string; reason: NonNullable<MutationResult['reason']>; errorMessage: string }[];
+  /** Groups that no longer exist, so were left out. */
+  missing: string[];
+}
+
+export interface UserCreateResult extends MutationResult {
+  /** The steps done, in order. */
+  completed: UserCreateStep[];
+  /** The step that failed after the account was made. */
+  failedStep?: UserCreateStep;
+  /** Set once the groups step has run. */
+  groups?: GroupsStepResult;
+  /** The account as read back, unless that failed. */
+  user?: DirectoryUser;
+  /** The account as the steps left it, unless that couldn't be read. */
+  fingerprint?: AccountFingerprint;
+}
+
+/**
+ * Raw values that change whenever anyone changes the account, so a later
+ * finish can tell the account is still as a create left it. uSNChanged
+ * is per domain controller.
+ */
+export interface AccountFingerprint {
+  objectGuid: string;
+  whenCreated: string | null;
+  usnChanged: string | null;
+  pwdLastSet: string | null;
+  lastLogonTimestamp: string | null;
 }
 
 export interface OuAttributePatch {
@@ -605,5 +871,16 @@ export class StepUpBindFailedError extends Error {
   constructor(message = 'step-up bind failed') {
     super(message);
     this.name = 'StepUpBindFailedError';
+  }
+}
+
+/**
+ * Every configured domain controller was unreachable. The message names
+ * what failed (hosts, ports, errno) for the log; responses never carry it.
+ */
+export class DirectoryUnavailableError extends Error {
+  constructor(detail: string, cause?: unknown) {
+    super(`no domain controller reachable: ${detail}`, { cause });
+    this.name = 'DirectoryUnavailableError';
   }
 }

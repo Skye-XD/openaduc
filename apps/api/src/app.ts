@@ -5,6 +5,7 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import sensible from '@fastify/sensible';
+import { ELEVATED_IDLE_END_HEADER } from '@openaduc/shared';
 import { loadEnv } from './config/env.js';
 import { buildLoggerOptions } from './lib/logger.js';
 import correlationId from './plugins/correlationId.js';
@@ -16,41 +17,43 @@ import csrfPlugin from './plugins/csrf.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerAuthRoutes } from './routes/auth.js';
 import { registerUserRoutes } from './routes/users.js';
+import { registerBulkJobRoutes } from './routes/bulkJobs.js';
+import { registerUserCreationRoutes } from './routes/userCreation.js';
+import { registerUserImportRoutes } from './routes/userImport.js';
 import { registerDeletedUserRoutes } from './routes/deletedUsers.js';
 import { registerAuditRoutes } from './routes/audit.js';
 import { registerSetupRoutes } from './routes/setup.js';
 import { registerDirectoryRoutes } from './routes/directories.js';
+import { registerNamingRoutes } from './routes/naming.js';
+import { registerNewUserSettingsRoutes } from './routes/newUserSettings.js';
 import { registerEntraIntegrationRoutes } from './routes/entraIntegrations.js';
-import { registerSettingsRoutes } from './routes/settings.js';
+import { registerTemporaryAccessPassRoutes } from './routes/temporaryAccessPass.js';
+import { registerClassRosterRoutes } from './routes/classRoster.js';
+import { registerLicenseRoutes } from './routes/licenses.js';
+import { registerRoleMappingRoutes, registerSettingsRoutes } from './routes/settings.js';
 import { registerGroupRoutes } from './routes/groups.js';
 import { registerComputerRoutes } from './routes/computers.js';
 import { registerDeletedComputerRoutes } from './routes/deletedComputers.js';
 import { registerOuRoutes } from './routes/ous.js';
 import { registerPolicyRoutes } from './routes/policies.js';
-import { Crypter } from './lib/encryption.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const env = loadEnv();
-  // A wrong ENCRYPTION_KEY should stop the start, not the first sign-in that needs a secret.
-  new Crypter(env.ENCRYPTION_KEY);
   const app = Fastify({
     logger: buildLoggerOptions(env),
-    disableRequestLogging: false,
-    trustProxy: env.TRUST_PROXY_HOPS,
+    // Trust only the configured proxy hops: anything further left in
+    // X-Forwarded-For was written by the client and would let it pick its
+    // own IP for rate limits, login backoff and the audit log.
+    // `hop` counts from the socket peer (0) outwards.
+    trustProxy: (_address: string, hop: number) => hop < env.TRUST_PROXY_HOPS,
     bodyLimit: 1024 * 1024,
   });
 
   await app.register(sensible);
-  // CSP starts out report-only so deployment-specific violations surface in
-  // logs without breaking the SPA. Flip to enforce by setting
-  // `reportOnly: false` here once the report stream is clean for one release.
-  // Note: the SPA itself is served from nginx in production — the canonical
-  // CSP for the app belongs there. This API CSP is a defense-in-depth layer
-  // for any HTML the API itself returns (currently: error pages from the
-  // helmet/sensible defaults).
+  // The API returns JSON, so its CSP allows nothing. The SPA's own policy
+  // is set by nginx (docker/nginx.conf), which serves it.
   await app.register(helmet, {
     contentSecurityPolicy: {
-      reportOnly: true,
       directives: {
         defaultSrc: ["'none'"],
         baseUri: ["'none'"],
@@ -67,6 +70,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cors, {
     origin: env.API_CORS_ORIGIN,
     credentials: true,
+    exposedHeaders: [ELEVATED_IDLE_END_HEADER],
   });
   await app.register(cookie, { secret: env.SESSION_COOKIE_SECRET });
   await app.register(rateLimit, {
@@ -88,11 +92,20 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerSetupRoutes(app);
   await registerAuthRoutes(app);
   await registerUserRoutes(app);
+  await registerBulkJobRoutes(app);
+  await registerUserCreationRoutes(app);
+  await registerUserImportRoutes(app);
   await registerDeletedUserRoutes(app);
   await registerAuditRoutes(app);
   await registerDirectoryRoutes(app);
+  await registerNamingRoutes(app);
+  await registerNewUserSettingsRoutes(app);
   await registerEntraIntegrationRoutes(app);
+  await registerTemporaryAccessPassRoutes(app);
+  await registerClassRosterRoutes(app);
+  await registerLicenseRoutes(app);
   await registerSettingsRoutes(app);
+  await registerRoleMappingRoutes(app);
   await registerGroupRoutes(app);
   await registerComputerRoutes(app);
   await registerDeletedComputerRoutes(app);

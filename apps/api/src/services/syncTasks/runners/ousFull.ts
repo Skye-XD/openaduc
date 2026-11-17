@@ -1,11 +1,9 @@
 // SPDX-License-Identifier: BUSL-1.1
-import { pruneOus, upsertOu } from '../../ouCache.js';
+import { markOusStale, upsertOu } from '../../ouCache.js';
 import type { RunnerContext, RunnerResult } from '../types.js';
 
 /**
- * Full OU crawl. OUs barely change — runs weekly by default. A completed crawl
- * prunes OUs that no longer exist in AD (deleted / moved out of scope) instead
- * of only flagging them stale, so removals propagate.
+ * Full OU crawl. OUs barely change — runs weekly by default.
  */
 export async function runOusFull(ctx: RunnerContext): Promise<RunnerResult> {
   const seen = new Set<string>();
@@ -21,10 +19,10 @@ export async function runOusFull(ctx: RunnerContext): Promise<RunnerResult> {
     }
   }
 
-  const pruned = await pruneOus(ctx.db, ctx.providerId, seen);
+  await markOusStale(ctx.db, ctx.providerId, seen);
 
   return {
     cursor: new Date().toISOString(),
-    stats: { ousSeen: count, ousPruned: pruned },
+    stats: { ousSeen: count },
   };
 }

@@ -3,19 +3,25 @@
      Tabs not backed by our cache schema (Dial-in, Environment, Sessions,
      Remote control, Remote Desktop Services Profile, COM+) render the
      authentic layout with disabled controls so the experience reads as
-     "ADUC, but our directory doesn't expose this here". Editable fields
-     submit through PATCH /users/:id and respect the step-up gate. -->
+     "ADUC, but our directory doesn't expose this here". -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import WinDialog from './WinDialog.vue';
 import WinTabs from '../primitives/WinTabs.vue';
 import WinIcon from '../primitives/WinIcon.vue';
-import { api } from '../../api/index.js';
-import { ApiError } from '../../api/client.js';
 import { useAuthStore } from '../../stores/auth.js';
 import { useOldSchool } from '../stores/useOldSchool.js';
+import { useUserRecord } from '../../design/composables/useDirectoryRecords.js';
+import type { UserAttribute } from '../../design/composables/useUserAttributeEdit.js';
+import { useUserChangesApply } from '../../design/composables/useUserChangesApply.js';
+import {
+  membershipChangeText,
+  membershipDoneText,
+  membershipOf,
+  useGroupMembership,
+} from '../../design/composables/useGroupMembership.js';
 import { useToast } from 'primevue/usetoast';
-import type { UserDetail, UserUpdateRequest } from '@openaduc/shared';
+import { undoable } from '../../design/feedback/undoToast.js';
 
 const props = defineProps<{ windowId: number; id: string }>();
 const emit = defineEmits<{ (e: 'close'): void }>();
@@ -24,125 +30,47 @@ const auth = useAuthStore();
 const store = useOldSchool();
 const toast = useToast();
 
-const user = ref<UserDetail | null>(null);
-const loading = ref(true);
-const err = ref<string | null>(null);
+const canEditAttributes = computed(() => auth.hasCapability('write:user.attributes'));
+const canUnlock = computed(() => auth.hasCapability('write:user.unlock'));
+const canManageGroups = computed(() => auth.hasCapability('write:group.membership'));
 
-// Mutable "draft" mirrors UserDetail writable subset. Dirty when any
-// field differs from the loaded snapshot.
-type StringField =
-  | 'displayName'
-  | 'givenName'
-  | 'surname'
-  | 'description'
-  | 'email'
-  | 'phone'
-  | 'mobile'
-  | 'title'
-  | 'department'
-  | 'company'
-  | 'employeeID'
-  | 'employeeNumber'
-  | 'ipPhone'
-  | 'homePhone'
-  | 'homePostalAddress'
-  | 'c'
-  | 'co'
-  | 'l'
-  | 'st'
-  | 'postalCode';
-
-interface Draft {
-  // Writable scalar fields.
-  values: Record<StringField, string>;
-  // Whether to flip the unlock action on Apply (only meaningful when locked).
-  doUnlock: boolean;
-}
-
-const draft = ref<Draft>({
-  values: {
-    displayName: '',
-    givenName: '',
-    surname: '',
-    description: '',
-    email: '',
-    phone: '',
-    mobile: '',
-    title: '',
-    department: '',
-    company: '',
-    employeeID: '',
-    employeeNumber: '',
-    ipPhone: '',
-    homePhone: '',
-    homePostalAddress: '',
-    c: '',
-    co: '',
-    l: '',
-    st: '',
-    postalCode: '',
-  },
-  doUnlock: false,
+const { draft, problems, valid, unlock, dirty, applying, reset, apply } = useUserChangesApply({
+  onApplied: () => toast.add({ severity: 'success', summary: 'Changes applied.', life: 2500 }),
+  onFailed: (summary, detail) => store.reportError(`${summary}\n${detail}`),
+  refresh: () => store.bumpData(),
 });
-const snapshot = ref<Draft | null>(null);
 
-function strField(v: string | null | undefined): string {
-  return v ?? '';
-}
+const {
+  record: user,
+  loading,
+  error: err,
+  load,
+} = useUserRecord({ id: () => props.id, onLoaded: reset });
+watch(() => store.dataVersion, load, { immediate: true });
 
-function snapshotFrom(u: UserDetail): Draft {
-  return {
-    values: {
-      displayName: strField(u.displayName),
-      givenName: strField(u.givenName),
-      surname: strField(u.surname),
-      description: strField(u.description),
-      email: strField(u.email),
-      phone: strField(u.phone),
-      mobile: strField(u.mobile),
-      title: strField(u.title),
-      department: strField(u.department),
-      company: strField(u.company),
-      employeeID: strField(u.employeeID),
-      employeeNumber: strField(u.employeeNumber),
-      ipPhone: strField(u.ipPhone),
-      homePhone: strField(u.homePhone),
-      homePostalAddress: strField(u.homePostalAddress),
-      c: strField(u.c),
-      co: strField(u.co),
-      l: strField(u.l),
-      st: strField(u.st),
-      postalCode: strField(u.postalCode),
-    },
-    doUnlock: false,
-  };
-}
-
-async function load(): Promise<void> {
-  loading.value = true;
-  err.value = null;
-  try {
-    const resp = await api.users.get(props.id);
-    user.value = resp.user;
-    const snap = snapshotFrom(resp.user);
-    draft.value = JSON.parse(JSON.stringify(snap));
-    snapshot.value = JSON.parse(JSON.stringify(snap));
-  } catch (e) {
-    err.value = e instanceof ApiError ? e.message : (e as Error).message;
-  } finally {
-    loading.value = false;
-  }
-}
-onMounted(load);
-watch(() => store.dataVersion, load);
-
-const dirty = computed(() => {
-  if (!snapshot.value) return false;
-  if (draft.value.doUnlock) return true;
-  for (const k of Object.keys(draft.value.values) as StringField[]) {
-    if (draft.value.values[k] !== snapshot.value.values[k]) return true;
-  }
-  return false;
+// ADUC's labels for the attributes this dialog edits.
+const LABELS: Partial<Record<UserAttribute, string>> = {
+  givenName: 'First name',
+  surname: 'Last name',
+  displayName: 'Display name',
+  description: 'Description',
+  phone: 'Telephone number',
+  email: 'E-mail',
+  streetAddress: 'Street',
+  l: 'City',
+  st: 'State/province',
+  postalCode: 'Zip/Postal Code',
+  co: 'Country/region',
+  homePhone: 'Home',
+  mobile: 'Mobile',
+  ipPhone: 'IP phone',
+  title: 'Title',
+  department: 'Department',
+  company: 'Company',
+};
+const problem = computed(() => {
+  const [key, message] = (Object.entries(problems.value) as [UserAttribute, string][])[0] ?? [];
+  return key ? `${LABELS[key] ?? key}: ${message}` : null;
 });
 
 // --- Dialog title -----------------------------------------------------
@@ -169,7 +97,7 @@ type TabId =
   | 'comPlus'
   | 'attributes';
 
-const tabs: { id: TabId; label: string }[] = [
+const allTabs: { id: TabId; label: string }[] = [
   { id: 'general', label: 'General' },
   { id: 'address', label: 'Address' },
   { id: 'account', label: 'Account' },
@@ -188,6 +116,10 @@ const tabs: { id: TabId; label: string }[] = [
   // user object via UserDetail.rawAttributes.
   { id: 'attributes', label: 'Attribute Editor' },
 ];
+// The API sends the attribute set only to callers allowed to see it.
+const tabs = computed(() =>
+  user.value?.rawAttributes ? allTabs : allTabs.filter((t) => t.id !== 'attributes'),
+);
 const activeTab = ref<TabId>('general');
 
 // --- Attribute Editor tab --------------------------------------------
@@ -206,7 +138,7 @@ function formatAttrValue(v: unknown): string {
 }
 
 const attributeRows = computed(() => {
-  if (!user.value) return [];
+  if (!user.value?.rawAttributes) return [];
   const all = Object.entries(user.value.rawAttributes);
   const filter = attrFilter.value.trim().toLowerCase();
   return all
@@ -223,80 +155,41 @@ const attributeRows = computed(() => {
     .map(([k, v]) => ({ key: k, value: formatAttrValue(v) }));
 });
 
-// --- Save -------------------------------------------------------------
-async function save(closeAfter: boolean): Promise<void> {
-  if (!user.value || !snapshot.value) return;
+// --- Apply ----------------------------------------------------------
+function applyChanges(close: boolean): void {
   if (!dirty.value) {
-    if (closeAfter) emit('close');
+    if (close) emit('close');
     return;
   }
-  const patch: UserUpdateRequest['patch'] = {};
-  for (const k of Object.keys(draft.value.values) as StringField[]) {
-    const next = draft.value.values[k];
-    const prev = snapshot.value.values[k];
-    if (next === prev) continue;
-    if (k === 'email') {
-      // The PATCH schema treats '' as null for email.
-      (patch as Record<string, unknown>)[k] = next.trim() === '' ? null : next.trim();
-    } else {
-      (patch as Record<string, unknown>)[k] = next === '' ? null : next;
-    }
-  }
-  const wantUnlock = draft.value.doUnlock && user.value.locked;
-
-  auth.requireEdit(async () => {
-    try {
-      if (Object.keys(patch).length > 0) {
-        await api.users.update(props.id, { patch });
-      }
-      if (wantUnlock) {
-        try {
-          await api.users.unlock(props.id);
-        } catch {
-          /* ignore */
-        }
-      }
-      toast.add({ severity: 'success', summary: 'Changes applied.', life: 2500 });
-      store.bumpData();
-      // Refresh local snapshot from the new state.
-      await load();
-      if (closeAfter) emit('close');
-    } catch (e) {
-      err.value = e instanceof ApiError ? e.message : (e as Error).message;
-    }
-  }, 'Updating a user requires step-up authentication.');
+  apply(close ? () => emit('close') : undefined);
 }
 
 // --- Member Of helpers -----------------------------------------------
-const memberOfPending = ref<string | null>(null);
-function removeMembership(groupId: string, groupName: string): void {
-  store.openDialog({
-    kind: 'confirm',
-    title: 'Multiple Names Found',
-    message: `Remove ${user.value?.displayName ?? user.value?.samAccountName} from "${groupName}"?`,
-    okLabel: 'Yes',
-    destructive: false,
-    onOk: () => {
-      auth.requireEdit(async () => {
-        memberOfPending.value = groupId;
-        try {
-          await api.users.removeGroup(props.id, { groupId });
-          toast.add({ severity: 'success', summary: `Removed from ${groupName}.`, life: 2500 });
-          await load();
-          store.bumpData();
-        } catch (e) {
-          toast.add({
-            severity: 'error',
-            summary: 'Remove failed',
-            detail: e instanceof ApiError ? e.message : (e as Error).message,
-            life: 5000,
-          });
-        } finally {
-          memberOfPending.value = null;
-        }
-      }, 'Removing a group membership requires step-up authentication.');
-    },
-  });
+const memberOfSelected = ref<string | null>(null);
+const selectedMembership = computed(
+  () => user.value?.groupMemberships.find((g) => g.id === memberOfSelected.value) ?? null,
+);
+// Unlike ADUC, Remove doesn't ask first: the toast offers Undo instead.
+const { pending: membershipPending, remove: removeMembership } = useGroupMembership({
+  onChanged: (change, m, offer) => {
+    toast.add(
+      undoable(
+        { severity: 'success', summary: `${membershipDoneText(change, m)}.`, life: 2500 },
+        offer,
+      ),
+    );
+    store.bumpData();
+  },
+  onFailed: ({ op: { change, membership }, message }) =>
+    store.reportError(
+      `Windows cannot ${membershipChangeText(change, membership)} because:\n${message}`,
+    ),
+});
+
+function removeSelectedMembership(): void {
+  const u = user.value;
+  const g = selectedMembership.value;
+  if (u && g) removeMembership(membershipOf(u, g));
 }
 function openAddGroup(): void {
   if (!user.value) return;
@@ -314,12 +207,6 @@ const upnLogonName = computed(() => {
   if (idx === -1) return { local: upn, domain: '' };
   return { local: upn.slice(0, idx), domain: upn.slice(idx) };
 });
-
-function rawAttr(u: UserDetail, key: string): string {
-  const v = (u.rawAttributes as Record<string, unknown>)[key];
-  if (Array.isArray(v)) return v.join('\n');
-  return v == null ? '' : String(v);
-}
 </script>
 
 <template>
@@ -327,10 +214,10 @@ function rawAttr(u: UserDetail, key: string): string {
     :window-id="windowId"
     :title="dialogTitle"
     icon="user"
-    :can-apply="dirty"
-    :can-ok="!loading"
-    @ok="save(true)"
-    @apply="save(false)"
+    :can-apply="dirty && valid"
+    :can-ok="!loading && valid"
+    @ok="applyChanges(true)"
+    @apply="applyChanges(false)"
     @cancel="$emit('close')"
     @close="$emit('close')"
   >
@@ -355,23 +242,47 @@ function rawAttr(u: UserDetail, key: string): string {
         <div class="os-form">
           <label class="label" for="givenName">First name:</label>
           <div style="display: flex; gap: 8px">
-            <input id="givenName" class="os-input" v-model="draft.values.givenName" />
+            <input
+              id="givenName"
+              class="os-input"
+              v-model="draft.givenName"
+              :disabled="!canEditAttributes || applying"
+              :aria-invalid="!!problems.givenName"
+            />
             <label class="label" style="flex: 0 0 60px; text-align: right; align-self: center"
               >Initials:</label
             >
             <input class="os-input" style="width: 60px" disabled />
           </div>
           <label class="label" for="surname">Last name:</label>
-          <input id="surname" class="os-input" v-model="draft.values.surname" />
+          <input
+            id="surname"
+            class="os-input"
+            v-model="draft.surname"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.surname"
+          />
           <label class="label" for="displayName">Display name:</label>
-          <input id="displayName" class="os-input" v-model="draft.values.displayName" />
+          <input
+            id="displayName"
+            class="os-input"
+            v-model="draft.displayName"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.displayName"
+          />
           <label class="label" for="description">Description:</label>
-          <input id="description" class="os-input" v-model="draft.values.description" />
+          <input
+            id="description"
+            class="os-input"
+            v-model="draft.description"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.description"
+          />
           <label class="label" for="office">Office:</label>
           <input
             id="office"
             class="os-input"
-            :value="rawAttr(user, 'physicalDeliveryOfficeName')"
+            :value="user.physicalDeliveryOfficeName ?? ''"
             disabled
           />
         </div>
@@ -379,11 +290,23 @@ function rawAttr(u: UserDetail, key: string): string {
         <div class="os-form">
           <label class="label" for="phone">Telephone number:</label>
           <div style="display: flex; gap: 6px">
-            <input id="phone" class="os-input" v-model="draft.values.phone" />
+            <input
+              id="phone"
+              class="os-input"
+              v-model="draft.phone"
+              :disabled="!canEditAttributes || applying"
+              :aria-invalid="!!problems.phone"
+            />
             <button class="os-btn" disabled style="min-width: 70px">Other…</button>
           </div>
           <label class="label" for="email">E-mail:</label>
-          <input id="email" class="os-input" v-model="draft.values.email" />
+          <input
+            id="email"
+            class="os-input"
+            v-model="draft.email"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.email"
+          />
           <label class="label" for="webPage">Web page:</label>
           <div style="display: flex; gap: 6px">
             <input id="webPage" class="os-input" disabled />
@@ -400,18 +323,45 @@ function rawAttr(u: UserDetail, key: string): string {
             id="street"
             class="os-textarea"
             rows="3"
-            v-model="draft.values.homePostalAddress"
+            v-model="draft.streetAddress"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.streetAddress"
           />
           <label class="label" for="pobox">P.O. Box:</label>
-          <input id="pobox" class="os-input" :value="rawAttr(user, 'postOfficeBox')" disabled />
+          <input id="pobox" class="os-input" :value="user.postOfficeBox ?? ''" disabled />
           <label class="label" for="city">City:</label>
-          <input id="city" class="os-input" v-model="draft.values.l" />
+          <input
+            id="city"
+            class="os-input"
+            v-model="draft.l"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.l"
+          />
           <label class="label" for="state">State/province:</label>
-          <input id="state" class="os-input" v-model="draft.values.st" />
+          <input
+            id="state"
+            class="os-input"
+            v-model="draft.st"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.st"
+          />
           <label class="label" for="zip">Zip/Postal Code:</label>
-          <input id="zip" class="os-input" v-model="draft.values.postalCode" />
+          <input
+            id="zip"
+            class="os-input"
+            v-model="draft.postalCode"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.postalCode"
+          />
           <label class="label" for="country">Country/region:</label>
-          <input id="country" class="os-input" v-model="draft.values.co" placeholder="(name)" />
+          <input
+            id="country"
+            class="os-input"
+            v-model="draft.co"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.co"
+            placeholder="(name)"
+          />
         </div>
       </template>
 
@@ -431,8 +381,8 @@ function rawAttr(u: UserDetail, key: string): string {
           <button class="os-btn" disabled>Log On To…</button>
         </div>
         <hr style="border: 0; border-top: 1px solid var(--os-window-border-soft); margin: 14px 0" />
-        <label class="os-check" :class="{ disabled: !user.locked }">
-          <input type="checkbox" v-model="draft.doUnlock" :disabled="!user.locked" />
+        <label v-if="canUnlock" class="os-check" :class="{ disabled: !user.locked }">
+          <input type="checkbox" v-model="unlock" :disabled="!user.locked" />
           Unlock account. This account is currently
           {{ user.locked ? 'locked out' : 'not locked out' }} on this Active Directory Domain
           Controller.
@@ -500,9 +450,9 @@ function rawAttr(u: UserDetail, key: string): string {
           <legend>User profile</legend>
           <div class="os-form" style="grid-template-columns: 110px minmax(0, 1fr)">
             <label class="label">Profile path:</label>
-            <input class="os-input" :value="rawAttr(user, 'profilePath')" disabled />
+            <input class="os-input" :value="user.profilePath ?? ''" disabled />
             <label class="label">Logon script:</label>
-            <input class="os-input" :value="rawAttr(user, 'scriptPath')" disabled />
+            <input class="os-input" :value="user.scriptPath ?? ''" disabled />
           </div>
         </fieldset>
         <fieldset class="os-groupbox">
@@ -512,7 +462,7 @@ function rawAttr(u: UserDetail, key: string): string {
             <input
               class="os-input"
               style="margin-left: 8px; flex: 1"
-              :value="rawAttr(user, 'homeDirectory')"
+              :value="user.homeDirectory ?? ''"
               disabled
             />
           </label>
@@ -533,25 +483,40 @@ function rawAttr(u: UserDetail, key: string): string {
           <legend>Telephone numbers</legend>
           <div class="os-form" style="grid-template-columns: 80px minmax(0, 1fr) 80px">
             <label class="label">Home:</label>
-            <input class="os-input" v-model="draft.values.homePhone" />
+            <input
+              class="os-input"
+              v-model="draft.homePhone"
+              :disabled="!canEditAttributes || applying"
+              :aria-invalid="!!problems.homePhone"
+            />
             <button class="os-btn" disabled>Other…</button>
             <label class="label">Pager:</label>
-            <input class="os-input" :value="rawAttr(user, 'pager')" disabled />
+            <input class="os-input" :value="user.pager ?? ''" disabled />
             <button class="os-btn" disabled>Other…</button>
             <label class="label">Mobile:</label>
-            <input class="os-input" v-model="draft.values.mobile" />
+            <input
+              class="os-input"
+              v-model="draft.mobile"
+              :disabled="!canEditAttributes || applying"
+              :aria-invalid="!!problems.mobile"
+            />
             <button class="os-btn" disabled>Other…</button>
             <label class="label">Fax:</label>
-            <input class="os-input" :value="rawAttr(user, 'facsimileTelephoneNumber')" disabled />
+            <input class="os-input" :value="user.facsimileTelephoneNumber ?? ''" disabled />
             <button class="os-btn" disabled>Other…</button>
             <label class="label">IP phone:</label>
-            <input class="os-input" v-model="draft.values.ipPhone" />
+            <input
+              class="os-input"
+              v-model="draft.ipPhone"
+              :disabled="!canEditAttributes || applying"
+              :aria-invalid="!!problems.ipPhone"
+            />
             <button class="os-btn" disabled>Other…</button>
           </div>
         </fieldset>
         <fieldset class="os-groupbox">
           <legend>Notes:</legend>
-          <textarea class="os-textarea" rows="3" :value="rawAttr(user, 'info')" disabled />
+          <textarea class="os-textarea" rows="3" :value="user.info ?? ''" disabled />
         </fieldset>
       </template>
 
@@ -559,11 +524,26 @@ function rawAttr(u: UserDetail, key: string): string {
       <template v-else-if="activeTab === 'organization'">
         <div class="os-form">
           <label class="label">Title:</label>
-          <input class="os-input" v-model="draft.values.title" />
+          <input
+            class="os-input"
+            v-model="draft.title"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.title"
+          />
           <label class="label">Department:</label>
-          <input class="os-input" v-model="draft.values.department" />
+          <input
+            class="os-input"
+            v-model="draft.department"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.department"
+          />
           <label class="label">Company:</label>
-          <input class="os-input" v-model="draft.values.company" />
+          <input
+            class="os-input"
+            v-model="draft.company"
+            :disabled="!canEditAttributes || applying"
+            :aria-invalid="!!problems.company"
+          />
         </div>
         <fieldset class="os-groupbox">
           <legend>Manager</legend>
@@ -608,26 +588,26 @@ function rawAttr(u: UserDetail, key: string): string {
             v-for="g in user.groupMemberships"
             :key="g.id"
             class="os-listbox-row"
-            :class="{ selected: memberOfPending === g.id }"
-            @click="memberOfPending = g.id"
+            :class="{ selected: memberOfSelected === g.id }"
+            @click="memberOfSelected = g.id"
           >
             <WinIcon name="group" :size="14" />
             <span style="flex: 1">{{ g.name }}</span>
             <span style="color: var(--os-window-text-muted)" v-if="!g.direct">(via nested)</span>
           </div>
         </div>
-        <div style="display: flex; gap: 6px; margin-top: 8px">
+        <div v-if="canManageGroups" style="display: flex; gap: 6px; margin-top: 8px">
           <button class="os-btn" type="button" @click="openAddGroup">Add…</button>
           <button
             class="os-btn"
             type="button"
-            :disabled="!memberOfPending"
-            @click="
-              () => {
-                const g = user!.groupMemberships.find((x) => x.id === memberOfPending);
-                if (g) removeMembership(g.id, g.name);
-              }
+            :disabled="!selectedMembership?.direct || membershipPending !== null"
+            :title="
+              selectedMembership && !selectedMembership.direct
+                ? 'Membership comes from a nested group'
+                : undefined
             "
+            @click="removeSelectedMembership"
           >
             Remove
           </button>
@@ -872,11 +852,16 @@ function rawAttr(u: UserDetail, key: string): string {
           <button class="os-btn" disabled>Filter…</button>
         </div>
       </template>
+      <div v-if="problem" class="os-error" role="alert">{{ problem }}</div>
     </div>
   </WinDialog>
 </template>
 
 <style scoped>
+.os-input[aria-invalid='true'],
+.os-textarea[aria-invalid='true'] {
+  border-color: #b30000;
+}
 .os-attr-list {
   min-height: 280px;
   max-height: none;

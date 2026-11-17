@@ -13,10 +13,13 @@ import {
   type OuContentsResponse,
   type OuListResponse,
 } from '@openaduc/shared';
+import { computerWriteBlock } from '../lib/computerWrites.js';
 import { stringifyForJsonb } from '../lib/jsonbSafe.js';
+import { rawScalarValue } from '../lib/rawAttributes.js';
 import { Unauthorized } from '../plugins/errorHandler.js';
 import { leafRdn, parentDn } from '../providers/active-directory/normalize.js';
 import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
+import { findCachedOu } from '../services/ouCache.js';
 
 const dnQuerySchema = z.object({
   // The OU's distinguishedName. Comes from the cached `directory_ous` table —
@@ -33,7 +36,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
   // can see OUs that haven't shown up in the most recent sync rather than
   // having them silently disappear.
   app.get('/api/ous', {
-    preHandler: app.requireCapability('read:user'),
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<OuListResponse> => {
       const provider = await app.services.providers.buildForRequest(req);
       const rows = await app.db
@@ -71,7 +74,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
   // requested OU. "Directly" = parent DN equals `dn` case-insensitively;
   // sub-OUs are not listed here (the tree handles drill-down).
   app.get('/api/ous/contents', {
-    preHandler: app.requireCapability('read:user'),
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'caller' } },
     handler: async (req): Promise<OuContentsResponse> => {
       const q = dnQuerySchema.parse(req.query);
       const provider = await app.services.providers.buildForRequest(req);
@@ -79,13 +82,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
       // Verify the DN belongs to a known OU for this provider before
       // querying the cache tables. Without this check, a caller could pass
       // any DN suffix as `dn` and scan users by an arbitrary tail.
-      const ou = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', q.dn.toLowerCase())
-        .select('distinguished_name')
-        .executeTakeFirst();
+      const ou = await findCachedOu(app.db, provider.id, q.dn);
       if (!ou) {
         return ouContentsResponseSchema.parse({
           users: [],
@@ -134,6 +131,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
             'email',
             'enabled',
             'locked',
+            sql<unknown>`raw_attributes_json->'description'`.as('description'),
           ])
           .orderBy('display_name', 'asc')
           .limit(2000)
@@ -165,7 +163,10 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
             'sam_account_name',
             'dns_host_name',
             'operating_system',
+            'description',
             'enabled',
+            sql<unknown>`raw_attributes_json->'userAccountControl'`.as('uac'),
+            sql<unknown>`raw_attributes_json->'isCriticalSystemObject'`.as('critical'),
           ])
           .orderBy('name', 'asc')
           .limit(2000)
@@ -247,6 +248,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
           samAccountName: u.sam_account_name ?? '',
           displayName: u.display_name,
           email: u.email,
+          description: rawScalarValue(u.description),
           enabled: u.enabled,
           locked: u.locked,
         })),
@@ -262,7 +264,12 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
           samAccountName: c.sam_account_name,
           dnsHostName: c.dns_host_name,
           operatingSystem: c.operating_system,
+          description: c.description,
           enabled: c.enabled,
+          writeBlock: computerWriteBlock({
+            userAccountControl: c.uac,
+            isCriticalSystemObject: c.critical,
+          }),
         })),
         linkedGroupPolicies: linkedRows.map((r) => ({
           id: r.id,
@@ -292,7 +299,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- POST /api/ous (create a child OU) -------------------------------
   app.post('/api/ous', {
-    preHandler: [app.requireCapability('write:ou.create'), app.requireStepUp],
+    config: { policy: { capability: 'write:ou.create', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const body = ouCreateRequestSchema.parse(req.body);
       const actor = req.actor!;
@@ -302,13 +309,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
       // Verify the parent OU exists in our cache for this provider. AD
       // would also reject an unknown parent, but checking here gives a
       // cleaner 400 with the actual reason.
-      const parent = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', body.parentDn.toLowerCase())
-        .select(['distinguished_name'])
-        .executeTakeFirst();
+      const parent = await findCachedOu(app.db, provider.id, body.parentDn);
       if (!parent) {
         throw app.httpErrors.badRequest('parent OU not found in directory cache');
       }
@@ -320,13 +321,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
       // was created in AD outside our sync window — the provider still
       // surfaces `policy_violation` from `entryAlreadyExists` as a 409.
       const candidateDn = `OU=${trimmedName},${parent.distinguished_name}`;
-      const collision = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', candidateDn.toLowerCase())
-        .select(['distinguished_name'])
-        .executeTakeFirst();
+      const collision = await findCachedOu(app.db, provider.id, candidateDn);
       if (collision) {
         throw app.httpErrors.conflict('an OU with that name already exists at that location');
       }
@@ -419,20 +414,14 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
   // Body: { dn, patch }. The only field today is `description`; null clears
   // it, a string replaces. Rename is deliberately not exposed here.
   app.patch('/api/ous', {
-    preHandler: [app.requireCapability('write:ou.update'), app.requireStepUp],
+    config: { policy: { capability: 'write:ou.update', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const body = ouUpdateRequestSchema.parse(req.body);
       const actor = req.actor!;
       if (!actor.session.actorUsername) throw Unauthorized('session has no bind identity');
       const provider = await app.services.providers.buildForRequest(req);
 
-      const target = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', body.dn.toLowerCase())
-        .select(['distinguished_name', 'name'])
-        .executeTakeFirst();
+      const target = await findCachedOu(app.db, provider.id, body.dn);
       if (!target) {
         throw app.httpErrors.notFound('OU not found in directory cache');
       }
@@ -499,7 +488,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
 
   // ---- DELETE /api/ous (remove an empty OU) ----------------------------
   app.delete('/api/ous', {
-    preHandler: [app.requireCapability('write:ou.delete'), app.requireStepUp],
+    config: { policy: { capability: 'write:ou.delete', stepUp: true, directory: 'caller' } },
     handler: async (req) => {
       const body = ouDeleteRequestSchema.parse(req.body);
       const actor = req.actor!;
@@ -509,13 +498,7 @@ export async function registerOuRoutes(app: FastifyInstance): Promise<void> {
       // The OU must exist in the cache. If a stale client tries to delete
       // something that isn't there, surface a clean 404 rather than a
       // generic AD error.
-      const target = await app.db
-        .selectFrom('directory_ous')
-        .where('provider_id', '=', provider.id)
-        .where('deleted_at', 'is', null)
-        .where(sql<string>`lower(distinguished_name)`, '=', body.dn.toLowerCase())
-        .select(['distinguished_name', 'name'])
-        .executeTakeFirst();
+      const target = await findCachedOu(app.db, provider.id, body.dn);
       if (!target) {
         throw app.httpErrors.notFound('OU not found in directory cache');
       }

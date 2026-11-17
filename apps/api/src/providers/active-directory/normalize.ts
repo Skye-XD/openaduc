@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 import type { Entry } from 'ldapts';
+import type { GroupScope, GroupType } from '@openaduc/shared';
 import type {
   DirectoryComputer,
   DirectoryDeletedComputer,
@@ -7,6 +8,7 @@ import type {
   DirectoryGroup,
   DirectoryGroupPolicy,
   DirectoryGroupPolicyLink,
+  DirectoryObjectRef,
   DirectoryOu,
   DirectoryUser,
 } from '../types.js';
@@ -31,6 +33,28 @@ export const BINARY_ATTRS = [
   'msExchSafeSendersHash',
   'msExchSafeRecipientsHash',
 ];
+
+// Attributes that hold secrets. The wildcard query returns whatever the
+// bind account may read, and some deployments let the service account read
+// these; they must never reach the cache, the API or the UI. Lowercase:
+// LDAP attribute names are case-insensitive.
+export const SECRET_ATTRS: ReadonlySet<string> = new Set([
+  'ms-mcs-admpwd', // legacy LAPS password
+  'mslaps-password', // Windows LAPS cleartext password
+  'mslaps-encryptedpassword',
+  'mslaps-encryptedpasswordhistory',
+  'mslaps-encrypteddsrmpassword',
+  'mslaps-encrypteddsrmpasswordhistory',
+  'msds-managedpassword', // gMSA
+  'unicodepwd',
+  'userpassword',
+  'supplementalcredentials',
+  'msfve-recoverypassword', // BitLocker recovery
+]);
+
+export function isSecretAttr(name: string): boolean {
+  return SECRET_ATTRS.has(name.toLowerCase());
+}
 
 // Attributes the wildcard query returns but that we don't want to surface
 // anywhere — neither in the UI's "More from directory" extras, the Raw LDAP
@@ -61,6 +85,11 @@ const SKIP_RAW_ATTRS = new Set<string>([
   // names resolved, so the raw DN list is duplicate noise.
   'managedObjects',
 ]);
+
+/** True for attributes never kept in rawAttributes: noise and secrets. */
+function omitFromRaw(name: string): boolean {
+  return SKIP_RAW_ATTRS.has(name) || isSecretAttr(name);
+}
 
 // Attribute set for deleted-object reads. Recycle-Bin-enabled domains keep
 // most user attributes around for the deleted-object lifetime; tombstones
@@ -108,19 +137,30 @@ export const USER_ATTRS = [
   'badPasswordTime',
   'whenCreated',
   'whenChanged',
+  'msDS-User-Account-Control-Computed',
 ];
 
 // Wildcard pulls every non-operational attribute populated on the entry —
 // extra mails, secondary phones, addresses, employeeID, etc. Used by detail
 // reads and full sync; the cache stores the raw blob so the UI can decide
 // what to surface without a schema change per attribute.
-export const USER_ATTRS_FULL = ['*'];
+// '*' doesn't include constructed attributes; ask for the ones we use.
+export const USER_ATTRS_FULL = [
+  '*',
+  'msDS-UserPasswordExpiryTimeComputed',
+  'msDS-User-Account-Control-Computed',
+  'msDS-ResultantPSO',
+];
+
+/** msDS-User-Account-Control-Computed bit: locked out right now. */
+const UF_LOCKOUT = 0x10;
 
 export const OU_ATTRS = [
   'distinguishedName',
   'ou',
   'name',
   'description',
+  'isCriticalSystemObject',
   'whenCreated',
   'whenChanged',
 ];
@@ -136,6 +176,9 @@ export const GROUP_ATTRS = [
   'mail',
   'groupType',
   'member',
+  'memberOf',
+  'isCriticalSystemObject',
+  'adminCount',
   'whenCreated',
   'whenChanged',
 ];
@@ -157,6 +200,7 @@ export const COMPUTER_ATTRS = [
   'managedBy',
   'memberOf',
   'userAccountControl',
+  'isCriticalSystemObject',
   'pwdLastSet',
   'lastLogonTimestamp',
   'whenCreated',
@@ -252,6 +296,29 @@ function parseGeneralizedTime(v: unknown): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+export const OBJECT_REF_ATTRS = [
+  'objectGUID',
+  'distinguishedName',
+  'name',
+  'displayName',
+  'objectClass',
+  'isCriticalSystemObject',
+];
+
+export function normalizeObjectRef(entry: Entry): DirectoryObjectRef | null {
+  const guidBuf = asBuffer(entry.objectGUID);
+  if (!guidBuf) return null;
+  const dn = asString(entry.distinguishedName) ?? entry.dn;
+  const classes = asStringArray(entry.objectClass).map((c) => c.toLowerCase());
+  return {
+    objectGuid: objectGuidToString(guidBuf),
+    distinguishedName: dn,
+    name: asString(entry.displayName) ?? asString(entry.name) ?? leafRdnValue(dn) ?? dn,
+    isOu: classes.includes('organizationalunit'),
+    isCriticalSystemObject: asString(entry.isCriticalSystemObject)?.toUpperCase() === 'TRUE',
+  };
+}
+
 export function normalizeUser(entry: Entry): DirectoryUser {
   const guidBuf = asBuffer(entry.objectGUID);
   if (!guidBuf) {
@@ -261,7 +328,13 @@ export function normalizeUser(entry: Entry): DirectoryUser {
 
   const uac = parseUserAccountControl(asString(entry.userAccountControl));
   const lockoutTimeStr = asString(entry.lockoutTime);
-  const lockedNow = isLocked(lockoutTimeStr);
+  // AD never clears lockoutTime when the lockout duration lapses, so a
+  // non-zero lockoutTime alone overstates lockouts. The constructed
+  // msDS-User-Account-Control-Computed has the effective bit (UF_LOCKOUT);
+  // fall back to lockoutTime only when it wasn't returned.
+  const computedUac = asString(entry['msDS-User-Account-Control-Computed']);
+  const lockedNow =
+    computedUac !== null ? (Number(computedUac) & UF_LOCKOUT) !== 0 : isLocked(lockoutTimeStr);
   const lockoutFiletime = filetimeToDate(lockoutTimeStr);
   const dn = asString(entry.distinguishedName);
   if (!dn) {
@@ -278,7 +351,7 @@ export function normalizeUser(entry: Entry): DirectoryUser {
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
@@ -298,20 +371,23 @@ export function normalizeUser(entry: Entry): DirectoryUser {
     mobile: asString(entry.mobile),
     title: asString(entry.title),
     department: asString(entry.department),
+    office: asString(entry.physicalDeliveryOfficeName),
     managerDn: asString(entry.manager),
     enabled: uac.enabled,
     locked: lockedNow,
     lockedAt: lockoutFiletime,
+    resultantPsoDn: asString(entry['msDS-ResultantPSO']),
     passwordNeverExpires: uac.passwordNeverExpires,
     passwordLastSetAt: passwordLastSet,
-    // passwordExpiresAt requires the domain max-password-age policy. We
-    // leave it null at this layer; the API route resolves it from
-    // `passwordLastSetAt + getDomainPolicy().maxPwdAgeMs` so the policy
-    // fetch (cached per-provider) isn't on the per-entry hot path.
-    passwordExpiresAt: null,
+    // Constructed by AD from the effective policy (domain or PSO). Never-
+    // expires and must-change both come back as sentinels, which map to null.
+    passwordExpiresAt: filetimeToDate(asString(entry['msDS-UserPasswordExpiryTimeComputed'])),
+    passwordExpiryComputed: entry['msDS-UserPasswordExpiryTimeComputed'] !== undefined,
+    passwordMustChange: asString(entry.pwdLastSet) === '0',
     accountExpiresAt: filetimeToDate(asString(entry.accountExpires)),
     lastLogonAt: filetimeToDate(asString(entry.lastLogonTimestamp)),
     lastBadPasswordAt: filetimeToDate(asString(entry.badPasswordTime)),
+    badPasswordCount: parseIntOrNull(asString(entry.badPwdCount)),
     createdAtSource: parseGeneralizedTime(entry.whenCreated),
     modifiedAtSource: parseGeneralizedTime(entry.whenChanged),
     memberOfDns: asStringArray(entry.memberOf),
@@ -331,7 +407,7 @@ export function normalizeOu(entry: Entry): DirectoryOu {
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
@@ -376,7 +452,7 @@ export function leafRdn(dn: string): string {
 }
 
 /** Return the value of the leftmost RDN ("OU=Sales,…" → "Sales"), or null. */
-function leafRdnValue(dn: string): string | null {
+export function leafRdnValue(dn: string): string | null {
   const { head } = splitDnHead(dn);
   const eq = head.indexOf('=');
   if (eq < 0) return null;
@@ -418,15 +494,13 @@ export function normalizeDeletedUser(entry: Entry): DirectoryDeletedUser {
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
   }
-  // AD stores `isDeleted` and `isRecycled` as the literal strings
-  // "TRUE"/"FALSE". Treat presence-as-TRUE generously since some servers
-  // omit the value entirely once deletion is complete.
-  const isDeletedRaw = asString(entry.isDeleted);
+  // The search filter already requires (isDeleted=TRUE). AD stores
+  // `isRecycled` as the literal strings "TRUE"/"FALSE".
   const isRecycledRaw = asString(entry.isRecycled);
   const recycled = isRecycledRaw !== null && isRecycledRaw.toUpperCase() === 'TRUE';
 
@@ -443,10 +517,6 @@ export function normalizeDeletedUser(entry: Entry): DirectoryDeletedUser {
     recycled,
     rawAttributes: raw,
   };
-  // isDeletedRaw is read for completeness — every entry returned with the
-  // ShowDeleted control should have it; we don't gate on the value because
-  // the search filter already requires (isDeleted=TRUE).
-  void isDeletedRaw;
 }
 
 export function normalizeComputer(entry: Entry): DirectoryComputer {
@@ -465,7 +535,7 @@ export function normalizeComputer(entry: Entry): DirectoryComputer {
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
@@ -508,7 +578,7 @@ export function normalizeDeletedComputer(entry: Entry): DirectoryDeletedComputer
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
@@ -530,6 +600,21 @@ export function normalizeDeletedComputer(entry: Entry): DirectoryDeletedComputer
   };
 }
 
+// groupType bits. AD stores the attribute as a signed 32-bit integer, so
+// the security bit is negative.
+export const GROUP_TYPE = {
+  builtin: 0x1,
+  global: 0x2,
+  'domain-local': 0x4,
+  universal: 0x8,
+  security: 0x80000000 | 0,
+} as const;
+
+/** The groupType value AD expects for a new group of this scope and type. */
+export function groupTypeValue(scope: GroupScope, type: GroupType): number {
+  return GROUP_TYPE[scope] | (type === 'security' ? GROUP_TYPE.security : 0);
+}
+
 export function normalizeGroup(entry: Entry): DirectoryGroup {
   const guidBuf = asBuffer(entry.objectGUID);
   if (!guidBuf) {
@@ -547,21 +632,17 @@ export function normalizeGroup(entry: Entry): DirectoryGroup {
   if (groupTypeRaw !== null) {
     const gt = Number.parseInt(groupTypeRaw, 10);
     if (Number.isFinite(gt)) {
-      const SECURITY = 0x80000000 | 0;
-      const SCOPE_GLOBAL = 0x2;
-      const SCOPE_DOMAIN_LOCAL = 0x4;
-      const SCOPE_UNIVERSAL = 0x8;
-      groupType = (gt & SECURITY) !== 0 ? 'security' : 'distribution';
-      if ((gt & SCOPE_GLOBAL) !== 0) groupScope = 'global';
-      else if ((gt & SCOPE_DOMAIN_LOCAL) !== 0) groupScope = 'domain-local';
-      else if ((gt & SCOPE_UNIVERSAL) !== 0) groupScope = 'universal';
+      groupType = (gt & GROUP_TYPE.security) !== 0 ? 'security' : 'distribution';
+      if ((gt & GROUP_TYPE.global) !== 0) groupScope = 'global';
+      else if ((gt & GROUP_TYPE['domain-local']) !== 0) groupScope = 'domain-local';
+      else if ((gt & GROUP_TYPE.universal) !== 0) groupScope = 'universal';
     }
   }
 
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;
@@ -582,6 +663,7 @@ export function normalizeGroup(entry: Entry): DirectoryGroup {
     groupType,
     groupScope,
     memberDns: asStringArray(entry.member),
+    memberOfDns: asStringArray(entry.memberOf),
     rawAttributes: raw,
   };
 }
@@ -605,7 +687,7 @@ export function normalizeGroupPolicy(entry: Entry): DirectoryGroupPolicy {
   const raw: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(entry)) {
     if (BINARY_ATTRS.includes(k)) continue;
-    if (SKIP_RAW_ATTRS.has(k)) continue;
+    if (omitFromRaw(k)) continue;
     const cleaned = stripBuffers(v);
     if (cleaned === undefined) continue;
     raw[k] = cleaned;

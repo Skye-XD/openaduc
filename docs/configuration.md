@@ -21,30 +21,32 @@ The full env schema lives in [`apps/api/src/config/env.ts`](../apps/api/src/conf
 
 ## API server
 
-| Variable          | Default                 | Description                                                                                                  |
-| ----------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `API_HOST`        | `0.0.0.0`               | Bind address for the Fastify HTTP server.                                                                    |
-| `API_PORT`        | `3000`                  | TCP port for the API.                                                                                        |
-| `API_CORS_ORIGIN` | `http://localhost:5173` | Comma-separated list of origins allowed by CORS. In production, set this to the public origin of the web UI. |
+| Variable           | Default                 | Description                                                                                                                                                                                                                                                                                                                                                               |
+| ------------------ | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `API_HOST`         | `0.0.0.0`               | Bind address for the Fastify HTTP server.                                                                                                                                                                                                                                                                                                                                 |
+| `API_PORT`         | `3000`                  | TCP port for the API.                                                                                                                                                                                                                                                                                                                                                     |
+| `API_CORS_ORIGIN`  | `http://localhost:5173` | Comma-separated list of origins allowed by CORS. In production, set this to the public origin of the web UI.                                                                                                                                                                                                                                                              |
+| `TRUST_PROXY_HOPS` | `1`                     | How many reverse proxies in front of the API to trust for the client's address (`X-Forwarded-For`). `1` is the bundled nginx. Add one for each proxy or load balancer in front of it (e.g. `2` behind an identity-aware proxy), or `0` if clients reach the API directly. Too high lets clients choose the address used for rate limits, login backoff and the audit log. |
 
 ## Sessions and step-up
 
-OpenADUC uses cookie-based sessions plus a separate **step-up** session minted when an admin re-authenticates to perform a write. Both have independent timeouts.
+OpenADUC uses cookie-based sessions plus a separate **elevated session** minted when an operator steps up (re-enters their password) to perform a write. Both have independent timeouts.
 
-| Variable                         | Default | Description                                                                                                 |
-| -------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------- |
-| `SESSION_IDLE_TIMEOUT_MINUTES`   | `60`    | Sign-out after this many minutes of inactivity.                                                             |
-| `SESSION_ABSOLUTE_TIMEOUT_HOURS` | `12`    | Hard sign-out cap regardless of activity.                                                                   |
-| `STEP_UP_TTL_MINUTES`            | `60`    | How long an elevated (step-up) session lasts. After expiry, write actions require re-entering the password. |
+| Variable                         | Default | Description                                     |
+| -------------------------------- | ------- | ----------------------------------------------- |
+| `SESSION_IDLE_TIMEOUT_MINUTES`   | `60`    | Sign-out after this many minutes of inactivity. |
+| `SESSION_ABSOLUTE_TIMEOUT_HOURS` | `12`    | Hard sign-out cap regardless of activity.       |
 
 These can be overridden per-deployment via the **app_settings** table (settings UI), which takes precedence over env values once set.
 
+The elevated session's limits are policy settings only, under **Settings → Policy → Elevated sessions** (no environment variables): it ends after `stepup.idle_timeout_minutes` without activity (default 15) or `stepup.absolute_lifetime_minutes` after step-up (default 240), whichever comes first. The idle timeout can't be longer than the absolute lifetime. Changing them requires step-up and is audited. `STEP_UP_TTL_MINUTES`, documented in earlier versions, never took effect and is no longer read. Upgrading from a version with a fixed step-up lifetime (the `stepup.ttl_minutes` setting): a lifetime you had changed becomes the absolute lifetime and caps the idle timeout, so no elevated session lasts longer than before; an unchanged one gets the new defaults.
+
 ## Database
 
-| Variable            | Default | Description                                                                          |
-| ------------------- | ------- | ------------------------------------------------------------------------------------ |
-| `DATABASE_POOL_MIN` | `2`     | Minimum idle Postgres connections.                                                   |
-| `DATABASE_POOL_MAX` | `10`    | Maximum Postgres connections. Bump if you see pool exhaustion under heavy sync load. |
+| Variable            | Default | Description                                                                                                                                             |
+| ------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_POOL_MIN` | `2`     | Minimum idle Postgres connections.                                                                                                                      |
+| `DATABASE_POOL_MAX` | `10`    | Maximum Postgres connections for queries. Sync tasks hold one more each, from a separate pool of the same size, so a process can open up to twice this. |
 
 ## Active Directory connection
 
@@ -57,16 +59,16 @@ These variables only matter on **first boot before the setup wizard has run**. I
 | `AD_BASE_DN`                  | —       | Base DN for searches (e.g. `DC=example,DC=com`).                                                                                                            |
 | `AD_SERVICE_ACCOUNT_UPN`      | —       | UPN of the read/sync service account (e.g. `openaduc-sync@example.com`).                                                                                    |
 | `AD_SERVICE_ACCOUNT_PASSWORD` | —       | Password for the service account. Stored encrypted in the DB once seeded.                                                                                   |
-| `AD_TLS_REJECT_UNAUTHORIZED`  | `1`     | Set to `0` only for local dev with self-signed Samba. **Never** set to `0` in production.                                                                   |
+| `AD_TLS_REJECT_UNAUTHORIZED`  | `1`     | Keep at `1`. For a DC with a private CA set `AD_TLS_CA_PATH` instead; `0` lets anyone on the network path impersonate the DC and collect passwords.         |
 | `AD_TLS_CA_PATH`              | —       | Path inside the API container to a custom CA bundle (PEM) used to validate the LDAPS certificate.                                                           |
-| `TRUST_PROXY_HOPS`            | `2`     | Reverse proxies in front of the API whose `X-Forwarded-For` entries are believed (Caddy on the host and the web container's nginx).                         |
 | `AD_OPERATION_TIMEOUT_MS`     | `15000` | Timeout (in ms) for individual LDAP operations. Increase if your DCs are slow or far away.                                                                  |
+| `SYNC_SCHEDULER_ENABLED`      | `1`     | Set to `0` to stop scheduled directory sync tasks in this process (the integration tests do). Manual and setup-time syncs still run.                        |
 
 ## Authorization bootstrap
 
-| Variable                   | Default | Description                                                                                                                                                                                                         |
-| -------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BOOTSTRAP_ADMIN_GROUP_DN` | —       | DN of an AD security group whose members are auto-granted the `admin` role until in-app role assignments are configured. The setup wizard sets this for you. The recovery account from the wizard works without it. |
+| Variable                   | Default | Description                                                                                                                                                                                                                                                                                  |
+| -------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BOOTSTRAP_ADMIN_GROUP_DN` | —       | DN of an AD security group whose members are auto-granted the `admin` role until in-app role assignments are configured. Applies only while no admin group is set in the app's settings. Setup sets Domain Admins there unless the admin signing in already qualifies through this variable. |
 
 ## Frontend (build-time)
 
@@ -82,6 +84,10 @@ A handful of settings live in the **app_settings** Postgres table and are manage
 - Per-task sync schedules (interval, cron).
 - Notification thresholds for failing sync tasks.
 - Branding overrides (display name, accent color).
+
+Each domain's **naming pattern** (how a new account's username is built from the person's name, `{first}.{last}` by default) and UPN suffix are set on its card in Configuration → Domains and stored with the domain. The preview there shows what the pattern makes of sample names. A change applies to accounts created afterwards; existing accounts keep their names.
+
+Each domain's **defaults for new users** are set on the same card: which password mode the New user form starts in (a random password nobody sees, the default; a generated one shown once; or one the operator types), whether a new user's `mail` is set to their UPN (on by default; `proxyAddresses` is never written), and the country a phone number written without a country code is read in (none by default, so such numbers need one). The operator can change each for the person they're creating.
 
 Env defaults in this file are the floor; the database wins where both exist.
 

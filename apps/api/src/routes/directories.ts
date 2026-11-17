@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: BUSL-1.1
+import {
+  LDAP_TLS_MODES,
+  type LdapTlsMode,
+  ldapTransportProblem,
+  rebindRequiredReason,
+} from '@openaduc/shared';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { NotFound, Unauthorized } from '../plugins/errorHandler.js';
+import { BadRequest, NotFound, Unauthorized } from '../plugins/errorHandler.js';
 import { auditContextFromRequest } from '../services/auditContext.js';
-import { buildEphemeralProvider } from '../services/directoryConfig.js';
+import {
+  buildEphemeralProvider,
+  type DirectoryProviderSummary,
+} from '../services/directoryConfig.js';
 import { loadEnv } from '../config/env.js';
 import { composeBindUpn } from '../lib/usernameParser.js';
 import { isKnownTaskKey } from '../services/syncTasks/registry.js';
@@ -27,7 +36,7 @@ const directoryCreateSchema = z.object({
   domain: z.string().trim().min(1).max(255),
   baseDn: z.string().trim().min(1).max(512),
   ldapUrls: z.array(z.string().trim().min(1)).min(1).max(10),
-  tlsMode: z.enum(['ldaps', 'starttls', 'plain']).default('ldaps'),
+  tlsMode: z.enum(LDAP_TLS_MODES).default('ldaps'),
   adminUsername: z.string().trim().min(1).max(256),
   adminPassword: z.string().min(1).max(1024),
   tlsRejectUnauthorized: z.boolean().optional(),
@@ -40,7 +49,7 @@ const directoryPatchFields = {
   domain: z.string().trim().min(1).max(255).optional(),
   baseDn: z.string().trim().min(1).max(512).optional(),
   ldapUrls: z.array(z.string().trim().min(1)).min(1).max(10).optional(),
-  tlsMode: z.enum(['ldaps', 'starttls', 'plain']).optional(),
+  tlsMode: z.enum(LDAP_TLS_MODES).optional(),
   tlsRejectUnauthorized: z.boolean().optional(),
   operationTimeoutMs: z.coerce.number().int().min(1000).max(120000).optional(),
   // Sync service account. Empty strings clear the stored values.
@@ -76,15 +85,40 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
     tlsCaPath: env.AD_TLS_CA_PATH,
   };
 
+  /** A provider bound as `bindUpn` against `dir`'s connection settings. */
+  function serviceAccountProvider(
+    dir: Pick<
+      DirectoryProviderSummary,
+      'name' | 'domain' | 'baseDn' | 'ldapUrls' | 'tlsMode' | 'tlsRejectUnauthorized'
+    >,
+    bindUpn: string,
+    bindPassword: string,
+  ) {
+    return buildEphemeralProvider(
+      {
+        name: dir.name,
+        type: 'active-directory',
+        domain: dir.domain,
+        baseDn: dir.baseDn,
+        ldapUrls: dir.ldapUrls,
+        tlsMode: dir.tlsMode,
+        bindUpn,
+        bindPassword,
+        tlsRejectUnauthorized: dir.tlsRejectUnauthorized ?? env.AD_TLS_REJECT_UNAUTHORIZED,
+      },
+      tlsFallbacks,
+    );
+  }
+
   // ---- GET /api/directories/public -------------------------------------
-  app.get('/api/directories/public', async () => {
+  app.get('/api/directories/public', { config: { policy: { public: true } } }, async () => {
     const directories = await app.services.directoryConfig.listPublic();
     return { directories };
   });
 
   // ---- GET /api/directories --------------------------------------------
   app.get('/api/directories', {
-    preHandler: app.requireCapability('configure:directory'),
+    config: { policy: { capability: 'configure:directory', stepUp: false, directory: 'none' } },
     handler: async () => {
       const rows = await app.services.directoryConfig.listAll();
       return { directories: rows };
@@ -96,16 +130,12 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // can read users — the same screens that show lockout state need this to
   // make sense of the timestamps. The provider caches results for 5min.
   app.get('/api/directories/:id/policy', {
-    preHandler: app.requireCapability('read:user'),
+    config: { policy: { capability: 'read:user', stepUp: false, directory: 'param' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);
       if (!directory) throw NotFound('directory not found');
       const provider = await app.services.providers.buildForRequest(req);
-      if (provider.id !== id) {
-        // Multi-directory deployments isolate by session.directoryId.
-        throw NotFound('directory not found');
-      }
       const policy = await provider.getDomainPolicy();
       const minutes = (ms: number | null): number | null =>
         ms === null ? null : Math.round(ms / 60_000);
@@ -119,6 +149,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
           maxPwdAgeDays: days(policy.maxPwdAgeMs),
           minPwdLength: policy.minPwdLength,
           pwdHistoryLength: policy.pwdHistoryLength,
+          complexityRequired: policy.complexityRequired,
           fetchedAt: new Date().toISOString(),
         },
       };
@@ -127,10 +158,14 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
 
   // ---- POST /api/directories -------------------------------------------
   app.post('/api/directories', {
-    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
-    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    config: {
+      rateLimit: { max: 5, timeWindow: '1 minute' },
+      policy: { capability: 'configure:directory', stepUp: true, directory: 'none' },
+    },
     handler: async (req) => {
       const body = directoryCreateSchema.parse(req.body);
+      const transportProblem = ldapTransportProblem(body.ldapUrls, body.tlsMode);
+      if (transportProblem) throw BadRequest(transportProblem);
       // Same UPN normalization as setup — accept any AD-friendly form, send
       // `user@<domain>` to the bind.
       const bindUsername = composeBindUpn(body.adminUsername, body.domain);
@@ -207,15 +242,65 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
 
   // ---- PATCH /api/directories/:id --------------------------------------
   app.patch('/api/directories/:id', {
-    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
+    config: { policy: { capability: 'configure:directory', stepUp: true, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const body = directoryPatchSchema.parse(req.body);
       const before = await app.services.directoryConfig.getById(id);
       if (!before) throw NotFound('directory not found');
 
-      if (body.tlsMode === 'plain' && before.tlsMode !== 'plain') {
-        req.log.warn({ id }, 'directory TLS mode being downgraded to plain');
+      if (body.ldapUrls !== undefined || body.tlsMode !== undefined) {
+        const transportProblem = ldapTransportProblem(
+          body.ldapUrls ?? before.ldapUrls,
+          body.tlsMode ?? before.tlsMode,
+        );
+        if (transportProblem) throw BadRequest(transportProblem);
+      }
+
+      // Syncs send the stored service-account password to whatever these
+      // settings point at, as whoever they name, and every sign-in sends an
+      // operator's. Changing them needs that password typed in and a
+      // working bind first.
+      const effectiveTlsCheck = (v: boolean | null) => v ?? env.AD_TLS_REJECT_UNAUTHORIZED;
+      const connectionOf = (d: {
+        ldapUrls: readonly string[];
+        tlsMode: LdapTlsMode;
+        tlsRejectUnauthorized: boolean | null;
+        syncBindUpn: string | null;
+      }) => ({ ...d, tlsRejectUnauthorized: effectiveTlsCheck(d.tlsRejectUnauthorized) });
+      const rebindReason = rebindRequiredReason(
+        connectionOf(before),
+        connectionOf({
+          ldapUrls: body.ldapUrls ?? before.ldapUrls,
+          tlsMode: body.tlsMode ?? before.tlsMode,
+          tlsRejectUnauthorized:
+            body.tlsRejectUnauthorized === undefined
+              ? before.tlsRejectUnauthorized
+              : body.tlsRejectUnauthorized,
+          syncBindUpn: body.syncBindUpn === undefined ? before.syncBindUpn : body.syncBindUpn,
+        }),
+      );
+      if (rebindReason) {
+        if (!body.syncBindPassword) throw BadRequest(rebindReason);
+        const syncBindUpn = body.syncBindUpn ?? before.syncBindUpn;
+        if (!syncBindUpn) {
+          throw BadRequest('Set a service account before changing how this domain is reached.');
+        }
+        const probe = await serviceAccountProvider(
+          {
+            ...before,
+            ldapUrls: body.ldapUrls ?? before.ldapUrls,
+            tlsMode: body.tlsMode ?? before.tlsMode,
+            tlsRejectUnauthorized: body.tlsRejectUnauthorized ?? before.tlsRejectUnauthorized,
+          },
+          syncBindUpn,
+          body.syncBindPassword,
+        ).authenticateUser({ username: syncBindUpn, password: body.syncBindPassword });
+        if (!probe.ok) {
+          throw BadRequest(
+            `Not saved: the service account couldn't sign in with the new settings (${probe.errorMessage ?? 'bind failed'}).`,
+          );
+        }
       }
 
       const updated = await app.services.directoryConfig.update(id, compactPatch(body));
@@ -234,6 +319,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
           metadata: {
             changedFields,
             syncSecretRotated: body.syncBindPassword !== undefined,
+            ...(rebindReason ? { connectionVerified: true } : {}),
           },
           before: {
             ldapUrls: before.ldapUrls,
@@ -261,8 +347,10 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // pass/fail message so the operator finds out about a typo at the
   // moment of typing instead of after waiting for the next scheduled run.
   app.post('/api/directories/:id/test-sync-bind', {
-    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
-    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    config: {
+      rateLimit: { max: 10, timeWindow: '1 minute' },
+      policy: { capability: 'configure:directory', stepUp: true, directory: 'none' },
+    },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const bodySchema = z.object({
@@ -281,25 +369,14 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
         if (!stored) {
           throw app.httpErrors.badRequest('no stored sync password — supply one or rotate first');
         }
+        // The stored password only ever goes out as the stored account.
+        if (body.syncBindUpn.toLowerCase() !== (directory.syncBindUpn ?? '').toLowerCase()) {
+          throw BadRequest('to test a different account, enter its password');
+        }
         password = stored.password;
       }
 
-      const tlsRejectUnauthorized =
-        directory.tlsRejectUnauthorized ?? env.AD_TLS_REJECT_UNAUTHORIZED;
-      const provider = buildEphemeralProvider(
-        {
-          name: directory.name,
-          type: 'active-directory',
-          domain: directory.domain,
-          baseDn: directory.baseDn,
-          ldapUrls: directory.ldapUrls,
-          tlsMode: directory.tlsMode as 'ldaps' | 'starttls' | 'plain',
-          bindUpn: body.syncBindUpn,
-          bindPassword: password,
-          tlsRejectUnauthorized,
-        },
-        tlsFallbacks,
-      );
+      const provider = serviceAccountProvider(directory, body.syncBindUpn, password);
       // Reuse the rich auth-classifier (returns specific reasons for
       // wrong-password / user-not-found / TLS / unreachable). For a SA
       // probe we don't need the full record — a successful bind is the
@@ -336,7 +413,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // every registered task immediately, instead of leaving the operator
   // staring at an "awaiting first tick" empty state.
   app.get('/api/directories/:id/sync-tasks', {
-    preHandler: app.requireCapability('configure:directory'),
+    config: { policy: { capability: 'configure:directory', stepUp: false, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);
@@ -352,7 +429,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // ---- PATCH /api/directories/:id/sync-tasks/:key ----------------------
   // Update cadence / anchor / enabled for a single task.
   app.patch('/api/directories/:id/sync-tasks/:key', {
-    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
+    config: { policy: { capability: 'configure:directory', stepUp: true, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const { key } = z.object({ key: z.string().min(1) }).parse(req.params);
@@ -425,8 +502,10 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
 
   // ---- POST /api/directories/:id/sync-tasks/:key/run -------------------
   app.post('/api/directories/:id/sync-tasks/:key/run', {
-    preHandler: app.requireCapability('configure:directory'),
-    config: { rateLimit: { max: 30, timeWindow: '1 minute' } },
+    config: {
+      rateLimit: { max: 30, timeWindow: '1 minute' },
+      policy: { capability: 'configure:directory', stepUp: true, directory: 'none' },
+    },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const { key } = z.object({ key: z.string().min(1) }).parse(req.params);
@@ -461,7 +540,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // the Tasks UI so the operator can see "ran 3× in the last 10 min, all
   // failed with X" rather than just the latest result.
   app.get('/api/directories/:id/sync-tasks/:key/history', {
-    preHandler: app.requireCapability('configure:directory'),
+    config: { policy: { capability: 'configure:directory', stepUp: false, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const { key } = z.object({ key: z.string().min(1) }).parse(req.params);
@@ -497,7 +576,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // "Run now" click registered even when the runner finishes faster than
   // the UI's poll cadence.
   app.get('/api/directories/:id/sync-tasks/queue', {
-    preHandler: app.requireCapability('configure:directory'),
+    config: { policy: { capability: 'configure:directory', stepUp: false, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);
@@ -513,7 +592,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // ---- POST /api/directories/:id/sync-tasks/:key/reset -----------------
   // Operator escape hatch — flip a single stuck task out of `running`.
   app.post('/api/directories/:id/sync-tasks/:key/reset', {
-    preHandler: app.requireCapability('configure:directory'),
+    config: { policy: { capability: 'configure:directory', stepUp: true, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const { key } = z.object({ key: z.string().min(1) }).parse(req.params);
@@ -542,7 +621,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // resetting every stuck task for the directory. Removed in a future
   // release once the UI fully migrates.
   app.post('/api/directories/:id/sync/reset', {
-    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
+    config: { policy: { capability: 'configure:directory', stepUp: true, directory: 'none' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);
@@ -572,8 +651,10 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // Pre-task-split clients triggered "the sync"; map it to running the
   // users.full task. Removed in a future release once the UI cuts over.
   app.post('/api/directories/:id/sync', {
-    preHandler: app.requireCapability('configure:directory'),
-    config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
+    config: {
+      rateLimit: { max: 10, timeWindow: '1 minute' },
+      policy: { capability: 'configure:directory', stepUp: true, directory: 'none' },
+    },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);

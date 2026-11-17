@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BUSL-1.1
 import { z } from 'zod';
+import { computerWriteBlockSchema } from './computer.js';
 
 export const directoryOuSchema = z.object({
   distinguishedName: z.string(),
@@ -22,13 +23,17 @@ export const ouListResponseSchema = z.object({
 });
 export type OuListResponse = z.infer<typeof ouListResponseSchema>;
 
-export const userMoveRequestSchema = z.object({
+/** An OU as a job or preview names it. */
+export const ouRefSchema = z.object({ distinguishedName: z.string(), name: z.string() });
+export type OuRef = z.infer<typeof ouRefSchema>;
+
+export const moveRequestSchema = z.object({
   // The new parent OU's DN. The server validates that it exists in the
   // cached directory_ous table for the active provider before issuing the
   // modifyDN to AD.
   targetOuDn: z.string().min(1).max(1024),
 });
-export type UserMoveRequest = z.infer<typeof userMoveRequestSchema>;
+export type MoveRequest = z.infer<typeof moveRequestSchema>;
 
 // OU name constraints for create:
 //   - 1..64 characters after trimming
@@ -81,6 +86,7 @@ export const ouUserRowSchema = z.object({
   samAccountName: z.string(),
   displayName: z.string().nullable(),
   email: z.string().nullable(),
+  description: z.string().nullable(),
   enabled: z.boolean(),
   locked: z.boolean(),
 });
@@ -100,7 +106,9 @@ export const ouComputerRowSchema = z.object({
   samAccountName: z.string().nullable(),
   dnsHostName: z.string().nullable(),
   operatingSystem: z.string().nullable(),
+  description: z.string().nullable(),
   enabled: z.boolean(),
+  writeBlock: computerWriteBlockSchema.nullable(),
 });
 export type OuComputerRow = z.infer<typeof ouComputerRowSchema>;
 

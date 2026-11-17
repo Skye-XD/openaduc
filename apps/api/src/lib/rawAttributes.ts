@@ -1,42 +1,49 @@
 // SPDX-License-Identifier: BUSL-1.1
-/**
- * The raw LDAP attributes of an object go to the browser for the property dialogs and the
- * "Raw LDAP" tab. The service account may be able to read attributes that are secrets in
- * themselves (LAPS local-administrator passwords, BitLocker recovery keys, password
- * hashes and key material). Those are dropped here unless the session holds
- * `view:raw_attributes`; checking that capability only in the web client protected nothing.
- */
-const SECRET_ATTRIBUTES = new Set(
-  [
-    'ms-Mcs-AdmPwd',
-    'msLAPS-Password',
-    'msLAPS-EncryptedPassword',
-    'msLAPS-EncryptedPasswordHistory',
-    'msLAPS-EncryptedDSRMPassword',
-    'msLAPS-EncryptedDSRMPasswordHistory',
-    'msFVE-RecoveryPassword',
-    'msFVE-KeyPackage',
-    'msDS-ManagedPassword',
-    'msDS-KeyCredentialLink',
-    'unicodePwd',
-    'userPassword',
-    'unixUserPassword',
-    'dBCSPwd',
-    'ntPwdHistory',
-    'lmPwdHistory',
-    'supplementalCredentials',
-  ].map((name) => name.toLowerCase()),
-);
+import { isSecretAttr } from '../providers/active-directory/normalize.js';
 
-export function visibleRawAttributes<T extends Record<string, unknown>>(
-  raw: T | null | undefined,
-  capabilities: readonly string[] | null | undefined,
-): Record<string, unknown> {
-  if (!raw) return {};
-  if (capabilities?.includes('view:raw_attributes')) return raw;
-  const out: Record<string, unknown> = {};
-  for (const [name, value] of Object.entries(raw)) {
-    if (!SECRET_ATTRIBUTES.has(name.toLowerCase())) out[name] = value;
+/**
+ * The raw LDAP view for a caller holding `capabilities`: every attribute
+ * with view:raw_attributes, otherwise null (fields the UI shows by name are
+ * typed fields on the detail responses). Secrets are dropped either way;
+ * normalization already strips them, and this also covers cache rows
+ * written before it did.
+ */
+export function rawAttributesFor(
+  capabilities: readonly string[] | undefined,
+  raw: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!capabilities?.includes('view:raw_attributes')) return null;
+  return Object.fromEntries(Object.entries(raw).filter(([k]) => !isSecretAttr(k)));
+}
+
+/** Read a single string value from a raw LDAP attribute (last value wins). */
+export function rawScalarValue(v: unknown): string | null {
+  if (v === null || v === undefined) return null;
+  if (Array.isArray(v)) {
+    if (v.length === 0) return null;
+    return rawScalarValue(v[v.length - 1]);
+  }
+  if (typeof v === 'string') return v.length > 0 ? v : null;
+  return String(v);
+}
+
+/** Read every string value from a raw LDAP attribute as an array. */
+export function rawArrayValues(v: unknown): string[] {
+  if (v === null || v === undefined) return [];
+  const arr = Array.isArray(v) ? v : [v];
+  const out: string[] = [];
+  for (const x of arr) {
+    if (typeof x === 'string') {
+      if (x.length > 0) out.push(x);
+    } else if (x !== null && x !== undefined) {
+      out.push(String(x));
+    }
   }
   return out;
+}
+
+/** An LDAP boolean (`TRUE`/`FALSE`, last value wins) from a raw attribute. */
+export function rawFlag(v: unknown): boolean {
+  const value = Array.isArray(v) ? v[v.length - 1] : v;
+  return typeof value === 'string' ? value.toUpperCase() === 'TRUE' : value === true;
 }

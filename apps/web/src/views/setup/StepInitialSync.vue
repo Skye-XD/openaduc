@@ -6,8 +6,10 @@ import Message from 'primevue/message';
 import ProgressBar from 'primevue/progressbar';
 import { api, type InitialSyncJob } from '../../api/index.js';
 import { ApiError } from '../../api/client.js';
+import { useAuthStore } from '../../stores/auth.js';
 
 const emit = defineEmits<{ complete: [job: InitialSyncJob] }>();
+const auth = useAuthStore();
 
 const job = ref<InitialSyncJob | null>(null);
 const starting = ref(false);
@@ -60,7 +62,7 @@ function statSummary(stats: Record<string, unknown> | null): string {
 
 async function poll(): Promise<void> {
   try {
-    const result = await api.setup.initialSyncStatus();
+    const result = await api.setup.initialSyncStatus({ background: true });
     job.value = result.job;
     if (result.job?.status === 'succeeded') {
       stopPolling();
@@ -116,6 +118,7 @@ async function start(): Promise<void> {
     attachUnloadGuard();
     schedulePoll();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, start)) return;
     startError.value =
       err instanceof ApiError
         ? err.message
@@ -138,6 +141,7 @@ async function retry(): Promise<void> {
       schedulePoll();
     }
   } catch (err) {
+    if (auth.retryAfterStepUp(err, retry)) return;
     startError.value =
       err instanceof ApiError ? err.message : err instanceof Error ? err.message : 'Retry failed';
   } finally {

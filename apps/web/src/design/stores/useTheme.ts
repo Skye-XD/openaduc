@@ -8,6 +8,11 @@ export type AccentName = 'cyan' | 'violet' | 'emerald' | 'amber' | 'rose' | 'blu
 
 const STORAGE_KEY = 'openaduc:theme';
 
+// A directory list's row height. Its virtual scroller needs the height as a
+// number, so it's set here and handed to CSS as --list-row-h. Every row is
+// tall enough for an avatar beside a name and a second line.
+export const LIST_ROW_HEIGHT: Record<Density, number> = { compact: 40, balanced: 48, comfy: 56 };
+
 interface AccentTokens {
   color: string;
   soft: string;
@@ -60,7 +65,13 @@ export const ACCENTS: Record<AccentName, AccentTokens> = {
 // pure white renders as pale and washes out — these shades (roughly tailwind
 // 600/700) keep accent text legible and primary buttons readable.
 const ACCENTS_LIGHT: Record<AccentName, AccentTokens> = {
-  cyan: { color: '#0891b2', soft: 'rgba(8, 145, 178, 0.12)', text: '#0e7490', contrast: '#ffffff' },
+  // cyan-700: white text on cyan-600 is only 3.7:1.
+  cyan: {
+    color: '#0e7490',
+    soft: 'rgba(14, 116, 144, 0.12)',
+    text: '#0b6b85',
+    contrast: '#ffffff',
+  },
   blue: { color: '#1d4ed8', soft: 'rgba(29, 78, 216, 0.10)', text: '#1e40af', contrast: '#ffffff' },
   violet: {
     color: '#6d28d9',
@@ -87,6 +98,9 @@ interface PersistedShape {
   // Active Directory Users and Computers MMC look-and-feel instead of the
   // modern views. See apps/web/src/oldschool/.
   oldSchool?: boolean;
+  // Single-key shortcuts (/, j, k, u, ?…). WCAG 2.1.4: they can get in the
+  // way of speech input, so the operator can turn them off.
+  singleKeyShortcuts?: boolean;
 }
 
 function readPersisted(): PersistedShape {
@@ -116,12 +130,14 @@ export const useThemeStore = defineStore('theme', () => {
   const accent = ref<AccentName>(persisted.accent ?? 'cyan');
   const sidebarCollapsed = ref<boolean>(persisted.sidebarCollapsed ?? false);
   const oldSchool = ref<boolean>(persisted.oldSchool ?? false);
+  const singleKeyShortcuts = ref<boolean>(persisted.singleKeyShortcuts ?? true);
 
   // Resolve tokens for the *active* mode — light gets the darker
   // shades, dark gets the bright ones. Same accent name, two palettes.
   const accentTokens = computed<AccentTokens>(() =>
     mode.value === 'light' ? ACCENTS_LIGHT[accent.value] : ACCENTS[accent.value],
   );
+  const listRowHeight = computed(() => LIST_ROW_HEIGHT[density.value]);
 
   // Apply theme/density classes and accent vars to <html> and <body> whenever
   // any of these change. Persist to localStorage in the same effect.
@@ -137,6 +153,7 @@ export const useThemeStore = defineStore('theme', () => {
 
     body.classList.remove('density-compact', 'density-balanced', 'density-comfy');
     body.classList.add(`density-${density.value}`);
+    html.style.setProperty('--list-row-h', `${listRowHeight.value}px`);
 
     // Old School flag — exposed as a class on <html> so the MMC stylesheet
     // can scope itself and the surrounding shell can dim its chrome.
@@ -158,6 +175,7 @@ export const useThemeStore = defineStore('theme', () => {
       accent: accent.value,
       sidebarCollapsed: sidebarCollapsed.value,
       oldSchool: oldSchool.value,
+      singleKeyShortcuts: singleKeyShortcuts.value,
     });
   });
 
@@ -189,7 +207,9 @@ export const useThemeStore = defineStore('theme', () => {
     accent,
     sidebarCollapsed,
     oldSchool,
+    singleKeyShortcuts,
     accentTokens,
+    listRowHeight,
     setMode,
     toggleMode,
     setDensity,

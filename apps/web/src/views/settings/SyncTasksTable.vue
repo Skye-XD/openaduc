@@ -9,6 +9,7 @@ import cronstrue from 'cronstrue';
 import { useToast } from 'primevue/usetoast';
 import {
   api,
+  type Background,
   type MonthlyDay,
   type ScheduleKind,
   type SyncTaskKey,
@@ -18,8 +19,10 @@ import {
 } from '../../api/index.js';
 import { ApiError } from '../../api/client.js';
 import { fmtRelative } from '../../design/lib/format.js';
+import { useAuthStore } from '../../stores/auth.js';
 
 const props = defineProps<{ directoryId: number; canEdit: boolean }>();
+const auth = useAuthStore();
 
 const tasks = ref<SyncTaskSummary[]>([]);
 const loading = ref(true);
@@ -41,12 +44,14 @@ const queuePending = ref<Set<SyncTaskKey>>(new Set());
 let burstPollHandle: ReturnType<typeof setInterval> | null = null;
 let burstPollUntil = 0;
 
-async function load(): Promise<void> {
+// Polls pass background: they don't keep the operator's elevated session
+// alive.
+async function load(opts: Background = {}): Promise<void> {
   loading.value = true;
   try {
     const [list, queue] = await Promise.all([
-      api.directories.syncTasks.list(props.directoryId),
-      api.directories.syncTasks.queue(props.directoryId).catch(() => ({
+      api.directories.syncTasks.list(props.directoryId, opts),
+      api.directories.syncTasks.queue(props.directoryId, opts).catch(() => ({
         // Queue endpoint might not be available on older API builds —
         // soft-fail so the table still loads.
         inFlight: [] as SyncTaskKey[],
@@ -77,7 +82,7 @@ let pollHandle: ReturnType<typeof setInterval> | null = null;
 watch([anyRunning, anyQueued], ([running, queued]) => {
   const shouldPoll = running || queued;
   if (shouldPoll && pollHandle === null) {
-    pollHandle = setInterval(() => void load(), 3000);
+    pollHandle = setInterval(() => void load({ background: true }), 3000);
   } else if (!shouldPoll && pollHandle !== null) {
     clearInterval(pollHandle);
     pollHandle = null;
@@ -96,7 +101,7 @@ function startBurstPoll(): void {
   burstPollUntil = Date.now() + 30_000;
   if (burstPollHandle !== null) return;
   burstPollHandle = setInterval(() => {
-    void load();
+    void load({ background: true });
     if (Date.now() > burstPollUntil) {
       if (burstPollHandle !== null) {
         clearInterval(burstPollHandle);
@@ -127,6 +132,7 @@ async function runNow(t: SyncTaskSummary): Promise<void> {
     startBurstPoll();
     void load();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, () => runNow(t))) return;
     toast.add({
       severity: 'error',
       summary: 'Could not queue task',
@@ -181,6 +187,7 @@ async function resetStuck(t: SyncTaskSummary): Promise<void> {
     toast.add({ severity: 'success', summary: 'Task reset', life: 2500 });
     await load();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, () => resetStuck(t))) return;
     toast.add({
       severity: 'error',
       summary: 'Could not reset task',
@@ -451,6 +458,7 @@ async function saveEdit(): Promise<void> {
     editOpen.value = false;
     await load();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, saveEdit)) return;
     editError.value = err instanceof ApiError ? err.message : 'Save failed';
   } finally {
     editSaving.value = false;
@@ -601,7 +609,7 @@ function anchorTimeToDate(value: string): Date | null {
         size="small"
         severity="secondary"
         outlined
-        @click="load"
+        @click="load()"
       />
     </div>
     <p v-if="loading && tasks.length === 0" class="hint">Loading tasks…</p>
@@ -675,7 +683,7 @@ function anchorTimeToDate(value: string): Date | null {
               outlined
               size="small"
               title="Reset stuck task"
-              @click="resetStuck(t)"
+              @click="auth.requireStepUp(() => resetStuck(t))"
             />
             <Button
               v-if="canEdit"
@@ -685,7 +693,7 @@ function anchorTimeToDate(value: string): Date | null {
               outlined
               title="Run now"
               :disabled="t.lastStatus === 'running' || queuing.has(t.taskKey)"
-              @click="runNow(t)"
+              @click="auth.requireStepUp(() => runNow(t))"
             />
             <Button
               v-if="canEdit"

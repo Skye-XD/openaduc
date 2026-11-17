@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
-import { pruneComputers, upsertComputer } from '../../computerCache.js';
+import { markComputersStale, upsertComputer } from '../../computerCache.js';
 import type { RunnerContext, RunnerResult } from '../types.js';
+import { shouldMarkStale } from './fullCrawl.js';
 
 /**
  * Full computer crawl + stale-mark for unseen rows. Daily reconciliation
@@ -24,17 +25,15 @@ export async function runComputersFull(ctx: RunnerContext): Promise<RunnerResult
     }
   }
 
-  // Same fail-loud guard as computers.delta — a systemic write failure
-  // shouldn't masquerade as a successful empty crawl.
-  if (total > 0 && seen.size === 0) {
-    const message = lastError instanceof Error ? lastError.message : 'every computer upsert failed';
-    throw new Error(`computers.full: 0 of ${total} entries written — ${message}`);
+  const crawl = { found: total, written: seen.size, lastError };
+  if (
+    await shouldMarkStale(ctx, { kind: 'computers', table: 'computer_cache_records', ...crawl })
+  ) {
+    await markComputersStale(ctx.db, ctx.providerId, seen);
   }
-
-  const pruned = await pruneComputers(ctx.db, ctx.providerId, seen);
 
   return {
     cursor: new Date().toISOString(),
-    stats: { computersSeen: total, computersUpserted: seen.size, computersPruned: pruned },
+    stats: { computersSeen: total, computersUpserted: seen.size },
   };
 }

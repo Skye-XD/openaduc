@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
 import { computed, onMounted, ref, watch, watchEffect } from 'vue';
-import { useRoute, useRouter } from 'vue-router';
+import { RouterLink, useRoute, useRouter } from 'vue-router';
 import DataTable, {
   type DataTablePageEvent,
   type DataTableRowClickEvent,
@@ -11,6 +11,7 @@ import Select from 'primevue/select';
 import Button from 'primevue/button';
 import Message from 'primevue/message';
 import DatePicker from 'primevue/datepicker';
+import { useToast } from 'primevue/usetoast';
 import { api, type AuditEventRow } from '../api/index.js';
 import { useAuthStore } from '../stores/auth.js';
 import PageHeader from '../design/primitives/PageHeader.vue';
@@ -19,7 +20,19 @@ import EmptyState from '../design/primitives/EmptyState.vue';
 import SignInEventsList from '../design/primitives/SignInEventsList.vue';
 import SignInEventDetailDialog from '../design/feedback/SignInEventDetailDialog.vue';
 import AuditEventDialog from '../design/feedback/AuditEventDialog.vue';
-import type { MfaRegistrationRow, MfaRegistrationStatus, SignInEventApp } from '@openaduc/shared';
+import AuditBulkEvents from '../design/primitives/AuditBulkEvents.vue';
+import BulkJobPanel from '../design/feedback/BulkJobPanel.vue';
+import BulkRevertDialog from '../design/feedback/BulkRevertDialog.vue';
+import { useBulkActions } from '../design/composables/useBulkActions.js';
+import { useBulkJobRevert } from '../design/composables/useBulkJobRevert.js';
+import { describeBulkEntry } from '../design/lib/bulkJob.js';
+import { resultBadge } from '../design/lib/auditResult.js';
+import {
+  IMPORT_JOB_ACTION,
+  type MfaRegistrationRow,
+  type MfaRegistrationStatus,
+  type SignInEventApp,
+} from '@openaduc/shared';
 import { fmtAbsolute, fmtRelative } from '../design/lib/format.js';
 
 // Three tabs: 'log' (local audit trail of admin/operator actions),
@@ -272,7 +285,11 @@ async function load(): Promise<void> {
   loading.value = true;
   error.value = null;
   try {
-    const params: Record<string, string | number> = { page: page.value, pageSize: pageSize.value };
+    const params: Record<string, string | number> = {
+      page: page.value,
+      pageSize: pageSize.value,
+      groupBulk: 1,
+    };
     if (action.value.trim()) params.action = action.value.trim();
     if (result.value !== 'all') params.result = result.value;
     if (correlationId.value.trim()) params.correlationId = correlationId.value.trim();
@@ -306,24 +323,64 @@ function onPage(ev: DataTablePageEvent): void {
   void load();
 }
 
-function resultBadge(r: string): string {
-  if (r === 'success') return 'badge-green';
-  if (r === 'failure' || r === 'denied') return 'badge-red';
-  return 'badge-muted';
-}
-
 // Clicking a row opens the detail modal. We pass the full row through so the
 // dialog can render every field (actor, request context, target, before/after,
 // metadata) without a second round-trip.
 const detailEvent = ref<AuditEventRow | null>(null);
 const detailOpen = ref(false);
 
-function openDetail(ev: DataTableRowClickEvent): void {
-  detailEvent.value = ev.data as AuditEventRow;
+function openEvent(event: AuditEventRow): void {
+  detailEvent.value = event;
   detailOpen.value = true;
 }
 
-onMounted(load);
+// A bulk job's entry opens to list its events instead.
+const expandedRows = ref<Record<string, boolean>>({});
+
+function toggleBulk(row: AuditEventRow): void {
+  const next = { ...expandedRows.value };
+  if (next[row.id]) delete next[row.id];
+  else next[row.id] = true;
+  expandedRows.value = next;
+}
+
+function openDetail(ev: DataTableRowClickEvent): void {
+  const row = ev.data as AuditEventRow;
+  if (row.bulk) toggleBulk(row);
+  else openEvent(row);
+}
+
+const bulkEntry = (row: AuditEventRow) => describeBulkEntry(row.bulk!, row.actorDisplayName);
+/**
+ * An import's results page, which only the operator who ran it can open,
+ * or its class roster, which anyone who may issue a TAP can.
+ */
+const importResults = (row: AuditEventRow) => {
+  if (row.bulk?.action !== IMPORT_JOB_ACTION || row.bulkJobId === null) return null;
+  if (row.actorUserId === auth.actor?.actorId) {
+    return { name: 'user-import-job', params: { id: row.bulkJobId } };
+  }
+  return row.bulk.subject?.import?.classTap && auth.hasCapability('write:user.issueTap')
+    ? { name: 'user-import-roster', params: { id: row.bulkJobId } }
+    : null;
+};
+
+const revertBulk = useBulkActions({ selectedIds: ref(new Set()), toast: useToast(), reload: load });
+const { job: revertJob, busy: revertBusy, jobFailure: revertFailure } = revertBulk;
+const revert = useBulkJobRevert({ bulk: revertBulk });
+
+function openRevert(row: AuditEventRow): void {
+  void revert.open({
+    jobId: row.bulkJobId!,
+    title: bulkEntry(row).title,
+    action: row.bulk!.action,
+  });
+}
+
+onMounted(() => {
+  void load();
+  revert.restore();
+});
 </script>
 
 <template>
@@ -395,6 +452,17 @@ onMounted(load);
 
       <Message v-if="error" severity="error" :closable="false">{{ error }}</Message>
 
+      <BulkJobPanel
+        v-if="revertJob"
+        :job="revertJob"
+        :failure="revertFailure"
+        :busy="revertBusy"
+        @stop="revertBulk.stopJob"
+        @continue="revertBulk.continueJob"
+        @retry="revertBulk.retryFailed"
+        @dismiss="revertBulk.dismissJob"
+      />
+
       <DataTable
         :value="rows"
         :loading="loading"
@@ -405,6 +473,7 @@ onMounted(load);
         :first="(page - 1) * pageSize"
         :rows-per-page-options="[25, 50, 100, 200]"
         data-key="id"
+        :expanded-rows="expandedRows"
         class="audit-table"
         @page="onPage"
         @row-click="openDetail"
@@ -440,6 +509,22 @@ onMounted(load);
             </template>
           </EmptyState>
         </template>
+        <Column :style="{ width: '36px' }">
+          <template #body="{ data }">
+            <button
+              v-if="data.bulk"
+              type="button"
+              class="bulk-toggle"
+              :aria-expanded="!!expandedRows[data.id]"
+              :aria-label="
+                expandedRows[data.id] ? 'Hide the job’s events' : 'Show the job’s events'
+              "
+              @click.stop="toggleBulk(data)"
+            >
+              <i :class="expandedRows[data.id] ? 'pi pi-chevron-down' : 'pi pi-chevron-right'" />
+            </button>
+          </template>
+        </Column>
         <Column header="Time" :style="{ width: '170px' }">
           <template #body="{ data }">
             <div class="time-cell">
@@ -468,7 +553,32 @@ onMounted(load);
         </Column>
         <Column header="Target" :style="{ minWidth: '200px' }">
           <template #body="{ data }">
-            <span v-if="data.targetDn" class="dn-cell mono">{{ data.targetDn }}</span>
+            <div v-if="data.bulk" class="bulk-cell">
+              <span class="bulk-title">{{ bulkEntry(data).title }}</span>
+              <span v-if="bulkEntry(data).reverted" class="bulk-reverted">
+                {{ bulkEntry(data).reverted }}
+              </span>
+              <RouterLink
+                v-if="importResults(data)"
+                :to="importResults(data)!"
+                class="bulk-results"
+                @click.stop
+                >{{
+                  importResults(data)!.name === 'user-import-roster' ? 'Class roster' : 'Results'
+                }}</RouterLink
+              >
+              <Button
+                v-if="revert.canRevert(data.bulk)"
+                label="Revert"
+                icon="pi pi-undo"
+                size="small"
+                severity="secondary"
+                text
+                class="bulk-revert"
+                @click.stop="openRevert(data)"
+              />
+            </div>
+            <span v-else-if="data.targetDn" class="dn-cell mono">{{ data.targetDn }}</span>
             <span v-else-if="data.targetType" class="cell-muted"
               >{{ data.targetType
               }}{{ data.targetId ? `:${data.targetId.slice(0, 8)}…` : '' }}</span
@@ -476,9 +586,17 @@ onMounted(load);
             <span v-else class="cell-muted">—</span>
           </template>
         </Column>
-        <Column header="Result" :style="{ width: '110px' }">
+        <Column header="Result" :style="{ minWidth: '110px' }">
           <template #body="{ data }">
-            <span class="badge" :class="resultBadge(data.result)">
+            <span
+              v-if="data.bulk && bulkEntry(data).outcome"
+              class="badge bulk-outcome"
+              :class="`badge-${bulkEntry(data).tone}`"
+            >
+              <span class="badge-dot" />
+              {{ bulkEntry(data).outcome }}
+            </span>
+            <span v-else class="badge" :class="resultBadge(data.result)">
               <span class="badge-dot" />
               {{ data.result }}
             </span>
@@ -490,9 +608,13 @@ onMounted(load);
             <span v-else class="cell-muted">—</span>
           </template>
         </Column>
+        <template #expansion="{ data }">
+          <AuditBulkEvents :bulk-job-id="data.bulkJobId" @select="openEvent" />
+        </template>
       </DataTable>
 
       <AuditEventDialog v-model:visible="detailOpen" :event="detailEvent" />
+      <BulkRevertDialog :workflow="revert" />
     </div>
 
     <!-- Sign-ins tab — filterable view of cached Entra events. -->
@@ -738,48 +860,6 @@ onMounted(load);
   gap: 12px;
 }
 
-/* Tab strip mirrors SettingsView for visual consistency. */
-.ds-tabs {
-  display: flex;
-  gap: 2px;
-  border-bottom: 1px solid var(--border);
-}
-
-.ds-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  background: transparent;
-  border: 0;
-  padding: 9px 14px;
-  color: var(--text-3);
-  font-size: 13px;
-  font-weight: 500;
-  cursor: pointer;
-  position: relative;
-  border-radius: 6px 6px 0 0;
-  font-family: var(--font-sans);
-}
-
-.ds-tab:hover {
-  color: var(--text);
-}
-
-.ds-tab.active {
-  color: var(--text);
-}
-
-.ds-tab.active::after {
-  content: '';
-  position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: -1px;
-  height: 2px;
-  background: var(--accent);
-  border-radius: 2px;
-}
-
 .audit-log-section,
 .audit-signin-section,
 .audit-mfa-section {
@@ -937,5 +1017,41 @@ onMounted(load);
 
 :deep(.audit-table .p-datatable-tbody > tr) {
   cursor: pointer;
+}
+
+.bulk-toggle {
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  padding: 2px 4px;
+}
+
+.bulk-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.bulk-title {
+  font-weight: 500;
+}
+
+.bulk-reverted {
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.bulk-results {
+  font-size: 12px;
+}
+
+.bulk-revert {
+  margin-left: -8px;
+}
+
+.bulk-outcome {
+  white-space: nowrap;
 }
 </style>

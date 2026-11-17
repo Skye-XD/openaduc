@@ -7,9 +7,16 @@ export function buildLoggerOptions(env: Env): LoggerOptions {
     level: env.LOG_LEVEL,
     redact: {
       paths: [
-        'password',
-        '*.password',
-        '*.*.password',
+        ...[
+          'password',
+          'newPassword',
+          'adminPassword',
+          'bindPassword',
+          'actorPassword',
+          'elevatedPassword',
+          'clientSecret',
+          'temporaryAccessPass',
+        ].flatMap((key) => [key, `*.${key}`, `*.*.${key}`]),
         'unicodePwd',
         '*.unicodePwd',
         'authorization',

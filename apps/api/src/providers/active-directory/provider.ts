@@ -1,5 +1,29 @@
 // SPDX-License-Identifier: BUSL-1.1
-import { Attribute, Change, EqualityFilter, type Client, type Entry, type Filter } from 'ldapts';
+import {
+  USAGE_LOCATION_ATTRIBUTE,
+  type ImportPerson,
+  type LdapTlsMode,
+  type NamingLookups,
+  type OuName,
+  type TakenNames,
+  type UserCreateStep,
+  escapeRdnValueRfc,
+  isDnWithin,
+} from '@openaduc/shared';
+import {
+  Attribute,
+  Change,
+  ConstraintViolationError,
+  AlreadyExistsError,
+  EqualityFilter,
+  OrFilter,
+  InsufficientAccessError,
+  NotAllowedOnNonLeafError,
+  UnwillingToPerformError,
+  type Client,
+  type Entry,
+  type Filter,
+} from 'ldapts';
 import type {
   AuthResult,
   AuthenticateInput,
@@ -15,26 +39,53 @@ import type {
   DirectoryGroupPolicy,
   DirectoryGroupPolicyLink,
   DirectoryObjectIdentifier,
+  DirectoryObjectRef,
   DirectoryOu,
   DirectoryProvider,
   DirectoryGroupSearchQuery,
   DirectoryUser,
+  UserTokenGroups,
   DirectoryUserSearchQuery,
+  GroupCreateInput,
   MutationResult,
+  NameHolders,
+  NewObjectNames,
   OuAttributePatch,
+  PeopleLookups,
   RecycleBinStatus,
   ResetPasswordInput,
   RestoreResult,
   RestoreUserInput,
   SyncInput,
   UserAttributePatch,
+  UserCreateFinish,
+  GroupsStepResult,
   UserCreateInput,
-  GroupCreateInput,
+  UserCreateResult,
+  AccountFingerprint,
+  UserRenameInput,
   WriteContext,
 } from '../types.js';
-import { StepUpBindFailedError } from '../types.js';
-import { type ClientConfig, withFailover } from './client.js';
-import { ShowDeletedControl, deletedObjectControls } from './controls.js';
+import { DirectoryUnavailableError, StepUpBindFailedError } from '../types.js';
+import {
+  type ClientConfig,
+  describeConnectionError,
+  certificateProblemMessage,
+  isDirectoryUnreachable,
+  withFailover,
+} from './client.js';
+import { ShowDeletedControl, TreeDeleteControl, deletedObjectControls } from './controls.js';
+import { withAllMembers } from './memberRange.js';
+import { planUserRename } from './rename.js';
+import { describeDeleteBlock, userDeleteBlockReason } from '../../lib/userDeletion.js';
+import {
+  describeGroupDeleteBlock,
+  groupDeleteBlock,
+  type GroupDeleteFacts,
+} from '../../lib/groupDeletion.js';
+import type { RoleGroup } from '../../lib/groupPrivilege.js';
+import { isDomainSid, ridOf } from '../../lib/sid.js';
+import { computerWriteBlock, describeComputerWriteBlock } from '../../lib/computerWrites.js';
 import {
   BINARY_ATTRS,
   COMPUTER_ATTRS,
@@ -44,17 +95,21 @@ import {
   GPLINK_SCAN_ATTRS,
   GPO_ATTRS,
   GROUP_ATTRS,
+  OBJECT_REF_ATTRS,
   OU_ATTRS,
   USER_ATTRS,
   USER_ATTRS_FULL,
   asString,
   asStringArray,
+  groupTypeValue,
   leafRdn,
+  leafRdnValue,
   normalizeComputer,
   normalizeDeletedComputer,
   normalizeDeletedUser,
   normalizeGroup,
   normalizeGroupPolicy,
+  normalizeObjectRef,
   normalizeOu,
   normalizeUser,
   parentDn,
@@ -62,10 +117,15 @@ import {
 } from './normalize.js';
 import {
   adDurationToMs,
+  dateToFiletime,
+  defaultComputerPassword,
   encodeUnicodePassword,
+  FILETIME_NEVER,
   escapeLdapFilter,
   isLocked,
   objectGuidFromString,
+  objectGuidToString,
+  sidToString,
   UAC,
 } from './utils.js';
 
@@ -80,6 +140,10 @@ const COMPUTER_FILTER_BASE = '(&(objectCategory=computer)(objectClass=computer))
 // directly so the route doesn't need to know how to build that DN — the
 // objectClass filter is already exact enough.
 const GPO_FILTER_BASE = '(objectClass=groupPolicyContainer)';
+/** A schema is extended rarely: what it defines is asked again after this long. */
+const SCHEMA_TTL_MS = 60 * 60_000;
+/** What each directory's schema was found to define, by directory and lDAPDisplayName. */
+const schemaAttributes = new Map<string, { at: number; defined: boolean }>();
 
 /**
  * All inputs the AD provider needs at runtime. Built either from a
@@ -91,6 +155,7 @@ export interface ActiveDirectoryProviderConfig {
   name: string;
   baseDn: string;
   ldapUrls: readonly string[];
+  tlsMode: LdapTlsMode;
   tlsRejectUnauthorized: boolean;
   tlsCaPath?: string | undefined;
   operationTimeoutMs: number;
@@ -117,10 +182,41 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     this.config = config;
     this.clientConfig = {
       ldapUrls: config.ldapUrls,
+      tlsMode: config.tlsMode,
       tlsRejectUnauthorized: config.tlsRejectUnauthorized,
       tlsCaPath: config.tlsCaPath,
       operationTimeoutMs: config.operationTimeoutMs,
     };
+  }
+
+  /**
+   * Bind as the operator on the first reachable DC and run `fn`. A refused
+   * bind is `permission_denied`; no reachable DC at all is
+   * `directory_error`. Once bound, `fn` must return its failures rather than
+   * throw, so a half-done write is never retried against another DC.
+   */
+  private async asOperator<T>(
+    ctx: WriteContext,
+    fn: (client: Client) => Promise<T>,
+  ): Promise<T | MutationResult> {
+    try {
+      return await withFailover(this.clientConfig, async (client) => {
+        try {
+          await client.bind(ctx.actorUsername, ctx.actorPassword);
+        } catch (err) {
+          if (isDirectoryUnreachable(err)) throw err;
+          return {
+            ok: false,
+            reason: 'permission_denied',
+            errorMessage: 'step-up bind failed',
+          } satisfies MutationResult;
+        }
+        return fn(client);
+      });
+    } catch (err) {
+      if (!(err instanceof DirectoryUnavailableError)) throw err;
+      return { ok: false, reason: 'directory_error', errorMessage: err.message };
+    }
   }
 
   // ---- Connection / auth -------------------------------------------------
@@ -170,10 +266,11 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         try {
           await client.bind(username, input.password);
         } catch (bindErr) {
+          // No answer from this DC: throw so withFailover tries the next.
+          if (isDirectoryUnreachable(bindErr)) throw bindErr;
           // Surface the actual reason. AD encodes a subcode in the error
           // text (e.g. "data 52e") that distinguishes wrong-password from
-          // user-not-found / disabled / expired / locked. Network or TLS
-          // failures look different at the JS error level (no LDAP code).
+          // user-not-found / disabled / expired / locked.
           return classifyBindError(bindErr);
         }
         try {
@@ -231,7 +328,9 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
       return {
         ok: false,
         reason: 'directory_error',
-        errorMessage: err instanceof Error ? err.message : 'directory error',
+        errorMessage:
+          certificateProblemMessage(err) ??
+          `cannot reach directory: ${describeConnectionError(err)}`,
       };
     }
   }
@@ -248,6 +347,22 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
    * throwing — user detail rendering shouldn't break because we couldn't
    * read maxPwdAge.
    */
+  async getPsoLockoutDuration(psoDn: string): Promise<number | null> {
+    try {
+      return await this.withServiceBind(async (client) => {
+        const { searchEntries } = await client.search(psoDn, {
+          scope: 'base',
+          filter: '(objectClass=msDS-PasswordSettings)',
+          attributes: ['msDS-LockoutDuration'],
+        });
+        return adDurationToMs(asString(searchEntries[0]?.['msDS-LockoutDuration']));
+      });
+    } catch {
+      // By default only Domain Admins can read PSOs.
+      return null;
+    }
+  }
+
   async getDomainPolicy(): Promise<DirectoryDomainPolicy> {
     const now = Date.now();
     if (this.domainPolicyCache && this.domainPolicyCache.expiresAt > now) {
@@ -265,6 +380,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
             'maxPwdAge',
             'minPwdLength',
             'pwdHistoryLength',
+            'pwdProperties',
           ],
         });
         const root: Entry = searchEntries[0] ?? ({} as Entry);
@@ -274,6 +390,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
           const n = Number.parseInt(s, 10);
           return Number.isFinite(n) ? n : null;
         };
+        const pwdProperties = intAttr(root['pwdProperties']);
         return {
           lockoutDurationMs: adDurationToMs(asString(root['lockoutDuration'])),
           lockoutThreshold: intAttr(root['lockoutThreshold']),
@@ -281,6 +398,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
           maxPwdAgeMs: adDurationToMs(asString(root['maxPwdAge'])),
           minPwdLength: intAttr(root['minPwdLength']),
           pwdHistoryLength: intAttr(root['pwdHistoryLength']),
+          complexityRequired: pwdProperties === null ? null : (pwdProperties & 1) === 1,
         } satisfies DirectoryDomainPolicy;
       });
       this.domainPolicyCache = {
@@ -297,11 +415,20 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         maxPwdAgeMs: null,
         minPwdLength: null,
         pwdHistoryLength: null,
+        complexityRequired: null,
       };
     }
   }
 
   // ---- Reads -------------------------------------------------------------
+
+  async findObject(identifier: DirectoryObjectIdentifier): Promise<DirectoryObjectRef | null> {
+    return this.withServiceBind(async (client) => {
+      const filter = identifierToFilter(identifier, '(objectClass=*)');
+      const entry = await this.searchOne(client, this.config.baseDn, filter, OBJECT_REF_ATTRS);
+      return entry ? normalizeObjectRef(entry) : null;
+    });
+  }
 
   async getUser(identifier: DirectoryObjectIdentifier): Promise<DirectoryUser | null> {
     return this.withServiceBind(async (client) => {
@@ -346,7 +473,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         explicitBufferAttributes: BINARY_ATTRS,
         paged: { pageSize: query.pageSize ?? 200 },
       });
-      return searchEntries.map(normalizeGroup);
+      return normalizeGroups(client, searchEntries);
     });
   }
 
@@ -366,7 +493,37 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         attributes: GROUP_ATTRS,
         explicitBufferAttributes: BINARY_ATTRS,
       });
-      return searchEntries.map(normalizeGroup);
+      return normalizeGroups(client, searchEntries);
+    });
+  }
+
+  async getUserTokenGroups(userId: DirectoryObjectIdentifier): Promise<UserTokenGroups | null> {
+    return this.withServiceBind(async (client) => {
+      const entry = await this.findUserEntry(client, userId, ['distinguishedName']);
+      if (!entry) return null;
+      // tokenGroups is constructed, so AD computes it only for a base search.
+      const { searchEntries } = await client.search(entry.dn, {
+        scope: 'base',
+        filter: '(objectClass=*)',
+        attributes: ['tokenGroups'],
+        explicitBufferAttributes: ['tokenGroups'],
+      });
+      const raw = searchEntries[0]?.tokenGroups;
+      const sids = (Array.isArray(raw) ? raw : raw ? [raw] : [])
+        .filter((v): v is Buffer => Buffer.isBuffer(v))
+        .map(sidToString);
+      if (sids.length === 0) return null;
+      // From the domain's root, not the base DN: Domain Admins and
+      // CN=Builtin sit outside an OU base. The string form of the SID is
+      // what AD and Samba both take; Samba doesn't match a domain SID
+      // written as escaped bytes.
+      const { searchEntries: groups } = await client.search(await this.domainRoot(client), {
+        scope: 'sub',
+        filter: `(&${GROUP_FILTER_BASE}(|${sids.map((sid) => `(objectSid=${sid})`).join('')}))`,
+        attributes: GROUP_ATTRS.filter((a) => a !== 'member' && a !== 'memberOf'),
+        explicitBufferAttributes: BINARY_ATTRS,
+      });
+      return { sids, groups: groups.map(normalizeGroup) };
     });
   }
 
@@ -426,7 +583,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         attributes: GROUP_ATTRS,
         explicitBufferAttributes: BINARY_ATTRS,
       });
-      return searchEntries.map(normalizeGroup);
+      return normalizeGroups(client, searchEntries);
     });
   }
 
@@ -499,11 +656,31 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     yield* this.streamSearch(filter, USER_ATTRS_FULL, input.pageSize ?? 500, normalizeUser);
   }
 
+  async *syncGroupMembers(groupDn: string): AsyncIterable<DirectoryUser> {
+    const filter = `(&${USER_FILTER_BASE}(memberOf=${escapeLdapFilter(groupDn)}))`;
+    yield* this.streamSearch(filter, USER_ATTRS_FULL, 500, normalizeUser);
+  }
+
+  async *syncLockedUsers(): AsyncIterable<DirectoryUser> {
+    // LDAP can't filter on the constructed lockout bit, so narrow by
+    // lockoutTime and keep only accounts whose lockout is still in effect.
+    const filter = `(&${USER_FILTER_BASE}(lockoutTime>=1))`;
+    for await (const user of this.streamSearch(filter, USER_ATTRS, 500, normalizeUser)) {
+      if (user.locked) yield user;
+    }
+  }
+
   async *syncGroups(input: SyncInput): AsyncIterable<DirectoryGroup> {
     const filter = input.modifiedSince
       ? `(&${GROUP_FILTER_BASE}(whenChanged>=${formatGeneralizedTime(input.modifiedSince)}))`
       : GROUP_FILTER_BASE;
-    yield* this.streamSearch(filter, GROUP_ATTRS, input.pageSize ?? 500, normalizeGroup);
+    yield* this.streamSearch(
+      filter,
+      GROUP_ATTRS,
+      input.pageSize ?? 500,
+      normalizeGroup,
+      withAllMembers,
+    );
   }
 
   async *syncComputers(input: SyncInput): AsyncIterable<DirectoryComputer> {
@@ -526,16 +703,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   async unlockUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult> {
     // Write-as-user model: bind as the operator using the password they
     // re-supplied for this action, perform the modify, then drop the bind.
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return {
-          ok: false,
-          reason: 'permission_denied',
-          errorMessage: 'step-up bind failed',
-        };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         // Resolve the target's DN. Service bind would also work; using the
         // operator bind keeps the entire operation in one identity.
@@ -580,77 +748,29 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   }
 
   /**
-   * Set `unicodePwd` to a new value. AD requires this to be a UTF-16LE
-   * encoding of the password wrapped in double quotes, transmitted over
-   * LDAPS (the cleartext-on-the-wire requirement is enforced by AD itself).
-   *
-   * If `forceChangeAtNextLogin` is true, also set `pwdLastSet=0`. AD treats
-   * that as "needs to change on next sign-in".
+   * Set a new password (see passwordChanges), with must-change if
+   * `forceChangeAtNextLogin`. `unlock` also sets `lockoutTime=0`. All of it
+   * is one modify, so it applies or fails whole.
    */
   async resetPassword(
     userId: DirectoryObjectIdentifier,
     input: ResetPasswordInput,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         const target = await this.findUserEntry(client, userId);
         if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
         const before = normalizeUser(target);
 
-        const changes: Change[] = [
-          new Change({
-            operation: 'replace',
-            modification: new Attribute({
-              type: 'unicodePwd',
-              values: [encodeUnicodePassword(input.newPassword)],
-            }),
-          }),
-        ];
-        // "Must change at next logon" (pwdLastSet=0) and "never expires" are
-        // mutually exclusive in AD; never-expires wins, matching ADUC (which
-        // greys out force-change when never-expires is ticked).
-        const neverExpires = input.passwordNeverExpires === true;
-        if (input.forceChangeAtNextLogin && !neverExpires) {
+        const changes = passwordChanges(input.newPassword, input.forceChangeAtNextLogin);
+        if (input.unlock) {
           changes.push(
             new Change({
               operation: 'replace',
-              modification: new Attribute({ type: 'pwdLastSet', values: ['0'] }),
+              modification: new Attribute({ type: 'lockoutTime', values: ['0'] }),
             }),
           );
-        }
-
-        // Optionally set/clear DONT_EXPIRE_PASSWORD in the same modify. Read
-        // the live UAC first so other flags are preserved (same shape as
-        // toggleAccountDisable / setPasswordNeverExpires).
-        if (input.passwordNeverExpires !== undefined) {
-          const currentUacRaw = (target as { userAccountControl?: string | string[] })
-            .userAccountControl;
-          const currentUac = Array.isArray(currentUacRaw)
-            ? currentUacRaw[currentUacRaw.length - 1]
-            : currentUacRaw;
-          const uacNum = currentUac ? Number.parseInt(String(currentUac), 10) : 0;
-          if (Number.isFinite(uacNum)) {
-            const nextUac = neverExpires
-              ? uacNum | UAC.DONT_EXPIRE_PASSWORD
-              : uacNum & ~UAC.DONT_EXPIRE_PASSWORD;
-            if (nextUac !== uacNum) {
-              changes.push(
-                new Change({
-                  operation: 'replace',
-                  modification: new Attribute({
-                    type: 'userAccountControl',
-                    values: [String(nextUac)],
-                  }),
-                }),
-              );
-            }
-          }
         }
 
         await client.modify(before.distinguishedName, changes);
@@ -663,22 +783,17 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
           // audit row carries the "what" without the "how".
           before: {
             passwordLastSetAt: before.passwordLastSetAt?.toISOString() ?? null,
-            passwordNeverExpires: before.passwordNeverExpires,
+            ...(input.unlock ? { locked: before.locked } : {}),
           },
           after: {
             passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null,
-            forceChangeAtNextLogin: input.forceChangeAtNextLogin && !neverExpires,
-            passwordNeverExpires: after?.passwordNeverExpires ?? neverExpires,
+            forceChangeAtNextLogin: input.forceChangeAtNextLogin,
+            // Unknown when the re-read failed; don't claim it's unlocked.
+            ...(input.unlock ? { locked: after ? after.locked : null } : {}),
           },
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isPolicy = /policy|complexity|length|history/i.test(message);
-        return {
-          ok: false,
-          reason: isPolicy ? 'policy_violation' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyPasswordError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
@@ -686,119 +801,164 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   }
 
   enableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult> {
-    return this.toggleAccountDisable(userId, ctx, false);
+    return this.toggleAccountDisable('user', userId, ctx, false);
   }
 
-  disableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult> {
-    return this.toggleAccountDisable(userId, ctx, true);
-  }
-
-  /**
-   * Flip the ACCOUNTDISABLE bit (0x2) of `userAccountControl`. Reads the
-   * current UAC value from the live entry so we don't clobber other bits
-   * (DONT_EXPIRE_PASSWORD, etc).
-   */
-  private async toggleAccountDisable(
+  async setAccountExpiry(
     userId: DirectoryObjectIdentifier,
+    expiresAt: Date | null,
     ctx: WriteContext,
-    disable: boolean,
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         const target = await this.findUserEntry(client, userId);
         if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
         const before = normalizeUser(target);
-        const currentUacRaw = (target as { userAccountControl?: string | string[] })
-          .userAccountControl;
-        const currentUac = Array.isArray(currentUacRaw)
-          ? currentUacRaw[currentUacRaw.length - 1]
-          : currentUacRaw;
-        const uacNum = currentUac ? Number.parseInt(String(currentUac), 10) : 0;
-        if (!Number.isFinite(uacNum)) {
-          return {
-            ok: false,
-            reason: 'directory_error',
-            errorMessage: 'unparseable userAccountControl',
-          };
-        }
-        const nextUac = disable ? uacNum | UAC.ACCOUNTDISABLE : uacNum & ~UAC.ACCOUNTDISABLE;
-        if (nextUac === uacNum) {
-          // Idempotent no-op.
-          return {
-            ok: true,
-            before: { enabled: before.enabled, userAccountControl: uacNum },
-            after: { enabled: before.enabled, userAccountControl: uacNum },
-          };
-        }
-
         await client.modify(
           before.distinguishedName,
           new Change({
             operation: 'replace',
             modification: new Attribute({
-              type: 'userAccountControl',
-              values: [String(nextUac)],
+              type: 'accountExpires',
+              values: [expiresAt ? dateToFiletime(expiresAt) : FILETIME_NEVER],
             }),
           }),
         );
-
         const afterEntry = await this.findUserEntry(client, userId);
         const after = afterEntry ? normalizeUser(afterEntry) : null;
         return {
           ok: true,
-          before: { enabled: before.enabled, userAccountControl: uacNum },
-          after: {
-            enabled: after?.enabled ?? !disable,
-            userAccountControl: nextUac,
-          },
+          before: { accountExpiresAt: before.accountExpiresAt?.toISOString() ?? null },
+          after: after ? { accountExpiresAt: after.accountExpiresAt?.toISOString() ?? null } : {},
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isAuthz = /no write|insuff/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
     });
   }
 
-  /**
-   * Flip the DONT_EXPIRE_PASSWORD bit (0x10000) of `userAccountControl`.
-   * Reads the current UAC from the live entry first so the other flags
-   * (ACCOUNTDISABLE, etc.) are preserved — same read-modify-write shape as
-   * `toggleAccountDisable`. This is the only per-user control over password
-   * expiry: when set, the account's password ignores the domain max-age policy.
-   */
-  async setPasswordNeverExpires(
+  disableUser(userId: DirectoryObjectIdentifier, ctx: WriteContext): Promise<MutationResult> {
+    return this.toggleAccountDisable('user', userId, ctx, true);
+  }
+
+  enableComputer(
+    computerId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.toggleAccountDisable('computer', computerId, ctx, false);
+  }
+
+  disableComputer(
+    computerId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.toggleAccountDisable('computer', computerId, ctx, true);
+  }
+
+  private findAccountEntry(
+    client: Client,
+    kind: AccountKind,
+    identifier: DirectoryObjectIdentifier,
+  ): Promise<Entry | null> {
+    return kind === 'user'
+      ? this.findUserEntry(client, identifier)
+      : this.findComputerEntry(client, identifier);
+  }
+
+  private toggleAccountDisable(
+    kind: AccountKind,
+    id: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+    disable: boolean,
+  ): Promise<MutationResult> {
+    return this.setAccountControlFlag(kind, id, ctx, {
+      flag: UAC.ACCOUNTDISABLE,
+      on: disable,
+      snapshot: (uac) => ({ enabled: (uac & UAC.ACCOUNTDISABLE) === 0 }),
+      refuse: kind === 'computer' && disable ? protectedComputer : undefined,
+    });
+  }
+
+  setPasswordMustChange(
+    userId: DirectoryObjectIdentifier,
+    mustChange: boolean,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.asOperator(ctx, async (client) => {
+      try {
+        const target = await this.findUserEntry(client, userId);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
+        const before = normalizeUser(target);
+        await client.modify(
+          before.distinguishedName,
+          new Change({
+            operation: 'replace',
+            modification: new Attribute({
+              type: 'pwdLastSet',
+              values: [mustChange ? '0' : '-1'],
+            }),
+          }),
+        );
+        const afterEntry = await this.findUserEntry(client, userId);
+        const after = afterEntry ? normalizeUser(afterEntry) : null;
+        return {
+          ok: true,
+          before: {
+            passwordMustChange: before.passwordMustChange,
+            passwordLastSetAt: before.passwordLastSetAt?.toISOString() ?? null,
+          },
+          after: {
+            passwordMustChange: after ? after.passwordMustChange : mustChange,
+            passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null,
+          },
+        };
+      } catch (err) {
+        return classifyWriteError(err);
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  setPasswordNeverExpires(
     userId: DirectoryObjectIdentifier,
     neverExpires: boolean,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
+    return this.setAccountControlFlag('user', userId, ctx, {
+      flag: UAC.DONT_EXPIRE_PASSWORD,
+      on: neverExpires,
+      snapshot: (uac) => ({ passwordNeverExpires: (uac & UAC.DONT_EXPIRE_PASSWORD) !== 0 }),
+    });
+  }
+
+  /**
+   * Set or clear one bit of `userAccountControl`. Reads the current value
+   * from the live entry so we don't clobber the other bits
+   * (DONT_EXPIRE_PASSWORD, WORKSTATION_TRUST_ACCOUNT, etc). Before and
+   * after are the bit as `snapshot` names it, with the whole value.
+   */
+  private async setAccountControlFlag(
+    kind: AccountKind,
+    id: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+    write: {
+      flag: number;
+      on: boolean;
+      snapshot: (uac: number) => Record<string, unknown>;
+      refuse?: ((entry: Entry) => MutationResult | null) | undefined;
+    },
+  ): Promise<MutationResult> {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const target = await this.findUserEntry(client, userId);
-        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
-        const before = normalizeUser(target);
-        const currentUacRaw = (target as { userAccountControl?: string | string[] })
-          .userAccountControl;
-        const currentUac = Array.isArray(currentUacRaw)
-          ? currentUacRaw[currentUacRaw.length - 1]
-          : currentUacRaw;
-        const uacNum = currentUac ? Number.parseInt(String(currentUac), 10) : 0;
+        const target = await this.findAccountEntry(client, kind, id);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: `${kind} not found` };
+        const refused = write.refuse?.(target) ?? null;
+        if (refused) return refused;
+        const dn = asString(target.distinguishedName) ?? target.dn;
+        const uacNum = userAccountControlOf(target);
         if (!Number.isFinite(uacNum)) {
           return {
             ok: false,
@@ -806,108 +966,69 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
             errorMessage: 'unparseable userAccountControl',
           };
         }
-        const nextUac = neverExpires
-          ? uacNum | UAC.DONT_EXPIRE_PASSWORD
-          : uacNum & ~UAC.DONT_EXPIRE_PASSWORD;
+        const nextUac = write.on ? uacNum | write.flag : uacNum & ~write.flag;
+        const before = { ...write.snapshot(uacNum), userAccountControl: uacNum };
         if (nextUac === uacNum) {
           // Idempotent no-op.
-          return {
-            ok: true,
-            before: { passwordNeverExpires: before.passwordNeverExpires },
-            after: { passwordNeverExpires: neverExpires },
-          };
+          return { ok: true, before, after: before };
         }
 
-        await client.modify(
-          before.distinguishedName,
-          new Change({
-            operation: 'replace',
-            modification: new Attribute({
-              type: 'userAccountControl',
-              values: [String(nextUac)],
-            }),
-          }),
-        );
+        await client.modify(dn, accountControlChange(nextUac));
 
-        const afterEntry = await this.findUserEntry(client, userId);
-        const after = afterEntry ? normalizeUser(afterEntry) : null;
+        const afterEntry = await this.findAccountEntry(client, kind, id);
         return {
           ok: true,
-          before: { passwordNeverExpires: before.passwordNeverExpires },
-          after: { passwordNeverExpires: after?.passwordNeverExpires ?? neverExpires },
+          before,
+          after: {
+            ...write.snapshot(afterEntry ? userAccountControlOf(afterEntry) : nextUac),
+            userAccountControl: nextUac,
+          },
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isAuthz = /no write|insuff/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
     });
   }
 
-  /**
-   * Expire the password immediately by setting `pwdLastSet=0`. AD reads that
-   * as "password expired — user must change it at next sign-in". (Same effect
-   * as the Reset Password dialog's "must change at next logon", but standalone
-   * and without setting a new password.) There is no per-user "expires on
-   * date" in AD, so this is the closest thing to forcing expiry now.
-   */
-  async expirePasswordNow(
-    userId: DirectoryObjectIdentifier,
+  async resetComputerAccount(
+    computerId: DirectoryObjectIdentifier,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const target = await this.findUserEntry(client, userId);
-        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
-        const before = normalizeUser(target);
-        // A password that never expires can't be "expired now" in a meaningful
-        // way — AD would just set pwdLastSet=0, but the flag still wins. Surface
-        // that as a policy error so the UI can tell the operator why.
-        if (before.passwordNeverExpires) {
+        const target = await this.findComputerEntry(client, computerId);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'computer not found' };
+        const refused = protectedComputer(target);
+        if (refused) return refused;
+        const before = normalizeComputer(target);
+        if (!before.samAccountName) {
           return {
             ok: false,
-            reason: 'policy_violation',
-            errorMessage: 'password is set to never expire; clear that flag first',
+            reason: 'directory_error',
+            errorMessage: 'computer has no pre-Windows 2000 name',
           };
         }
-
         await client.modify(
           before.distinguishedName,
           new Change({
             operation: 'replace',
-            modification: new Attribute({ type: 'pwdLastSet', values: ['0'] }),
+            modification: new Attribute({
+              type: 'unicodePwd',
+              values: [encodeUnicodePassword(defaultComputerPassword(before.samAccountName))],
+            }),
           }),
         );
-
-        const afterEntry = await this.findUserEntry(client, userId);
-        const after = afterEntry ? normalizeUser(afterEntry) : null;
+        const afterEntry = await this.findComputerEntry(client, computerId);
+        const after = afterEntry ? normalizeComputer(afterEntry) : null;
         return {
           ok: true,
           before: { passwordLastSetAt: before.passwordLastSetAt?.toISOString() ?? null },
-          after: {
-            passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null,
-            forceChangeAtNextLogin: true,
-          },
+          after: { passwordLastSetAt: after?.passwordLastSetAt?.toISOString() ?? null },
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isAuthz = /no write|insuff/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
@@ -929,18 +1050,10 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     patch: UserAttributePatch,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return {
-          ok: false,
-          reason: 'permission_denied',
-          errorMessage: 'step-up bind failed',
-        };
-      }
-      try {
-        const target = await this.findUserEntry(client, userId);
+        // The full read, so the audit snapshot holds attributes outside the curated set.
+        const target = await this.findUserEntry(client, userId, USER_ATTRS_FULL);
         if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
         const before = normalizeUser(target);
 
@@ -953,7 +1066,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
         await client.modify(before.distinguishedName, changes);
 
         // Re-read so the route can return the actual post-write state.
-        const afterEntry = await this.findUserEntry(client, userId);
+        const afterEntry = await this.findUserEntry(client, userId, USER_ATTRS_FULL);
         const after = afterEntry ? normalizeUser(afterEntry) : null;
         return {
           ok: true,
@@ -981,7 +1094,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     groupId: DirectoryObjectIdentifier,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return this.modifyGroupMembership(userId, groupId, ctx, 'add');
+    return this.modifyGroupMembership({ kind: 'user', id: userId }, groupId, ctx, 'add');
   }
 
   removeUserFromGroup(
@@ -989,102 +1102,129 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     groupId: DirectoryObjectIdentifier,
     ctx: WriteContext,
   ): Promise<MutationResult> {
-    return this.modifyGroupMembership(userId, groupId, ctx, 'delete');
+    return this.modifyGroupMembership({ kind: 'user', id: userId }, groupId, ctx, 'delete');
+  }
+
+  addGroupToGroup(
+    memberGroupId: DirectoryObjectIdentifier,
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.modifyGroupMembership({ kind: 'group', id: memberGroupId }, groupId, ctx, 'add');
+  }
+
+  removeGroupFromGroup(
+    memberGroupId: DirectoryObjectIdentifier,
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.modifyGroupMembership({ kind: 'group', id: memberGroupId }, groupId, ctx, 'delete');
   }
 
   /**
-   * Add or remove a user's DN from a group's `member` attribute. Same write-
-   * as-user pattern as the other writes; idempotent (no-op if already in the
-   * desired state).
+   * Add or remove a user's or group's DN from a group's `member` attribute.
+   * Same write-as-user pattern as the other writes; idempotent (no-op if
+   * already in the desired state).
    */
   private async modifyGroupMembership(
-    userId: DirectoryObjectIdentifier,
+    member: { kind: 'user' | 'group'; id: DirectoryObjectIdentifier },
     groupId: DirectoryObjectIdentifier,
     ctx: WriteContext,
     op: 'add' | 'delete',
   ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const userEntry = await this.findUserEntry(client, userId);
-        if (!userEntry) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
-        const groupEntry = await this.findGroupEntry(client, groupId);
+        const memberEntry =
+          member.kind === 'user'
+            ? await this.findUserEntry(client, member.id, ['objectGUID', 'distinguishedName'])
+            : await this.findGroupEntry(client, member.id, ['objectGUID', 'distinguishedName']);
+        if (!memberEntry) {
+          return { ok: false, reason: 'not_found', errorMessage: `${member.kind} not found` };
+        }
+        const groupEntry = await this.findGroupEntry(client, groupId, [
+          'objectGUID',
+          'distinguishedName',
+        ]);
         if (!groupEntry) return { ok: false, reason: 'not_found', errorMessage: 'group not found' };
-        const user = normalizeUser(userEntry);
-        const group = normalizeGroup(groupEntry);
-        const userDnLc = user.distinguishedName.toLowerCase();
-        const isMember = group.memberDns.some((dn) => dn.toLowerCase() === userDnLc);
-
-        if (op === 'add' && isMember) {
-          return {
-            ok: true,
-            before: { isMember: true },
-            after: { isMember: true },
-          };
-        }
-        if (op === 'delete' && !isMember) {
-          return {
-            ok: true,
-            before: { isMember: false },
-            after: { isMember: false },
-          };
-        }
-
-        await client.modify(
-          group.distinguishedName,
-          new Change({
-            operation: op,
-            modification: new Attribute({
-              type: 'member',
-              values: [user.distinguishedName],
-            }),
-          }),
-        );
-
-        return {
-          ok: true,
-          before: { isMember, group: group.distinguishedName, user: user.distinguishedName },
-          after: {
-            isMember: op === 'add',
-            group: group.distinguishedName,
-            user: user.distinguishedName,
-          },
-        };
+        const memberDn = asString(memberEntry.distinguishedName) ?? memberEntry.dn;
+        const groupDn = asString(groupEntry.distinguishedName) ?? groupEntry.dn;
+        const snapshot = (inGroup: boolean) => ({
+          isMember: inGroup,
+          group: groupDn,
+          member: memberDn,
+          memberKind: member.kind,
+        });
+        const wasMember = await this.setMember(client, groupDn, memberDn, op === 'add');
+        return { ok: true, before: snapshot(wasMember), after: snapshot(op === 'add') };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isAuthz = /no write|insuff/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
     });
   }
 
+  /** Make `memberDn` a member of `groupDn` or not; returns whether it was one. */
+  private async setMember(
+    client: Client,
+    groupDn: string,
+    memberDn: string,
+    member: boolean,
+  ): Promise<boolean> {
+    // Ask AD rather than reading `member`, which a large group hands out
+    // in ranges.
+    const { searchEntries } = await client.search(groupDn, {
+      scope: 'base',
+      filter: `(member=${escapeLdapFilter(memberDn)})`,
+      attributes: ['distinguishedName'],
+    });
+    const wasMember = searchEntries.length > 0;
+    if (wasMember !== member) {
+      await client.modify(
+        groupDn,
+        new Change({
+          operation: member ? 'add' : 'delete',
+          modification: new Attribute({ type: 'member', values: [memberDn] }),
+        }),
+      );
+    }
+    return wasMember;
+  }
+
   /**
-   * Move a user to a different OU. AD permits this via modifyDN: keep the
-   * user's existing RDN (the CN=…) but change its parent to `targetOuDn`.
-   * ldapts accepts a full new DN as the second argument and translates it
+   * Move a user or computer to a different OU. AD permits this via
+   * modifyDN: keep the account's existing RDN (the CN=…) but change its
+   * parent to `targetOuDn`. ldapts accepts a full new DN as the second argument and translates it
    * into the wire-level Modify DN request (with `newSuperior` set to the
    * target OU).
    *
-   * Idempotent: if the user is already directly under `targetOuDn`, returns
-   * `ok: true` with a no-op snapshot so the caller doesn't have to special-
+   * Idempotent: if the account is already directly under `targetOuDn`,
+   * returns `ok: true` with a no-op snapshot so the caller doesn't have to special-
    * case the case where someone clicked "Move" without changing the value.
    *
    * `objectGuid` survives a move, so cached IDs (memberships, audit
-   * targetId) remain valid — only the DN changes, which `userLiveRefresh`
-   * will pick up at the route layer.
+   * targetId) remain valid — only the DN changes, which the route re-reads
+   * into the cache.
    */
-  async moveUser(
+  moveUser(
     userId: DirectoryObjectIdentifier,
+    targetOuDn: string,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.moveAccount('user', userId, targetOuDn, ctx);
+  }
+
+  moveComputer(
+    computerId: DirectoryObjectIdentifier,
+    targetOuDn: string,
+    ctx: WriteContext,
+  ): Promise<MutationResult> {
+    return this.moveAccount('computer', computerId, targetOuDn, ctx);
+  }
+
+  private async moveAccount(
+    kind: AccountKind,
+    id: DirectoryObjectIdentifier,
     targetOuDn: string,
     ctx: WriteContext,
   ): Promise<MutationResult> {
@@ -1092,50 +1232,39 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     if (!trimmedTarget) {
       return { ok: false, reason: 'directory_error', errorMessage: 'empty target OU' };
     }
-    return withFailover(this.clientConfig, async (client) => {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const target = await this.findUserEntry(client, userId);
-        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
-        const before = normalizeUser(target);
-        const currentParent = parentDn(before.distinguishedName);
+        const target = await this.findAccountEntry(client, kind, id);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: `${kind} not found` };
+        const refused = kind === 'computer' ? protectedComputer(target) : null;
+        if (refused) return refused;
+        const dn = asString(target.distinguishedName) ?? target.dn;
+        const currentParent = parentDn(dn);
+        // By GUID too, so a revert finds the OU however it's renamed or moved since.
+        const parentGuid = currentParent ? await this.guidOf(client, currentParent) : null;
         // Compare case-insensitively — AD treats DN components as case-
         // insensitive even though it preserves the casing on writes.
         if (currentParent && currentParent.toLowerCase() === trimmedTarget.toLowerCase()) {
-          return {
-            ok: true,
-            before: { distinguishedName: before.distinguishedName, parentDn: currentParent },
-            after: { distinguishedName: before.distinguishedName, parentDn: currentParent },
-          };
+          const unchanged = { distinguishedName: dn, parentDn: currentParent, parentGuid };
+          return { ok: true, before: unchanged, after: unchanged };
         }
 
-        const rdn = leafRdn(before.distinguishedName);
+        const rdn = leafRdn(dn);
         const newDn = `${rdn},${trimmedTarget}`;
-        await client.modifyDN(before.distinguishedName, newDn);
+        await client.modifyDN(dn, newDn);
 
         return {
           ok: true,
-          before: {
-            distinguishedName: before.distinguishedName,
-            parentDn: currentParent,
-          },
+          before: { distinguishedName: dn, parentDn: currentParent, parentGuid },
           after: {
             distinguishedName: newDn,
             parentDn: trimmedTarget,
+            parentGuid: await this.guidOf(client, trimmedTarget),
           },
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'modify failed';
-        const isAuthz = /no write|insuff|access/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        // A same-named object in the OU comes back as `conflict`.
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
@@ -1143,96 +1272,100 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   }
 
   /**
-   * Provision a new user as a direct child of `input.parentDn`. Same
-   * write-as-operator model as the other writes — the operator's bind owns
-   * the new object's ACL trail.
+   * Rename a person. The RDN change goes first because it's the one most
+   * likely to be refused (a same-named object in the OU, a missing rename
+   * right) and the easiest to undo: if the attribute write that follows
+   * fails, the RDN is renamed back so the account isn't left half-renamed.
    *
-   * The account is created DISABLED with no password via a single LDAP
-   * `add` (userAccountControl = NORMAL_ACCOUNT | ACCOUNTDISABLE |
-   * PASSWD_NOTREQD = 546) — the same state ADUC's "New User" wizard leaves
-   * an account in before its password page. The operator sets a password
-   * and enables the account afterwards via resetPassword + enableUser. The
-   * CN (RDN) is derived from displayName → "given surname" → samAccountName
-   * and RFC-escaped.
-   *
-   * Returns the created DirectoryUser (read back after the add) so the
-   * route can seed the cache without waiting for the next sync.
+   * New logon names, address and RDN are checked against the directory
+   * first so a clash comes back as `conflict` naming the other object,
+   * rather than as AD's opaque constraint error.
    */
-  async createUser(
-    input: UserCreateInput,
+  async renameUser(
+    userId: DirectoryObjectIdentifier,
+    input: UserRenameInput,
     ctx: WriteContext,
-  ): Promise<MutationResult & { user?: DirectoryUser }> {
-    const sam = input.samAccountName.trim();
-    if (!sam) {
-      return { ok: false, reason: 'directory_error', errorMessage: 'empty sAMAccountName' };
-    }
-    const cleanParent = input.parentDn.trim();
-    if (!cleanParent) {
-      return { ok: false, reason: 'directory_error', errorMessage: 'empty parent DN' };
-    }
-    const given = input.givenName?.trim() || undefined;
-    const surname = input.surname?.trim() || undefined;
-    const displayName =
-      input.displayName?.trim() || [given, surname].filter(Boolean).join(' ').trim() || sam;
-    const cn = displayName;
-    const upn = input.userPrincipalName?.trim() || undefined;
-    const mail = input.email?.trim() || undefined;
-    const newDn = `CN=${escapeRdnValue(cn)},${cleanParent}`;
-
-    // 546 = NORMAL_ACCOUNT (0x200) | ACCOUNTDISABLE (0x2) | PASSWD_NOTREQD
-    // (0x20). Disabled + no-password-required so the bare add succeeds even
-    // under a strict domain password policy; the operator enables it after
-    // setting a password.
-    const uac = UAC.NORMAL_ACCOUNT | UAC.ACCOUNTDISABLE | UAC.PASSWD_NOTREQD;
-
-    return withFailover(this.clientConfig, async (client) => {
+  ): Promise<MutationResult> {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const attrs: Record<string, string | string[]> = {
-          objectClass: ['top', 'person', 'organizationalPerson', 'user'],
-          cn,
-          sAMAccountName: sam,
-          userAccountControl: String(uac),
-        };
-        if (upn) attrs.userPrincipalName = upn;
-        if (given) attrs.givenName = given;
-        if (surname) attrs.sn = surname;
-        if (displayName) attrs.displayName = displayName;
-        if (mail) attrs.mail = mail;
+        const target = await this.findUserEntry(client, userId, USER_ATTRS_FULL);
+        if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
+        const user = normalizeUser(target);
+        const before = renameSnapshot(user);
+        const plan = planUserRename(
+          {
+            givenName: user.givenName,
+            surname: user.surname,
+            displayName: user.displayName,
+            cn: asString(target.cn),
+            samAccountName: user.samAccountName,
+            userPrincipalName: user.userPrincipalName,
+            email: user.email,
+            proxyAddresses: asStringArray(target.proxyAddresses),
+          },
+          input,
+        );
+        if (Object.keys(plan.attributes).length === 0 && plan.newCn === null) {
+          return { ok: true, before, after: before };
+        }
 
-        await client.add(newDn, attrs);
+        const conflict = await this.findNameClash(
+          client,
+          {
+            samAccountName: plan.newSamAccountName,
+            userPrincipalName: plan.newUserPrincipalName,
+            email: plan.newEmail,
+            cn: plan.newCn,
+          },
+          parentDn(user.distinguishedName),
+          { exceptObjectGuid: user.objectGuid },
+        );
+        if (conflict) return { ok: false, reason: 'conflict', errorMessage: conflict, before };
 
-        // Read the created entry back so we return a real objectGuid + the
-        // DN AD actually assigned.
-        const entry = await this.findUserEntry(client, { kind: 'samAccountName', value: sam });
-        const user = entry ? normalizeUser(entry) : undefined;
+        let dn = user.distinguishedName;
+        const oldRdn = leafRdn(dn);
+        if (plan.newCn !== null) {
+          const newRdn = `CN=${escapeRdnValueRfc(plan.newCn)}`;
+          // A bare RDN (no unescaped comma) keeps the parent: ldapts only
+          // sets newSuperior when the new DN contains one.
+          await client.modifyDN(dn, newRdn);
+          dn = `${newRdn},${parentDn(dn)}`;
+        }
+
+        const changes = Object.entries(plan.attributes).map(([type, values]) =>
+          values.length === 0
+            ? new Change({ operation: 'delete', modification: new Attribute({ type, values: [] }) })
+            : new Change({ operation: 'replace', modification: new Attribute({ type, values }) }),
+        );
+        if (changes.length > 0) {
+          try {
+            await client.modify(dn, changes);
+          } catch (err) {
+            if (plan.newCn !== null) {
+              const rolledBack = await client
+                .modifyDN(dn, oldRdn)
+                .then(() => true)
+                .catch(() => false);
+              const message = err instanceof Error ? err.message : 'modify failed';
+              return {
+                ...classifyWriteError(err),
+                errorMessage: rolledBack
+                  ? `${message} (the name change was rolled back)`
+                  : `${message} (the object was renamed to ${dn} but its attributes were not updated, and renaming it back failed)`,
+              };
+            }
+            throw err;
+          }
+        }
+
+        const afterEntry = await this.findUserEntry(client, userId, USER_ATTRS_FULL);
         return {
           ok: true,
-          after: {
-            distinguishedName: user?.distinguishedName ?? newDn,
-            samAccountName: sam,
-            enabled: false,
-          },
-          // Only present when the read-back succeeded — under
-          // exactOptionalPropertyTypes we can't assign an explicit
-          // `undefined` to the optional `user` field.
-          ...(user ? { user } : {}),
+          before,
+          after: afterEntry ? renameSnapshot(normalizeUser(afterEntry)) : {},
         };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'add failed';
-        // 68 = entryAlreadyExists (DN collision). insuff/access = the
-        // operator's bind lacks create rights on the target OU.
-        const isExists = /already exists|entryAlreadyExists/i.test(message);
-        const isAuthz = /no write|insuff|access/i.test(message);
-        return {
-          ok: false,
-          reason: isExists ? 'policy_violation' : isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
@@ -1240,46 +1373,704 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   }
 
   /**
-   * Permanently delete a user. Resolves the DN from the identifier, then
-   * issues an LDAP delete bound as the operator (write-as-user). AD returns
-   * unwillingToPerform (53) when the account carries the "protect from
-   * accidental deletion" deny ACE — surfaced as permission_denied so the
-   * route can tell the operator to clear that flag in ADUC.
+   * Delete a disabled user. The guard runs against the entry read on the
+   * operator's own bind, immediately before the delete, so it holds even
+   * if the caller's view of the account is stale.
+   *
+   * A plain delete is tried first because Delete is the right helpdesk
+   * roles are usually delegated; only a user with child objects needs the
+   * tree delete and its Delete Subtree right.
    */
   async deleteUser(
     userId: DirectoryObjectIdentifier,
     ctx: WriteContext,
-  ): Promise<MutationResult> {
-    return withFailover(this.clientConfig, async (client) => {
+    options: { allowTreeDelete?: boolean } = {},
+  ): Promise<MutationResult & { treeDelete?: boolean }> {
+    return this.asOperator(ctx, async (client) => {
       try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const target = await this.findUserEntry(client, userId);
+        const target = await this.findUserEntry(client, userId, USER_ATTRS_FULL);
         if (!target) return { ok: false, reason: 'not_found', errorMessage: 'user not found' };
-        const before = normalizeUser(target);
-        await client.del(before.distinguishedName);
-        return {
-          ok: true,
-          before: {
-            distinguishedName: before.distinguishedName,
-            samAccountName: before.samAccountName,
-          },
-        };
+        const user = normalizeUser(target);
+        const before = deletionSnapshot(user);
+        const blocked = userDeleteBlockReason(user);
+        if (blocked) {
+          return {
+            ok: false,
+            reason: 'policy_violation',
+            errorMessage: describeDeleteBlock(blocked),
+            before,
+          };
+        }
+
+        let treeDelete = false;
+        try {
+          await client.del(user.distinguishedName);
+        } catch (err) {
+          if (!(err instanceof NotAllowedOnNonLeafError)) throw err;
+          // The account holds other objects. Deleting them too must be the
+          // operator's explicit choice, never a silent escalation.
+          if (!options.allowTreeDelete) {
+            return {
+              ok: false,
+              reason: 'policy_violation',
+              errorMessage:
+                'the account contains other objects (e.g. Exchange ActiveSync devices); confirm deleting them too',
+              before,
+            };
+          }
+          treeDelete = true;
+          await client.del(user.distinguishedName, new TreeDeleteControl());
+        }
+        return { ok: true, before, after: { deleted: true, treeDelete }, treeDelete };
       } catch (err) {
-        const message = err instanceof Error ? err.message : 'del failed';
-        const isAuthz = /unwilling|access denied|insufficient|no write|insuff/i.test(message);
-        return {
-          ok: false,
-          reason: isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
+        return classifyWriteError(err);
       } finally {
         await client.unbind().catch(() => undefined);
       }
     });
+  }
+
+  /**
+   * Who already holds each name an object would take, other than the
+   * object itself. sAMAccountName, UPN and email are searched across the
+   * whole domain naming context, not just the configured base DN, because
+   * they must be unique domain-wide; the CN only among `parentDn`'s
+   * children. A holder outside the base DN comes back with a null `dn`:
+   * the operator has no business seeing what lives there.
+   */
+  private async nameClashes(
+    client: Client,
+    names: Partial<Record<ClashAttribute, string | null | undefined>>,
+    parentDn: string | null,
+    exceptObjectGuid?: string,
+  ): Promise<Partial<Record<ClashAttribute, { dn: string | null }>>> {
+    const domainRoot = await this.domainRoot(client);
+    const filters: Record<ClashAttribute, (v: string) => string> = {
+      samAccountName: (v) => `(sAMAccountName=${v})`,
+      userPrincipalName: (v) => `(userPrincipalName=${v})`,
+      email: (v) => `(|(mail=${v})(proxyAddresses=smtp:${v}))`,
+      cn: (v) => `(cn=${v})`,
+    };
+    const holders: Partial<Record<ClashAttribute, { dn: string | null }>> = {};
+    for (const attribute of CLASH_ORDER) {
+      const value = names[attribute]?.trim();
+      if (!value) continue;
+      const { searchEntries } = await client.search(
+        attribute === 'cn' ? (parentDn ?? domainRoot) : domainRoot,
+        {
+          scope: attribute === 'cn' ? 'one' : 'sub',
+          filter: filters[attribute](escapeLdapFilter(value)),
+          attributes: ['objectGUID', 'distinguishedName'],
+          explicitBufferAttributes: BINARY_ATTRS,
+        },
+      );
+      const other = searchEntries.find((e) => {
+        const guid = e.objectGUID;
+        return !(Buffer.isBuffer(guid) && objectGuidToString(guid) === exceptObjectGuid);
+      });
+      if (other) {
+        holders[attribute] = { dn: isDnWithin(other.dn, this.config.baseDn) ? other.dn : null };
+      }
+    }
+    return holders;
+  }
+
+  /** The first of `names` already held, as a message naming the holder, or null. */
+  private async findNameClash(
+    client: Client,
+    names: Partial<Record<ClashAttribute, string | null | undefined>>,
+    parentDn: string | null,
+    options: { exceptObjectGuid?: string; samLabel?: string } = {},
+  ): Promise<string | null> {
+    const holders = await this.nameClashes(client, names, parentDn, options.exceptObjectGuid);
+    const label: Record<ClashAttribute, string> = {
+      samAccountName: options.samLabel ?? 'logon name',
+      userPrincipalName: 'UPN',
+      email: 'email address',
+      cn: 'name',
+    };
+    for (const attribute of CLASH_ORDER) {
+      const holder = holders[attribute];
+      if (!holder) continue;
+      const where = attribute === 'cn' ? 'in this OU' : 'elsewhere in the domain';
+      return `the ${label[attribute]} "${names[attribute]!.trim()}" is already used ${holder.dn ? `by ${holder.dn}` : where}`;
+    }
+    return null;
+  }
+
+  async findNameHolders(input: NewObjectNames): Promise<NameHolders> {
+    return this.withServiceBind(async (client) => {
+      const holders = await this.nameClashes(
+        client,
+        { cn: input.cn, samAccountName: input.samAccountName },
+        input.parentDn,
+      );
+      return { cn: holders.cn ?? null, samAccountName: holders.samAccountName ?? null };
+    });
+  }
+
+  async findTakenNames(lookups: NamingLookups): Promise<TakenNames> {
+    return this.withServiceBind(async (client) => {
+      const domainRoot = await this.domainRoot(client);
+      const samAccountNames = (
+        await this.searchAny(
+          client,
+          domainRoot,
+          'sub',
+          lookups.samAccountNamePrefixes.map((p) => `(sAMAccountName=${escapeLdapFilter(p)}*)`),
+          ['sAMAccountName'],
+        )
+      ).flatMap((e) => asStringArray(e.sAMAccountName));
+
+      const addressEntries = await this.searchAny(
+        client,
+        domainRoot,
+        'sub',
+        lookups.upnLocalPrefixes.map((p) => {
+          const v = escapeLdapFilter(p);
+          return `(userPrincipalName=${v}*)(mail=${v}*)(proxyAddresses=smtp:${v}*)`;
+        }),
+        ['userPrincipalName', 'mail', 'proxyAddresses'],
+      );
+      const userPrincipalNames = addressEntries.flatMap((e) => asStringArray(e.userPrincipalName));
+      const mailAddresses = addressEntries.flatMap((e) => [
+        ...asStringArray(e.mail),
+        ...asStringArray(e.proxyAddresses)
+          .filter((a) => /^smtp:/i.test(a))
+          .map((a) => a.slice(5)),
+      ]);
+
+      const byOu = new Map<string, string[]>();
+      const want = (ouDn: string, clause: string) =>
+        byOu.set(ouDn, [...(byOu.get(ouDn) ?? []), clause]);
+      for (const { ouDn, cn } of lookups.cns) want(ouDn, `(cn=${escapeLdapFilter(cn)})`);
+      for (const { ouDn, cn } of lookups.cnPrefixes) want(ouDn, `(cn=${escapeLdapFilter(cn)}*)`);
+      const cns: OuName[] = [];
+      for (const [ouDn, clauses] of byOu) {
+        // Callers check this; a search outside the base DN never runs.
+        if (!isDnWithin(ouDn, this.config.baseDn)) continue;
+        try {
+          const found = await this.searchAny(client, ouDn, 'one', clauses, ['cn']);
+          for (const e of found) for (const cn of asStringArray(e.cn)) cns.push({ ouDn, cn });
+        } catch (err) {
+          // An OU that doesn't exist yet holds no names; the create checks it.
+          if ((err as { name?: string }).name !== 'NoSuchObjectError') throw err;
+        }
+      }
+      return { samAccountNames, userPrincipalNames, mailAddresses, cns };
+    });
+  }
+
+  async findPeople(lookups: PeopleLookups): Promise<ImportPerson[]> {
+    return this.withServiceBind(async (client) => {
+      const clauses = [
+        ...lookups.employeeIds.map((v) => `(employeeID=${escapeLdapFilter(v)})`),
+        ...lookups.identifiers.map((v) => {
+          const e = escapeLdapFilter(v);
+          return `(mail=${e})(proxyAddresses=smtp:${e})(userPrincipalName=${e})(sAMAccountName=${e})`;
+        }),
+      ];
+      const entries = await this.searchAny(
+        client,
+        await this.domainRoot(client),
+        'sub',
+        clauses,
+        [
+          'objectGUID',
+          'distinguishedName',
+          'sAMAccountName',
+          'userPrincipalName',
+          'displayName',
+          'employeeID',
+          'mail',
+          'proxyAddresses',
+        ],
+        USER_FILTER_BASE,
+      );
+      const people = new Map<string, ImportPerson>();
+      for (const entry of entries) {
+        const ref = normalizeObjectRef(entry);
+        if (!ref) continue;
+        people.set(ref.objectGuid, {
+          id: ref.objectGuid,
+          distinguishedName: ref.distinguishedName,
+          samAccountName: asString(entry.sAMAccountName) ?? null,
+          userPrincipalName: asString(entry.userPrincipalName) ?? null,
+          displayName: asString(entry.displayName) ?? null,
+          employeeId: asString(entry.employeeID) ?? null,
+          addresses: [
+            ...asStringArray(entry.mail),
+            ...asStringArray(entry.proxyAddresses)
+              .filter((a) => /^smtp:/i.test(a))
+              .map((a) => a.slice(5)),
+          ],
+        });
+      }
+      return [...people.values()];
+    });
+  }
+
+  async findObjects(refs: {
+    dns: readonly string[];
+    guids: readonly string[];
+  }): Promise<DirectoryObjectRef[]> {
+    return this.withServiceBind(async (client) => {
+      const entries = await this.searchAny(
+        client,
+        this.config.baseDn,
+        'sub',
+        refs.dns.map((dn) => `(distinguishedName=${escapeLdapFilter(dn)})`),
+        OBJECT_REF_ATTRS,
+      );
+      // A binary objectGUID only matches as a filter object, not in a string filter.
+      for (let i = 0; i < refs.guids.length; i += 50) {
+        const { searchEntries } = await client.search(this.config.baseDn, {
+          scope: 'sub',
+          filter: new OrFilter({
+            filters: refs.guids.slice(i, i + 50).map(
+              (guid) =>
+                new EqualityFilter({
+                  attribute: 'objectGUID',
+                  value: objectGuidFromString(guid),
+                }),
+            ),
+          }),
+          attributes: OBJECT_REF_ATTRS,
+          explicitBufferAttributes: BINARY_ATTRS,
+          paged: { pageSize: 500 },
+        });
+        entries.push(...searchEntries);
+      }
+      return entries.flatMap((e) => normalizeObjectRef(e) ?? []);
+    });
+  }
+
+  /**
+   * Everything matching any of `clauses` (and `within`, when given), in
+   * bounded filters so 500 names don't make one huge one.
+   */
+  private async searchAny(
+    client: Client,
+    base: string,
+    scope: 'one' | 'sub',
+    clauses: string[],
+    attributes: string[],
+    within?: string,
+  ): Promise<Entry[]> {
+    const entries: Entry[] = [];
+    for (let i = 0; i < clauses.length; i += 50) {
+      const any = `(|${clauses.slice(i, i + 50).join('')})`;
+      const { searchEntries } = await client.search(base, {
+        scope,
+        filter: within ? `(&${within}${any})` : any,
+        attributes,
+        explicitBufferAttributes: BINARY_ATTRS,
+        paged: { pageSize: 500 },
+      });
+      entries.push(...searchEntries);
+    }
+    return entries;
+  }
+
+  async getUpnSuffixes(): Promise<string[]> {
+    return this.withServiceBind(async (client) => {
+      const { searchEntries } = await client.search('', {
+        scope: 'base',
+        filter: '(objectClass=*)',
+        attributes: ['configurationNamingContext'],
+      });
+      const configNc = asString(searchEntries[0]?.configurationNamingContext);
+      if (!configNc) return [];
+      const { searchEntries: partitions } = await client.search(`CN=Partitions,${configNc}`, {
+        scope: 'base',
+        filter: '(objectClass=*)',
+        attributes: ['uPNSuffixes'],
+      });
+      return asStringArray(partitions[0]?.uPNSuffixes);
+    });
+  }
+
+  async hasSchemaAttribute(ldapDisplayName: string): Promise<boolean> {
+    const key = `${this.id}:${ldapDisplayName.toLowerCase()}`;
+    const known = schemaAttributes.get(key);
+    if (known && Date.now() - known.at < SCHEMA_TTL_MS) return known.defined;
+    const defined = await this.withServiceBind(async (client) => {
+      const { searchEntries } = await client.search('', {
+        scope: 'base',
+        filter: '(objectClass=*)',
+        attributes: ['schemaNamingContext'],
+      });
+      const schemaNc = asString(searchEntries[0]?.schemaNamingContext);
+      if (!schemaNc) return false;
+      const { searchEntries: found } = await client.search(schemaNc, {
+        scope: 'one',
+        filter: `(&(objectClass=attributeSchema)(lDAPDisplayName=${escapeLdapFilter(ldapDisplayName)}))`,
+        attributes: ['lDAPDisplayName'],
+        sizeLimit: 1,
+      });
+      return found.length > 0;
+    });
+    schemaAttributes.set(key, { at: Date.now(), defined });
+    return defined;
+  }
+
+  /**
+   * Create a group at `input.dn`, bound as the operator. The names are
+   * checked again on this bind: the preflight the dialog ran may be stale.
+   * Once AD has added the group the create has happened, so a failed
+   * read-back still reports success, without the group.
+   */
+  async createGroup(
+    input: GroupCreateInput,
+    ctx: WriteContext,
+  ): Promise<MutationResult & { group?: DirectoryGroup }> {
+    return this.asOperator(ctx, async (client) => {
+      try {
+        const clash = await this.findNameClash(
+          client,
+          { cn: input.cn, samAccountName: input.samAccountName },
+          parentDn(input.dn),
+          { samLabel: 'pre-Windows 2000 name' },
+        );
+        if (clash) return { ok: false, reason: 'conflict', errorMessage: clash };
+
+        const attrs: Record<string, string | string[]> = {
+          objectClass: ['top', 'group'],
+          cn: input.cn,
+          sAMAccountName: input.samAccountName,
+          groupType: String(groupTypeValue(input.scope, input.type)),
+        };
+        if (input.description) attrs.description = input.description;
+        await client.add(input.dn, attrs);
+
+        const entry = await this.findGroupEntry(client, {
+          kind: 'distinguishedName',
+          value: input.dn,
+        }).catch(() => null);
+        if (!entry) {
+          const { dn, cn, samAccountName, description, scope, type } = input;
+          return {
+            ok: true,
+            after: { distinguishedName: dn, cn, samAccountName, description, scope, type },
+          };
+        }
+        const group = normalizeGroup(entry);
+        return { ok: true, after: groupSnapshot(group), group };
+      } catch (err) {
+        return classifyWriteError(err);
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  async createUser(
+    input: UserCreateInput,
+    steps: readonly UserCreateStep[],
+    finish: UserCreateFinish,
+    ctx: WriteContext,
+  ): Promise<UserCreateResult> {
+    const result = await this.asOperator(ctx, async (client): Promise<UserCreateResult> => {
+      try {
+        const clash = await this.findNameClash(
+          client,
+          {
+            samAccountName: input.samAccountName,
+            userPrincipalName: input.userPrincipalName,
+            email: input.mail,
+            cn: input.cn,
+          },
+          parentDn(input.dn),
+        );
+        if (clash) return { ok: false, reason: 'conflict', errorMessage: clash, completed: [] };
+
+        const attrs: Record<string, string | string[]> = {
+          objectClass: ['top', 'person', 'organizationalPerson', 'user'],
+          cn: input.cn,
+          sAMAccountName: input.samAccountName,
+          userPrincipalName: input.userPrincipalName,
+          givenName: input.givenName,
+          sn: input.surname,
+          displayName: input.displayName,
+          // Disabled until it has a password: AD refuses an enabled account
+          // without one that meets the policy.
+          userAccountControl: String(UAC.NORMAL_ACCOUNT | UAC.ACCOUNTDISABLE),
+        };
+        if (input.mail) attrs.mail = input.mail;
+        if (input.otherMailbox) attrs.otherMailbox = input.otherMailbox;
+        if (input.mobile) attrs.mobile = input.mobile;
+        if (input.telephoneNumber) attrs.telephoneNumber = input.telephoneNumber;
+        if (input.initials) attrs.initials = input.initials;
+        if (input.employeeId) attrs.employeeID = input.employeeId;
+        if (input.description) attrs.description = input.description;
+        if (input.usageLocation) attrs[USAGE_LOCATION_ATTRIBUTE] = input.usageLocation;
+        Object.assign(attrs, input.organisation);
+        if (input.manager) attrs.manager = input.manager;
+        try {
+          await client.add(input.dn, attrs);
+        } catch (err) {
+          return { ...classifyWriteError(err), completed: [] };
+        }
+        return await this.runCreateSteps(client, input.dn, ['create'], steps, finish);
+      } catch (err) {
+        return { ...classifyWriteError(err), completed: [] };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+    return 'completed' in result ? result : { ...result, completed: [] };
+  }
+
+  async finishUserCreate(
+    userId: DirectoryObjectIdentifier,
+    steps: readonly UserCreateStep[],
+    finish: UserCreateFinish,
+    ctx: WriteContext,
+  ): Promise<UserCreateResult> {
+    const result = await this.asOperator(ctx, async (client): Promise<UserCreateResult> => {
+      try {
+        const target = await this.findUserEntry(client, userId);
+        if (!target) {
+          return { ok: false, reason: 'not_found', errorMessage: 'user not found', completed: [] };
+        }
+        return await this.runCreateSteps(
+          client,
+          normalizeUser(target).distinguishedName,
+          [],
+          steps,
+          finish,
+        );
+      } catch (err) {
+        return { ...classifyWriteError(err), completed: [] };
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+    return 'completed' in result ? result : { ...result, completed: [] };
+  }
+
+  async getAccountFingerprint(
+    identifier: DirectoryObjectIdentifier,
+  ): Promise<AccountFingerprint | null> {
+    return this.withServiceBind((client) => this.accountFingerprint(client, identifier));
+  }
+
+  private async accountFingerprint(
+    client: Client,
+    identifier: DirectoryObjectIdentifier,
+  ): Promise<AccountFingerprint | null> {
+    const entry = await this.findUserEntry(client, identifier, [
+      'objectGUID',
+      'whenCreated',
+      'uSNChanged',
+      'pwdLastSet',
+      'lastLogonTimestamp',
+    ]);
+    const guid = entry?.objectGUID;
+    if (!entry || !Buffer.isBuffer(guid)) return null;
+    return {
+      objectGuid: objectGuidToString(guid),
+      whenCreated: asString(entry.whenCreated),
+      usnChanged: asString(entry.uSNChanged),
+      pwdLastSet: asString(entry.pwdLastSet),
+      lastLogonTimestamp: asString(entry.lastLogonTimestamp),
+    };
+  }
+
+  /**
+   * The steps not yet `done`, in order, stopping at the first that fails,
+   * then the account as they left it. The password step also clears
+   * PASSWD_NOTREQD, and enabling leaves exactly a normal account, so a
+   * new account carries no flags nobody chose.
+   */
+  private async runCreateSteps(
+    client: Client,
+    dn: string,
+    done: UserCreateStep[],
+    steps: readonly UserCreateStep[],
+    finish: UserCreateFinish,
+  ): Promise<UserCreateResult> {
+    const completed = [...done];
+    const leftAs = async () => {
+      const id = { kind: 'distinguishedName', value: dn } as const;
+      const entry = await this.findUserEntry(client, id).catch(() => null);
+      const fingerprint = await this.accountFingerprint(client, id).catch(() => null);
+      return {
+        ...(entry ? { user: normalizeUser(entry) } : {}),
+        ...(fingerprint ? { fingerprint } : {}),
+      };
+    };
+    let groups: GroupsStepResult | undefined;
+    for (const step of steps) {
+      if (completed.includes(step)) continue;
+      if (step === 'groups') {
+        groups = await this.addToGroups(client, dn, finish.groups);
+        const failed = groups.failed;
+        if (failed.length > 0) {
+          return {
+            ok: false,
+            reason: failed[0]!.reason,
+            errorMessage: failed
+              .map((f) => `${leafRdnValue(f.dn) ?? f.dn}: ${f.errorMessage}`)
+              .join('; '),
+            completed,
+            failedStep: step,
+            groups,
+            ...(await leftAs()),
+          };
+        }
+        completed.push(step);
+        continue;
+      }
+      try {
+        if (step === 'password') {
+          await client.modify(dn, [
+            ...passwordChanges(finish.password, finish.mustChange),
+            accountControlChange(UAC.NORMAL_ACCOUNT | UAC.ACCOUNTDISABLE),
+          ]);
+        } else if (step === 'enable') {
+          await client.modify(dn, accountControlChange(UAC.NORMAL_ACCOUNT));
+        }
+        completed.push(step);
+      } catch (err) {
+        const refused = step === 'password' ? classifyPasswordError(err) : classifyWriteError(err);
+        return {
+          ...refused,
+          completed,
+          failedStep: step,
+          ...(groups ? { groups } : {}),
+          ...(await leftAs()),
+        };
+      }
+    }
+    return { ok: true, completed, ...(groups ? { groups } : {}), ...(await leftAs()) };
+  }
+
+  /** Add the account to each group, carrying on past one that refuses. */
+  private async addToGroups(
+    client: Client,
+    dn: string,
+    groupDns: readonly string[],
+  ): Promise<GroupsStepResult> {
+    const done: GroupsStepResult = { added: [], failed: [], missing: [] };
+    for (const groupDn of groupDns) {
+      try {
+        await this.setMember(client, groupDn, dn, true);
+        done.added.push(groupDn);
+      } catch (err) {
+        if ((err as { name?: string }).name === 'NoSuchObjectError') {
+          done.missing.push(groupDn);
+          continue;
+        }
+        const { reason, errorMessage } = classifyWriteError(err);
+        done.failed.push({
+          dn: groupDn,
+          reason: reason ?? 'directory_error',
+          errorMessage: errorMessage ?? 'refused',
+        });
+      }
+    }
+    return done;
+  }
+
+  async getGroupDeleteFacts(group: DirectoryGroup): Promise<GroupDeleteFacts> {
+    return this.withServiceBind((client) => this.groupDeleteFacts(client, group));
+  }
+
+  private async groupDeleteFacts(client: Client, group: DirectoryGroup): Promise<GroupDeleteFacts> {
+    const parents: DirectoryGroup[] = [];
+    for (const dn of group.memberOfDns) {
+      // A parent this bind can't read can't be judged; it's left out.
+      const parent = await client
+        .search(dn, {
+          scope: 'base',
+          filter: GROUP_FILTER_BASE,
+          attributes: ['objectGUID', 'objectSid', 'distinguishedName', 'adminCount'],
+          explicitBufferAttributes: BINARY_ATTRS,
+        })
+        .then((r) => r.searchEntries[0])
+        .catch(() => undefined);
+      if (parent) parents.push(normalizeGroup(parent));
+    }
+    return { parents, primaryGroupMembers: await this.countPrimaryGroupMembers(client, group) };
+  }
+
+  /** Accounts whose primaryGroupID is this group's RID; null if AD wouldn't say. */
+  private async countPrimaryGroupMembers(
+    client: Client,
+    group: DirectoryGroup,
+  ): Promise<number | null> {
+    const rid = ridOf(group.sid);
+    // Only a group of the account's own domain can be its primary group.
+    if (rid === null || !isDomainSid(group.sid)) return 0;
+    try {
+      const { searchEntries } = await client.search(await this.domainRoot(client), {
+        scope: 'sub',
+        filter: `(primaryGroupID=${rid})`,
+        attributes: ['distinguishedName'],
+        paged: { pageSize: 500 },
+      });
+      return searchEntries.length;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Delete a group. The guard runs against the entry, its parents and its
+   * primary-group count read on the operator's own bind, immediately
+   * before the delete.
+   */
+  async deleteGroup(
+    groupId: DirectoryObjectIdentifier,
+    ctx: WriteContext,
+    roleGroups: readonly RoleGroup[],
+  ): Promise<MutationResult> {
+    return this.asOperator(ctx, async (client) => {
+      try {
+        const entry = await this.findGroupEntry(client, groupId);
+        if (!entry) return { ok: false, reason: 'not_found', errorMessage: 'group not found' };
+        const group = normalizeGroup(entry);
+        const before = groupSnapshot(group);
+        const block = groupDeleteBlock(
+          group,
+          await this.groupDeleteFacts(client, group),
+          roleGroups,
+        );
+        if (block) {
+          return {
+            ok: false,
+            reason: 'policy_violation',
+            errorMessage: describeGroupDeleteBlock(block),
+            before,
+          };
+        }
+        await client.del(group.distinguishedName);
+        return { ok: true, before, after: { deleted: true } };
+      } catch (err) {
+        return classifyWriteError(err);
+      } finally {
+        await client.unbind().catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * The domain's naming context: sAMAccountName and UPN are unique across
+   * it, not just under the configured base DN.
+   */
+  private async domainRoot(client: Client): Promise<string> {
+    return (await this.resolveDefaultNamingContext(client)) ?? this.config.baseDn;
+  }
+
+  private async resolveDefaultNamingContext(client: Client): Promise<string | null> {
+    const { searchEntries } = await client.search('', {
+      scope: 'base',
+      filter: '(objectClass=*)',
+      attributes: ['defaultNamingContext'],
+    });
+    const dse = searchEntries[0];
+    return dse ? asString((dse as Record<string, unknown>).defaultNamingContext) : null;
   }
 
   /**
@@ -1292,74 +2083,6 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
    * is responsible for validating that `parentDn` exists in our cache; we
    * trust it here.
    */
-  /**
-   * Create a group under `input.parentDn`. `scope` + `category` map to the AD
-   * `groupType` bitmask (security groups carry the 0x80000000 bit, which makes
-   * the 32-bit value negative). Same write-as-operator model as the other
-   * writes; reads the entry back so the route gets a real objectGuid.
-   */
-  async createGroup(
-    input: GroupCreateInput,
-    ctx: WriteContext,
-  ): Promise<MutationResult & { group?: DirectoryGroup }> {
-    const cleanName = input.name.trim();
-    const cleanParent = input.parentDn.trim();
-    const sam = input.samAccountName.trim();
-    if (!cleanName || !cleanParent || !sam) {
-      return { ok: false, reason: 'directory_error', errorMessage: 'missing name, parent, or logon name' };
-    }
-    // groupType as the signed 32-bit string AD/LDAP expects.
-    const GROUP_TYPES: Record<string, string> = {
-      'security:global': '-2147483646',
-      'security:domainLocal': '-2147483644',
-      'security:universal': '-2147483640',
-      'distribution:global': '2',
-      'distribution:domainLocal': '4',
-      'distribution:universal': '8',
-    };
-    const groupType = GROUP_TYPES[`${input.category}:${input.scope}`] ?? '-2147483646';
-    const newDn = `CN=${escapeRdnValue(cleanName)},${cleanParent}`;
-
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
-      try {
-        const attrs: Record<string, string | string[]> = {
-          objectClass: ['top', 'group'],
-          cn: cleanName,
-          sAMAccountName: sam,
-          groupType,
-        };
-        if (input.description && input.description.trim()) {
-          attrs.description = input.description.trim();
-        }
-        await client.add(newDn, attrs);
-
-        const entry = await this.findGroupEntry(client, { kind: 'samAccountName', value: sam });
-        const group = entry ? normalizeGroup(entry) : undefined;
-        return {
-          ok: true,
-          after: { distinguishedName: group?.distinguishedName ?? newDn, samAccountName: sam },
-          ...(group ? { group } : {}),
-        };
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'add failed';
-        const isExists = /already exists|entryAlreadyExists/i.test(message);
-        const isAuthz = /no write|insuff|access/i.test(message);
-        return {
-          ok: false,
-          reason: isExists ? 'policy_violation' : isAuthz ? 'permission_denied' : 'directory_error',
-          errorMessage: message,
-        };
-      } finally {
-        await client.unbind().catch(() => undefined);
-      }
-    });
-  }
-
   async createOu(
     parentDn: string,
     name: string,
@@ -1377,12 +2100,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     const escapedName = escapeRdnValue(cleanName);
     const newDn = `OU=${escapedName},${cleanParent}`;
 
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         const attrs: Record<string, string | string[]> = {
           objectClass: ['top', 'organizationalUnit'],
@@ -1436,12 +2154,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     if (!cleanDn) {
       return { ok: false, reason: 'directory_error', errorMessage: 'empty DN' };
     }
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         await client.del(cleanDn);
         return {
@@ -1494,12 +2207,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     if (!cleanDn) {
       return { ok: false, reason: 'directory_error', errorMessage: 'empty DN' };
     }
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         const changes: Change[] = [];
 
@@ -1575,6 +2283,27 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   // operator's bind password is in the credential cache. Bind failure
   // throws `StepUpBindFailedError`, which the route maps to a 401/403
   // prompting re-elevation.
+
+  async countChildObjects(dns: string[], ctx: WriteContext): Promise<Map<string, number | null>> {
+    return this._withOperatorBind(ctx, async (client) => {
+      const counts = new Map<string, number | null>();
+      for (const dn of dns) {
+        try {
+          // Everything a tree delete would remove: the whole subtree, which
+          // the search returns with the base itself, so minus one.
+          const { searchEntries } = await client.search(dn, {
+            scope: 'sub',
+            filter: '(objectClass=*)',
+            attributes: ['1.1'],
+          });
+          counts.set(dn, Math.max(0, searchEntries.length - 1));
+        } catch {
+          counts.set(dn, null);
+        }
+      }
+      return counts;
+    });
+  }
 
   async getRecycleBinStatus(ctx: WriteContext): Promise<RecycleBinStatus> {
     return this._withOperatorBind(ctx, async (client) => {
@@ -1788,12 +2517,7 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     input: RestoreUserInput,
     ctx: WriteContext,
   ): Promise<RestoreResult> {
-    return withFailover(this.clientConfig, async (client) => {
-      try {
-        await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
-        return { ok: false, reason: 'permission_denied', errorMessage: 'step-up bind failed' };
-      }
+    return this.asOperator(ctx, async (client) => {
       try {
         const containerDn = await this._resolveDeletedObjectsContainer(client);
         if (!containerDn) {
@@ -1949,7 +2673,8 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     return withFailover(this.clientConfig, async (client) => {
       try {
         await client.bind(ctx.actorUsername, ctx.actorPassword);
-      } catch {
+      } catch (err) {
+        if (isDirectoryUnreachable(err)) throw err;
         throw new StepUpBindFailedError();
       }
       try {
@@ -1989,6 +2714,21 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     });
   }
 
+  /** The object's GUID, or null when it can't be read. */
+  private async guidOf(client: Client, dn: string): Promise<string | null> {
+    try {
+      const { searchEntries } = await client.search(dn, {
+        scope: 'base',
+        filter: '(objectClass=*)',
+        attributes: ['objectGUID'],
+        explicitBufferAttributes: BINARY_ATTRS,
+      });
+      return searchEntries[0] ? (normalizeObjectRef(searchEntries[0])?.objectGuid ?? null) : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async searchOne(
     client: Client,
     base: string,
@@ -2017,9 +2757,11 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
   private async findGroupEntry(
     client: Client,
     identifier: DirectoryObjectIdentifier,
+    attributes: readonly string[] = GROUP_ATTRS,
   ): Promise<Entry | null> {
     const filter = identifierToFilter(identifier, GROUP_FILTER_BASE);
-    return this.searchOne(client, this.config.baseDn, filter, GROUP_ATTRS);
+    const entry = await this.searchOne(client, this.config.baseDn, filter, [...attributes]);
+    return entry ? withAllMembers(client, entry) : null;
   }
 
   private async findComputerEntry(
@@ -2078,24 +2820,43 @@ export class ActiveDirectoryProvider implements DirectoryProvider {
     attributes: string[],
     pageSize: number,
     map: (e: Entry) => T,
+    complete?: (client: Client, e: Entry) => Promise<Entry>,
   ): AsyncIterable<T> {
-    // ldapts paged search returns all entries together (it manages the
-    // cookie internally). For very large directories a true streaming API
-    // would help; for MVP scale (low tens of thousands) batching is fine.
-    yield* await this.withServiceBind(async (client) => {
-      const { searchEntries } = await client.search(this.config.baseDn, {
+    // Yield each page as it arrives, so memory is bounded by the page size
+    // rather than the directory size (users carry photos). Failover happens
+    // only while connecting: a search that breaks midway isn't restarted on
+    // another DC, which would repeat entries.
+    const client = await withFailover(this.clientConfig, async (c) => {
+      await c.bind(this.config.serviceAccountUpn, this.config.serviceAccountPassword);
+      return c;
+    });
+    try {
+      const pages = client.searchPaginated(this.config.baseDn, {
         scope: 'sub',
         filter,
         attributes,
         explicitBufferAttributes: BINARY_ATTRS,
         paged: { pageSize },
       });
-      return searchEntries.map(map);
-    });
+      for await (const page of pages) {
+        for (const entry of page.searchEntries) {
+          yield map(complete ? await complete(client, entry) : entry);
+        }
+      }
+    } finally {
+      await client.unbind().catch(() => undefined);
+    }
   }
 }
 
 // ---- Module-private helpers ---------------------------------------------
+
+/** Normalize groups read in one search, with every member of the large ones. */
+async function normalizeGroups(client: Client, entries: Entry[]): Promise<DirectoryGroup[]> {
+  const groups: DirectoryGroup[] = [];
+  for (const entry of entries) groups.push(normalizeGroup(await withAllMembers(client, entry)));
+  return groups;
+}
 
 function looksLikeUpn(s: string): boolean {
   return s.includes('@') && !s.includes('=');
@@ -2126,7 +2887,7 @@ function classifyBindError(err: unknown): AuthResult {
     return {
       ok: false,
       reason: 'directory_error',
-      errorMessage: `cannot reach directory: ${message}`,
+      errorMessage: certificateProblemMessage(err) ?? `cannot reach directory: ${message}`,
     };
   }
 
@@ -2227,41 +2988,8 @@ function classifyBindError(err: unknown): AuthResult {
  * below for the strict version used by restoreDeletedUser.
  */
 function escapeRdnValue(value: string): string {
-  // eslint-disable-next-line no-control-regex -- NUL is intentionally escaped per RFC 4514 §2.4
-  return value.replace(/[,+<>;"=\\ ]/g, (m) => `\\${m}`);
-}
-
-/**
- * Strict RFC 4514 §2.4 RDN value escaping. Used for tombstone
- * reanimation, where AD's modify primitive validates the new DN
- * strictly: comma/equals/etc. inside a CN must be escaped, but spaces
- * in the middle of the value must NOT be escaped. The general-purpose
- * `escapeRdnValue` above is over-aggressive for that case.
- */
-function escapeRdnValueRfc(value: string): string {
-  if (!value) return value;
-  let out = '';
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i]!;
-    if (
-      ch === ',' ||
-      ch === '+' ||
-      ch === '"' ||
-      ch === '\\' ||
-      ch === '<' ||
-      ch === '>' ||
-      ch === ';' ||
-      ch === '=' ||
-      ch === '\x00'
-    ) {
-      out += '\\' + ch;
-    } else {
-      out += ch;
-    }
-  }
-  if (out.startsWith('#') || out.startsWith(' ')) out = '\\' + out;
-  if (out.length > 1 && out.endsWith(' ')) out = out.slice(0, -1) + '\\ ';
-  return out;
+  // NUL (written as \0, never a raw byte) is intentionally escaped per RFC 4514 §2.4
+  return value.replace(/[,+<>;"=\\\0]/g, (m) => `\\${m}`);
 }
 
 /**
@@ -2332,6 +3060,7 @@ const PATCH_ATTRIBUTE_MAP: Record<string, string> = {
   ipPhone: 'ipPhone',
   homePhone: 'homePhone',
   homePostalAddress: 'homePostalAddress',
+  streetAddress: 'streetAddress',
   description: 'description',
   company: 'company',
   c: 'c',
@@ -2339,6 +3068,10 @@ const PATCH_ATTRIBUTE_MAP: Record<string, string> = {
   l: 'l',
   st: 'st',
   postalCode: 'postalCode',
+  countryCode: 'countryCode',
+  physicalDeliveryOfficeName: 'physicalDeliveryOfficeName',
+  // writeUserAttributes checks the manager is a user, and not the user itself.
+  managerDn: 'manager',
 };
 
 /** Map our multi-valued patch field name → the AD attribute name. */
@@ -2346,6 +3079,7 @@ const PATCH_MULTI_ATTRIBUTE_MAP: Record<string, string> = {
   otherMailbox: 'otherMailbox',
   otherHomePhone: 'otherHomePhone',
   otherMobile: 'otherMobile',
+  postOfficeBox: 'postOfficeBox',
 };
 
 /**
@@ -2353,95 +3087,42 @@ const PATCH_MULTI_ATTRIBUTE_MAP: Record<string, string> = {
  *
  * Scalar fields (PATCH_ATTRIBUTE_MAP):
  *   - `undefined` ⇒ field absent, skip
- *   - `null` or empty string ⇒ delete the AD attribute
+ *   - `null` or empty string ⇒ clear the AD attribute
  *   - anything else ⇒ replace with the trimmed value
  *
  * Multi-valued fields (PATCH_MULTI_ATTRIBUTE_MAP):
  *   - `undefined` ⇒ skip
- *   - `null` or empty array ⇒ delete the AD attribute
+ *   - `null` or empty array ⇒ clear the AD attribute
  *   - non-empty array ⇒ replace with all (trimmed, non-empty) values
+ *
+ * A clear is a replace with no values, not a delete: a delete of an
+ * attribute the user doesn't have fails the whole modify, a replace
+ * with none is a no-op then.
  *
  * Returns an empty array if every field was undefined.
  */
 function buildAttributeChanges(patch: UserAttributePatch): Change[] {
-  const changes: Change[] = [];
   const data = patch as Record<string, unknown>;
+  const replace = (type: string, values: string[]) =>
+    new Change({ operation: 'replace', modification: new Attribute({ type, values }) });
+  const changes: Change[] = [];
   for (const [patchKey, attrName] of Object.entries(PATCH_ATTRIBUTE_MAP)) {
     const raw = data[patchKey];
     if (raw === undefined) continue;
-    if (raw === null || (typeof raw === 'string' && raw.trim() === '')) {
-      changes.push(
-        new Change({
-          operation: 'delete',
-          modification: new Attribute({ type: attrName, values: [] }),
-        }),
-      );
-      continue;
-    }
-    if (typeof raw === 'string') {
-      changes.push(
-        new Change({
-          operation: 'replace',
-          modification: new Attribute({ type: attrName, values: [raw.trim()] }),
-        }),
-      );
-    }
+    const value = typeof raw === 'string' ? raw.trim() : '';
+    changes.push(replace(attrName, value ? [value] : []));
   }
   for (const [patchKey, attrName] of Object.entries(PATCH_MULTI_ATTRIBUTE_MAP)) {
     const raw = data[patchKey];
     if (raw === undefined) continue;
-    if (raw === null) {
-      changes.push(
-        new Change({
-          operation: 'delete',
-          modification: new Attribute({ type: attrName, values: [] }),
-        }),
-      );
-      continue;
-    }
-    if (Array.isArray(raw)) {
-      const cleaned = raw
-        .filter((v): v is string => typeof v === 'string')
-        .map((v) => v.trim())
-        .filter((v) => v.length > 0);
-      changes.push(
-        cleaned.length === 0
-          ? new Change({
-              operation: 'delete',
-              modification: new Attribute({ type: attrName, values: [] }),
-            })
-          : new Change({
-              operation: 'replace',
-              modification: new Attribute({ type: attrName, values: cleaned }),
-            }),
-      );
-    }
+    const values = Array.isArray(raw)
+      ? raw
+          .filter((v): v is string => typeof v === 'string')
+          .map((v) => v.trim())
+          .filter((v) => v.length > 0)
+      : [];
+    changes.push(replace(attrName, values));
   }
-  // Account expiration. `null` clears it (never expires); a Date/ISO string is
-  // converted to an AD `accountExpires` FILETIME (100-ns ticks since 1601 UTC),
-  // which needs BigInt to stay exact. `0` reads back as "never".
-  if ('accountExpiresAt' in patch) {
-    const v = patch.accountExpiresAt;
-    let filetime: string | null = null;
-    if (v === null) {
-      filetime = '0';
-    } else if (v !== undefined) {
-      const d = v instanceof Date ? v : new Date(v);
-      if (!Number.isNaN(d.getTime())) {
-        filetime = ((BigInt(d.getTime()) + 11644473600000n) * 10000n).toString();
-      }
-    }
-    if (filetime !== null) {
-      changes.push(
-        new Change({
-          operation: 'replace',
-          modification: new Attribute({ type: 'accountExpires', values: [filetime] }),
-        }),
-      );
-    }
-  }
-  // managerDn is typed on UserAttributePatch but not yet handled here — it
-  // needs a cycle check before write. Excluded intentionally.
   return changes;
 }
 
@@ -2462,6 +3143,7 @@ function snapshotForAudit(user: DirectoryUser): Record<string, unknown> {
     ipPhone: rawAuditScalar(raw['ipPhone']),
     homePhone: rawAuditScalar(raw['homePhone']),
     homePostalAddress: rawAuditScalar(raw['homePostalAddress']),
+    streetAddress: rawAuditScalar(raw['streetAddress']),
     description: rawAuditScalar(raw['description']),
     company: rawAuditScalar(raw['company']),
     c: rawAuditScalar(raw['c']),
@@ -2469,6 +3151,10 @@ function snapshotForAudit(user: DirectoryUser): Record<string, unknown> {
     l: rawAuditScalar(raw['l']),
     st: rawAuditScalar(raw['st']),
     postalCode: rawAuditScalar(raw['postalCode']),
+    postOfficeBox: rawAuditArray(raw['postOfficeBox']),
+    countryCode: rawAuditScalar(raw['countryCode']),
+    physicalDeliveryOfficeName: user.office ?? null,
+    managerDn: user.managerDn,
     otherMailbox: rawAuditArray(raw['otherMailbox']),
     otherHomePhone: rawAuditArray(raw['otherHomePhone']),
     otherMobile: rawAuditArray(raw['otherMobile']),
@@ -2487,4 +3173,150 @@ function rawAuditArray(v: unknown): string[] {
   return arr
     .map((x) => (typeof x === 'string' ? x : x === null || x === undefined ? '' : String(x)))
     .filter((s) => s.length > 0);
+}
+
+/** The identity attributes a rename can touch, for the audit trail. */
+function renameSnapshot(user: DirectoryUser): Record<string, unknown> {
+  const raw = user.rawAttributes;
+  return {
+    distinguishedName: user.distinguishedName,
+    cn: rawAuditScalar(raw['cn']),
+    givenName: user.givenName,
+    surname: user.surname,
+    displayName: user.displayName,
+    samAccountName: user.samAccountName,
+    userPrincipalName: user.userPrincipalName,
+    email: user.email,
+    proxyAddresses: rawAuditArray(raw['proxyAddresses']),
+  };
+}
+
+/**
+ * What a deleted account looked like. On domains without the Recycle Bin
+ * the tombstone loses most of this, so the audit row is the only record of
+ * the account's groups and attributes.
+ */
+function deletionSnapshot(user: DirectoryUser): Record<string, unknown> {
+  return {
+    ...snapshotForAudit(user),
+    distinguishedName: user.distinguishedName,
+    samAccountName: user.samAccountName,
+    userPrincipalName: user.userPrincipalName,
+    sid: user.sid,
+    enabled: user.enabled,
+    memberOf: user.memberOfDns,
+  };
+}
+
+/**
+ * A group as the audit trail keeps it. Its members and parent groups are
+ * here because a deleted group's tombstone doesn't keep them.
+ */
+function groupSnapshot(group: DirectoryGroup): Record<string, unknown> {
+  return {
+    distinguishedName: group.distinguishedName,
+    name: group.name,
+    samAccountName: group.samAccountName,
+    sid: group.sid,
+    description: group.description,
+    groupScope: group.groupScope,
+    groupType: group.groupType,
+    members: group.memberDns,
+    memberOf: group.memberOfDns,
+  };
+}
+
+type AccountKind = 'user' | 'computer';
+
+/** The refusal for a domain controller or critical computer, or null. */
+function protectedComputer(entry: Entry): MutationResult | null {
+  const block = computerWriteBlock(entry);
+  return block
+    ? { ok: false, reason: 'policy_violation', errorMessage: describeComputerWriteBlock(block) }
+    : null;
+}
+
+/** An entry's userAccountControl as a number; NaN when unparseable. */
+function userAccountControlOf(entry: Entry): number {
+  const raw = (entry as { userAccountControl?: string | string[] }).userAccountControl;
+  const value = Array.isArray(raw) ? raw[raw.length - 1] : raw;
+  return value ? Number.parseInt(String(value), 10) : 0;
+}
+
+type ClashAttribute = 'samAccountName' | 'userPrincipalName' | 'email' | 'cn';
+const CLASH_ORDER: readonly ClashAttribute[] = [
+  'samAccountName',
+  'userPrincipalName',
+  'email',
+  'cn',
+];
+
+/**
+ * Set a password, and must-change with it. One modify, so a password AD
+ * refuses leaves `pwdLastSet` alone; without must-change, AD sets
+ * `pwdLastSet` to now. AD requires the value as UTF-16LE in quotes, over
+ * an encrypted connection.
+ */
+function passwordChanges(password: string, mustChange: boolean): Change[] {
+  const changes = [
+    new Change({
+      operation: 'replace',
+      modification: new Attribute({
+        type: 'unicodePwd',
+        values: [encodeUnicodePassword(password)],
+      }),
+    }),
+  ];
+  if (mustChange) {
+    changes.push(
+      new Change({
+        operation: 'replace',
+        modification: new Attribute({ type: 'pwdLastSet', values: ['0'] }),
+      }),
+    );
+  }
+  return changes;
+}
+
+function accountControlChange(userAccountControl: number): Change {
+  return new Change({
+    operation: 'replace',
+    modification: new Attribute({
+      type: 'userAccountControl',
+      values: [String(userAccountControl)],
+    }),
+  });
+}
+
+/**
+ * A refused password write. AD reports a password its policy rejects
+ * under several result codes (constraint violation, unwilling to
+ * perform), always with extended error 0000052D; Samba names the
+ * restriction instead.
+ */
+function classifyPasswordError(err: unknown): MutationResult {
+  const refused = classifyWriteError(err);
+  return /\b0*52D\b|password_restrictions|policy|complexity|length|history/i.test(
+    refused.errorMessage ?? '',
+  )
+    ? { ...refused, reason: 'policy_violation' }
+    : refused;
+}
+
+/**
+ * Map an LDAP write failure to a MutationResult reason by result code
+ * rather than by message text, which varies across DC versions.
+ */
+function classifyWriteError(err: unknown): MutationResult {
+  const errorMessage = err instanceof Error ? err.message : 'write failed';
+  if (err instanceof InsufficientAccessError) {
+    return { ok: false, reason: 'permission_denied', errorMessage };
+  }
+  if (err instanceof AlreadyExistsError || err instanceof ConstraintViolationError) {
+    return { ok: false, reason: 'conflict', errorMessage };
+  }
+  if (err instanceof UnwillingToPerformError || err instanceof NotAllowedOnNonLeafError) {
+    return { ok: false, reason: 'policy_violation', errorMessage };
+  }
+  return { ok: false, reason: 'directory_error', errorMessage };
 }

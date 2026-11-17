@@ -31,12 +31,21 @@ export interface AuditEventInput {
   before?: Record<string, unknown> | null;
   after?: Record<string, unknown> | null;
   metadata?: Record<string, unknown>;
+  /** The bulk job the event belongs to, which groups it in the audit log. */
+  bulkJobId?: string | null;
 }
 
 // Sensitive keys that must never reach the audit log even if a caller
 // accidentally puts them in metadata/before/after.
 const SENSITIVE_KEYS = new Set([
   'password',
+  'newpassword',
+  'adminpassword',
+  'bindpassword',
+  'actorpassword',
+  'elevatedpassword',
+  'clientsecret',
+  'temporaryaccesspass',
   'pass',
   'pwd',
   'unicodepwd',
@@ -121,14 +130,15 @@ export class AuditService {
   /**
    * Insert an audit event. Throws on DB failure — high-risk-write callers
    * (Phase 5's withAudit wrapper) should propagate this so the corresponding
-   * write fails closed.
+   * write fails closed. `db`, a transaction, records it with the write it
+   * describes, so neither happens without the other.
    */
-  async recordEvent(input: AuditEventInput): Promise<void> {
+  async recordEvent(input: AuditEventInput, db: Kysely<DB> = this.db): Promise<void> {
     const before = input.before ? (redact(input.before) as Record<string, unknown>) : null;
     const after = input.after ? (redact(input.after) as Record<string, unknown>) : null;
     const metadata = input.metadata ? (redact(input.metadata) as Record<string, unknown>) : {};
 
-    await this.db
+    await db
       .insertInto('audit_events')
       .values({
         action: input.action,
@@ -148,6 +158,7 @@ export class AuditService {
         before_json: before ? JSON.stringify(before) : null,
         after_json: after ? JSON.stringify(after) : null,
         metadata_json: JSON.stringify(metadata),
+        bulk_job_id: input.bulkJobId ?? null,
       })
       .execute();
   }

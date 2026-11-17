@@ -26,9 +26,9 @@ import {
 } from '@openaduc/shared';
 import { StepUpBindFailedError, type WriteContext } from '../providers/types.js';
 import { NotFound, StepUpRequired, Unauthorized } from '../plugins/errorHandler.js';
-import { visibleRawAttributes } from '../lib/rawAttributes.js';
+import { rawAttributesFor } from '../lib/rawAttributes.js';
 
-const guidParamSchema = z.object({ guid: z.string().uuid() });
+const guidParamSchema = z.object({ guid: z.guid() });
 
 function ctxFromReq(req: FastifyRequest): WriteContext {
   const actor = req.actor!;
@@ -43,7 +43,7 @@ function ctxFromReq(req: FastifyRequest): WriteContext {
 export async function registerDeletedComputerRoutes(app: FastifyInstance): Promise<void> {
   // ---- GET /api/deleted-computers --------------------------------------
   app.get('/api/deleted-computers', {
-    preHandler: [app.requireCapability('read:computer.deleted'), app.requireStepUp],
+    config: { policy: { capability: 'read:computer.deleted', stepUp: true, directory: 'caller' } },
     handler: async (req): Promise<DeletedComputerSearchResponse> => {
       const q = deletedComputerSearchQuerySchema.parse(req.query);
       const provider = await app.services.providers.buildForRequest(req);
@@ -57,9 +57,7 @@ export async function registerDeletedComputerRoutes(app: FastifyInstance): Promi
         all = await provider.searchDeletedComputers(q.q ? { text: q.q } : {}, ctx);
       } catch (err) {
         if (err instanceof StepUpBindFailedError) {
-          throw StepUpRequired(
-            'the directory rejected your editing session — please re-authenticate',
-          );
+          throw StepUpRequired('password_rejected');
         }
         throw err;
       }
@@ -100,7 +98,7 @@ export async function registerDeletedComputerRoutes(app: FastifyInstance): Promi
 
   // ---- GET /api/deleted-computers/:guid --------------------------------
   app.get('/api/deleted-computers/:guid', {
-    preHandler: [app.requireCapability('read:computer.deleted'), app.requireStepUp],
+    config: { policy: { capability: 'read:computer.deleted', stepUp: true, directory: 'caller' } },
     handler: async (req): Promise<{ computer: DeletedComputerDetail }> => {
       const { guid } = guidParamSchema.parse(req.params);
       const provider = await app.services.providers.buildForRequest(req);
@@ -112,9 +110,7 @@ export async function registerDeletedComputerRoutes(app: FastifyInstance): Promi
         computer = await provider.getDeletedComputer(guid, ctxFromReq(req));
       } catch (err) {
         if (err instanceof StepUpBindFailedError) {
-          throw StepUpRequired(
-            'the directory rejected your editing session — please re-authenticate',
-          );
+          throw StepUpRequired('password_rejected');
         }
         throw err;
       }
@@ -129,10 +125,7 @@ export async function registerDeletedComputerRoutes(app: FastifyInstance): Promi
         lastKnownParent: computer.lastKnownParent,
         deletedAt: computer.deletedAt ? computer.deletedAt.toISOString() : null,
         recycled: computer.recycled,
-        rawAttributes: visibleRawAttributes(
-          computer.rawAttributes,
-          req.actor?.session.capabilities,
-        ),
+        rawAttributes: rawAttributesFor(req.actor?.session.capabilities, computer.rawAttributes),
       };
       return { computer: deletedComputerDetailSchema.parse(detail) };
     },

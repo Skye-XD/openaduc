@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 import { setTimeout as delay } from 'node:timers/promises';
 import type { FastifyBaseLogger } from 'fastify';
+import { LICENSE_PERMISSIONS, TAP_PERMISSIONS } from '@openaduc/shared';
 import type { EntraIntegrationCreds, EntraIntegrationService } from './entraIntegration.js';
 
 // Microsoft Graph client built around the OAuth 2.0 client-credentials
@@ -46,10 +47,41 @@ export class GraphPermissionError extends Error {
     public readonly statusCode: number,
     public readonly graphCode: string | null,
     public readonly hint: string | null,
+    /** Graph's own explanation, without the status and path. */
+    public readonly graphMessage: string | null = null,
   ) {
     super(message);
     this.name = 'GraphPermissionError';
   }
+}
+
+/** Graph kept refusing for being busy past what OpenADUC will wait. */
+export class GraphThrottledError extends Error {
+  constructor(
+    public readonly path: string,
+    public readonly statusCode: number,
+    /** How long Graph last asked to wait. */
+    public readonly retryAfterSeconds: number,
+  ) {
+    super(`Graph ${statusCode} on ${path}: throttled, retry after ${retryAfterSeconds}s`);
+    this.name = 'GraphThrottledError';
+  }
+}
+
+// Throttling: a few retries, waiting as long as Graph's Retry-After says,
+// within a total a page request can bear. A sync task that gives up runs
+// again at its next slot.
+const THROTTLE_RETRIES = 3;
+const THROTTLE_MAX_WAIT_MS = 10_000;
+const THROTTLE_BACKOFF_MS = 1_000;
+
+/** Retry-After as delta-seconds or an HTTP date, in milliseconds. */
+function retryAfterMs(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  const at = Date.parse(header);
+  return Number.isNaN(at) ? null : Math.max(0, at - Date.now());
 }
 
 export class GraphClient {
@@ -60,10 +92,18 @@ export class GraphClient {
    */
   private inflightTokenFetch: Promise<string> | null = null;
 
+  private readonly throttle: { maxWaitMs: number; sleep: (ms: number) => Promise<unknown> };
+
   constructor(
     private readonly creds: EntraIntegrationCreds,
     private readonly log: FastifyBaseLogger,
-  ) {}
+    throttle: { maxWaitMs?: number; sleep?: (ms: number) => Promise<unknown> } = {},
+  ) {
+    this.throttle = {
+      maxWaitMs: throttle.maxWaitMs ?? THROTTLE_MAX_WAIT_MS,
+      sleep: throttle.sleep ?? ((ms) => delay(ms)),
+    };
+  }
 
   // ---- Public surface --------------------------------------------------
 
@@ -72,9 +112,45 @@ export class GraphClient {
    * with a hint about the most likely missing permission so the operator
    * sees something more useful than "Forbidden".
    */
-  async getJson<T = unknown>(path: string): Promise<GraphResponse<T>> {
-    const res = await this.request(path, { method: 'GET' });
+  async getJson<T = unknown>(
+    path: string,
+    opts: { headers?: Record<string, string> } = {},
+  ): Promise<GraphResponse<T>> {
+    const res = await this.request(path, { method: 'GET', ...opts });
     return await readJson<T>(res, path);
+  }
+
+  /** Issue a JSON POST against Graph. Errors as `getJson`. */
+  async postJson<T = unknown>(path: string, body: unknown): Promise<GraphResponse<T>> {
+    const res = await this.request(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return await readJson<T>(res, path);
+  }
+
+  /** Issue a DELETE against Graph. Something already gone (404) is as good as deleted. */
+  async delete(path: string): Promise<void> {
+    const res = await this.request(path, { method: 'DELETE' });
+    if (res.status === 404) return;
+    if (!res.ok) await raiseFromError(res, path);
+  }
+
+  /**
+   * The application permissions admin consent has granted, from the access
+   * token's `roles` claim, so a missing one can be named without calling
+   * the API it guards (some of which write).
+   */
+  async grantedPermissions(): Promise<string[]> {
+    const token = await this.getToken();
+    try {
+      const payload = JSON.parse(Buffer.from(token.split('.')[1] ?? '', 'base64url').toString());
+      const roles: unknown = payload?.roles;
+      return Array.isArray(roles) ? roles.filter((r): r is string => typeof r === 'string') : [];
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -134,36 +210,42 @@ export class GraphClient {
     path: string,
     init: { method: string; headers?: Record<string, string>; body?: string | URLSearchParams },
   ): Promise<Response> {
-    const token = await this.getToken();
     const url = path.startsWith('http') ? path : `${GRAPH_BASE}${path}`;
-    const res = await fetch(url, {
-      method: init.method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/json',
-        ...(init.headers ?? {}),
-      },
-      ...(init.body !== undefined ? { body: init.body } : {}),
-    });
-
-    // One automatic retry on 401 — covers the rare race where the cached
-    // token expired between our check and Graph's eval. After that,
-    // surface as a permission error.
-    if (res.status === 401 && this.cachedToken) {
-      this.cachedToken = null;
-      const fresh = await this.getToken();
-      return await fetch(url, {
+    const send = async () =>
+      await fetch(url, {
         method: init.method,
         headers: {
-          Authorization: `Bearer ${fresh}`,
+          Authorization: `Bearer ${await this.getToken()}`,
           Accept: 'application/json',
           ...(init.headers ?? {}),
         },
         ...(init.body !== undefined ? { body: init.body } : {}),
       });
-    }
 
-    return res;
+    let waited = 0;
+    for (let attempt = 0; ; attempt++) {
+      let res = await send();
+      // One automatic retry on 401 — covers the rare race where the cached
+      // token expired between our check and Graph's eval. After that,
+      // surface as a permission error.
+      if (res.status === 401 && this.cachedToken) {
+        this.cachedToken = null;
+        res = await send();
+      }
+      // Throttled (429), or busy (503, retried only for a read, which a
+      // retry can't do twice). Graph says how long to wait; a wait past
+      // what's left of the budget fails now rather than holding a request.
+      const busy = res.status === 429 || (res.status === 503 && init.method === 'GET');
+      if (!busy) return res;
+      const wait =
+        retryAfterMs(res.headers.get('retry-after')) ?? THROTTLE_BACKOFF_MS * 2 ** attempt;
+      if (attempt >= THROTTLE_RETRIES || waited + wait > this.throttle.maxWaitMs) {
+        throw new GraphThrottledError(path, res.status, Math.ceil(wait / 1000));
+      }
+      this.log.warn({ path, status: res.status, waitMs: wait }, 'graph throttled; retrying');
+      await this.throttle.sleep(wait);
+      waited += wait;
+    }
   }
 
   private async getToken(): Promise<string> {
@@ -269,15 +351,19 @@ async function readJson<T>(res: Response, path: string): Promise<GraphResponse<T
 async function raiseFromError(res: Response, path: string): Promise<never> {
   let message = `Graph ${res.status} on ${path}`;
   let code: string | null = null;
+  let graphMessage: string | null = null;
   try {
     const body = (await res.json()) as { error?: { code?: string; message?: string } };
-    if (body?.error?.message) message = `${message}: ${body.error.message}`;
+    if (body?.error?.message) {
+      graphMessage = body.error.message;
+      message = `${message}: ${graphMessage}`;
+    }
     if (body?.error?.code) code = body.error.code;
   } catch {
     /* fallthrough */
   }
   const hint = permissionHintForPath(res.status, path, code);
-  throw new GraphPermissionError(message, res.status, code, hint);
+  throw new GraphPermissionError(message, res.status, code, hint, graphMessage);
 }
 
 function permissionHintForPath(status: number, path: string, code: string | null): string | null {
@@ -288,6 +374,24 @@ function permissionHintForPath(status: number, path: string, code: string | null
     }
     if (path.includes('/photo')) {
       return 'User.Read.All (Application) is required to read user photos';
+    }
+    if (path.includes('/temporaryAccessPassMethods')) {
+      return `${TAP_PERMISSIONS.issue.name} (Application) is required to issue Temporary Access Passes`;
+    }
+    if (path.includes('/authenticationMethodsPolicy')) {
+      return `${TAP_PERMISSIONS.policy.name} (Application) is required to read the Temporary Access Pass policy`;
+    }
+    if (path.includes('/roleManagement/')) {
+      return `${TAP_PERMISSIONS.roles.name} (Application) is required to read Entra role assignments and eligibilities`;
+    }
+    if (path.startsWith('/subscribedSkus')) {
+      return `${LICENSE_PERMISSIONS.organization.name} (Application) is required to read the tenant’s subscriptions`;
+    }
+    if (path.startsWith('/groups')) {
+      return `${LICENSE_PERMISSIONS.groups.name} (Application) is required to read groups and the licenses they grant`;
+    }
+    if (path.startsWith('/users')) {
+      return `${TAP_PERMISSIONS.users.name} (Application) is required to find users and their groups`;
     }
     if (path.includes('/organization')) {
       return 'Directory.Read.All (Application) is required for the /organization probe';
@@ -309,6 +413,13 @@ export class GraphClientFactory {
     private readonly entra: EntraIntegrationService,
     private readonly log: FastifyBaseLogger,
   ) {}
+
+  /** The directory's client while its Temporary Access Pass feature is on; null otherwise. */
+  async tapGraph(providerId: number): Promise<GraphClient | null> {
+    return (await this.entra.isFeatureEnabled(providerId, 'temporaryAccessPass'))
+      ? this.build(providerId)
+      : null;
+  }
 
   async build(providerId: number): Promise<GraphClient | null> {
     const existing = this.cache.get(providerId);

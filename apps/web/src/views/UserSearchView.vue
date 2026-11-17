@@ -1,5 +1,12 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
+import { useBulkAccountChange } from '../design/composables/useBulkAccountChange.js';
+import { useBulkActions, type BulkAction } from '../design/composables/useBulkActions.js';
+import { useBulkAttributeEdit } from '../design/composables/useBulkAttributeEdit.js';
+import { useBulkGroupMembership } from '../design/composables/useBulkGroupMembership.js';
+import Dialog from 'primevue/dialog';
+import type { ListFreshness } from '@openaduc/shared';
+import SyncFreshness from '../design/primitives/SyncFreshness.vue';
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import DataTable from 'primevue/datatable';
@@ -10,30 +17,57 @@ import InputText from 'primevue/inputtext';
 import InputNumber from 'primevue/inputnumber';
 import MultiSelect from 'primevue/multiselect';
 import Select from 'primevue/select';
-import Checkbox from 'primevue/checkbox';
-import Dialog from 'primevue/dialog';
-import TreeSelect from 'primevue/treeselect';
-import type { TreeNode } from 'primevue/treenode';
 import Message from 'primevue/message';
 import Toast from 'primevue/toast';
 import { useToast } from 'primevue/usetoast';
 import { FilterMatchMode, type FilterMatchModeValue } from '../design/lib/filterMatchMode.js';
 import { api } from '../api/index.js';
-import { ApiError } from '../api/client.js';
-import type { UserSummary } from '@openaduc/shared';
+import {
+  BULK_ACCOUNT_ACTIONS,
+  BULK_ACCOUNT_CAPABILITIES,
+  BULK_ACCOUNT_OPS,
+  csvRow,
+  type UserCreateResponse,
+  type UserSummary,
+} from '@openaduc/shared';
 import { useAuthStore } from '../stores/auth.js';
 import PageHeader from '../design/primitives/PageHeader.vue';
-import SyncButton from '../design/primitives/SyncButton.vue';
-import UserBulkBar from '../design/primitives/UserBulkBar.vue';
 import Avatar from '../design/primitives/Avatar.vue';
 import StatusBadge from '../design/primitives/StatusBadge.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
+import ListSkeleton from '../design/primitives/ListSkeleton.vue';
+import { useListLoading } from '../design/composables/useListLoading.js';
+import DeleteUsersDialog from '../design/feedback/DeleteUsersDialog.vue';
+import BulkAccountDialog from '../design/feedback/BulkAccountDialog.vue';
+import BulkJobPanel from '../design/feedback/BulkJobPanel.vue';
+import BulkRevertDialog from '../design/feedback/BulkRevertDialog.vue';
+import { useBulkJobRevert } from '../design/composables/useBulkJobRevert.js';
+import { bulkJobTitle } from '../design/lib/bulkJob.js';
+import BulkEditDialog from '../design/feedback/BulkEditDialog.vue';
+import BulkGroupsDialog from '../design/feedback/BulkGroupsDialog.vue';
+import PasteListDialog from '../design/feedback/PasteListDialog.vue';
+import NewUserDialog from '../design/feedback/NewUserDialog.vue';
+import { announceUserCreated } from '../design/feedback/userToasts.js';
 import { fmtRelative } from '../design/lib/format.js';
 
 const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
 const toast = useToast();
+
+const canCreate = computed(() => auth.hasCapability('write:user.create'));
+const newUserOpen = ref(false);
+
+/** The operator lands on the new user's page. */
+async function onUserCreated(created: UserCreateResponse): Promise<void> {
+  newUserOpen.value = false;
+  if (created.id) {
+    await router.push({ name: 'user-detail', params: { id: created.id } });
+  } else {
+    await load();
+  }
+  announceUserCreated(toast, created);
+}
 
 type AcctStatus = 'enabled' | 'disabled' | 'locked';
 
@@ -56,10 +90,28 @@ interface FilterEntry<T> {
 const rows = ref<UserRow[]>([]);
 const filteredRows = ref<UserRow[]>([]);
 const total = ref(0);
+const freshness = ref<ListFreshness | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const drawerOpen = ref(false);
-const searchInput = ref<HTMLInputElement | null>(null);
+const {
+  skeleton,
+  table: listTable,
+  title: pageTitle,
+  status: listStatus,
+  searchField,
+} = useListLoading<UserSummary>({
+  rows,
+  loading,
+  error,
+  total: () => total.value,
+  title: 'Users',
+  noun: ['user', 'users'],
+  open: openDetail,
+  showSearch: () => {
+    drawerOpen.value = true;
+  },
+});
 
 const filters = ref<{
   _searchBlob: FilterEntry<string>;
@@ -143,49 +195,6 @@ function decorate(u: UserSummary): UserRow {
   };
 }
 
-// ---- OU filter (server-side: re-queries with ?ou=<dn>&includeSubOus) ------
-// Unlike the other filters (which run client-side over the loaded rows), the
-// summary rows don't carry a DN, so OU membership is resolved by the server.
-const ouNodes = ref<TreeNode[]>([]);
-const ouNameByDn = ref<Map<string, string>>(new Map());
-const ouTreeSelection = ref<Record<string, boolean>>({});
-const includeSubOus = ref(true);
-const selectedOuDn = computed<string | null>(
-  () => Object.keys(ouTreeSelection.value).find((k) => ouTreeSelection.value[k]) ?? null,
-);
-
-async function loadOus(): Promise<void> {
-  try {
-    const resp = await api.ous.list();
-    const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
-    const nameMap = new Map<string, string>();
-    for (const o of resp.ous) {
-      byDn.set(o.distinguishedName.toLowerCase(), {
-        key: o.distinguishedName,
-        label: o.name,
-        children: [],
-      });
-      nameMap.set(o.distinguishedName, o.name);
-    }
-    const roots: TreeNode[] = [];
-    for (const o of resp.ous) {
-      const node = byDn.get(o.distinguishedName.toLowerCase())!;
-      const parent = o.parentDn ? byDn.get(o.parentDn.toLowerCase()) : undefined;
-      if (parent) parent.children!.push(node);
-      else roots.push(node);
-    }
-    const sortRec = (nodes: TreeNode[]): void => {
-      nodes.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? ''));
-      for (const n of nodes) if (n.children) sortRec(n.children);
-    };
-    sortRec(roots);
-    ouNodes.value = roots;
-    ouNameByDn.value = nameMap;
-  } catch {
-    // Non-fatal — the OU filter just won't have options.
-  }
-}
-
 async function load(): Promise<void> {
   loading.value = true;
   error.value = null;
@@ -194,99 +203,20 @@ async function load(): Promise<void> {
       pageSize: 50_000,
       sort: 'displayName',
       sortDir: 'asc',
-      ...(selectedOuDn.value ? { ou: selectedOuDn.value, includeSubOus: includeSubOus.value } : {}),
     });
     rows.value = resp.rows.map(decorate);
     filteredRows.value = rows.value;
+    // Accounts gone from the cache can't be acted on, nor shown as selected.
+    const loaded = loadedIds.value;
+    if ([...selectedIds.value].some((id) => !loaded.has(id))) {
+      selectedIds.value = new Set([...selectedIds.value].filter((id) => loaded.has(id)));
+    }
     total.value = resp.total;
+    freshness.value = resp.freshness;
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to load users';
   } finally {
     loading.value = false;
-  }
-}
-
-// Re-fetch when the OU filter changes (server-side filter).
-watch(selectedOuDn, () => void load());
-watch(includeSubOus, () => {
-  if (selectedOuDn.value) void load();
-});
-
-// ---- Create user ----------------------------------------------------------
-// Reuses the OU tree loaded for the filter (ouNodes) as the target-OU picker.
-const canCreateUser = computed(() => auth.hasCapability('write:user.create'));
-const newUserOpen = ref(false);
-const newUserSubmitting = ref(false);
-const newUserError = ref<string | null>(null);
-const newUserOuSel = ref<Record<string, boolean>>({});
-const newUserParentDn = computed<string | null>(
-  () => Object.keys(newUserOuSel.value).find((k) => newUserOuSel.value[k]) ?? null,
-);
-const newUserDraft = ref({
-  givenName: '',
-  surname: '',
-  displayName: '',
-  samAccountName: '',
-  userPrincipalName: '',
-  email: '',
-});
-const newUserSamValid = computed(() => {
-  const s = newUserDraft.value.samAccountName.trim();
-  return s.length >= 1 && s.length <= 20 && /^[^\s"[\]:;|=+*?<>/\\,]+$/.test(s);
-});
-
-function openNewUser(): void {
-  newUserDraft.value = {
-    givenName: '',
-    surname: '',
-    displayName: '',
-    samAccountName: '',
-    userPrincipalName: '',
-    email: '',
-  };
-  newUserOuSel.value = {};
-  newUserError.value = null;
-  newUserOpen.value = true;
-}
-
-async function submitNewUser(): Promise<void> {
-  if (!newUserParentDn.value) {
-    newUserError.value = 'Pick a target OU.';
-    return;
-  }
-  if (!newUserSamValid.value) {
-    newUserError.value = 'Logon name is required, ≤20 chars, no spaces or reserved characters.';
-    return;
-  }
-  newUserError.value = null;
-  newUserSubmitting.value = true;
-  try {
-    const d = newUserDraft.value;
-    const res = await api.users.create({
-      parentDn: newUserParentDn.value,
-      samAccountName: d.samAccountName.trim(),
-      userPrincipalName: d.userPrincipalName.trim() || undefined,
-      givenName: d.givenName.trim() || undefined,
-      surname: d.surname.trim() || undefined,
-      displayName: d.displayName.trim() || undefined,
-      email: d.email.trim() || undefined,
-    });
-    toast.add({
-      severity: 'success',
-      summary: 'User created',
-      detail: `${res.samAccountName} created (disabled). Set a password and enable it to activate.`,
-      life: 6000,
-    });
-    newUserOpen.value = false;
-    await load();
-  } catch (err) {
-    if (err instanceof ApiError && err.code === 'step_up_required') {
-      auth.stepUpPendingAction = submitNewUser;
-      return;
-    }
-    newUserError.value = err instanceof ApiError ? err.message : String(err);
-  } finally {
-    newUserSubmitting.value = false;
   }
 }
 
@@ -296,6 +226,11 @@ async function submitNewUser(): Promise<void> {
 // "pages" — "select all" instead toggles every currently-visible row.
 const selectedIds = ref<Set<string>>(new Set());
 const selectedCount = computed(() => selectedIds.value.size);
+const loadedIds = computed(() => new Set(rows.value.map((r) => r.id)));
+const hiddenSelectedCount = computed(() => {
+  const visible = new Set(filteredRows.value.map((r) => r.id));
+  return [...selectedIds.value].filter((id) => !visible.has(id)).length;
+});
 
 const allFilteredSelected = computed(
   () =>
@@ -347,7 +282,7 @@ function isActive(value: unknown): boolean {
 }
 
 interface Chip {
-  key: FilterKey | 'ou';
+  key: FilterKey;
   label: string;
 }
 
@@ -389,20 +324,12 @@ const activeChips = computed<Chip[]>(() => {
   if (isActive(f.title.value)) {
     out.push({ key: 'title', label: `Title: "${f.title.value}"` });
   }
-  if (selectedOuDn.value) {
-    const name = ouNameByDn.value.get(selectedOuDn.value) ?? selectedOuDn.value;
-    out.push({ key: 'ou', label: `OU: ${name}${includeSubOus.value ? ' (+sub)' : ''}` });
-  }
   return out;
 });
 
 const activeCount = computed(() => activeChips.value.length);
 
-function clearFilter(key: FilterKey | 'ou'): void {
-  if (key === 'ou') {
-    ouTreeSelection.value = {};
-    return;
-  }
+function clearFilter(key: FilterKey): void {
   filters.value[key].value = null;
 }
 
@@ -410,8 +337,6 @@ function clearAll(): void {
   for (const k of Object.keys(filters.value) as FilterKey[]) {
     filters.value[k].value = null;
   }
-  ouTreeSelection.value = {};
-  includeSubOus.value = true;
 }
 
 // ---- Deep-link / URL sync -------------------------------------------------
@@ -485,15 +410,7 @@ watch(
 // Generate from filteredRows so the export honors whatever the operator
 // is looking at right now. Replaces the server-side /users/export.csv
 // path; with all rows already in memory there's no reason to re-query.
-function csvEscape(v: unknown): string {
-  if (v == null) return '';
-  let s = String(v);
-  // A value from the directory that starts like a formula would run in the spreadsheet
-  // that opens the export; a leading apostrophe makes it text.
-  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
-  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-}
+// csvRow neutralises formula-like cells, same as the server export.
 
 function exportCsv(): void {
   const cols: { header: string; pick: (r: UserRow) => unknown }[] = [
@@ -509,9 +426,9 @@ function exportCsv(): void {
     { header: 'Title', pick: (r) => r.title ?? '' },
     { header: 'Modified', pick: (r) => r.modifiedAtSource ?? '' },
   ];
-  const lines = [cols.map((c) => csvEscape(c.header)).join(',')];
+  const lines = [csvRow(cols.map((c) => c.header))];
   for (const r of filteredRows.value) {
-    lines.push(cols.map((c) => csvEscape(c.pick(r))).join(','));
+    lines.push(csvRow(cols.map((c) => c.pick(r))));
   }
   const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -530,10 +447,135 @@ function exportCsv(): void {
   });
 }
 
-// Bulk actions now live in the shared <UserBulkBar> component (rendered at the
-// top of the page); selection state above drives the table checkboxes and is
-// passed to it. `clearSelection`/`selectedCount` are still exported for the
-// checkbox header + potential callers.
+// ---- Bulk actions ---------------------------------------------------------
+const canBulkDisable = computed(() => auth.hasCapability('write:user.enableDisable'));
+const canBulkUnlock = computed(() => auth.hasCapability('write:user.unlock'));
+
+const bulk = useBulkActions({ selectedIds, toast, reload: load });
+const {
+  job: bulkJob,
+  busy: bulkJobBusy,
+  pendingBulkAction,
+  bulkRunning,
+  bulkErrors,
+  jobFailure: bulkJobFailure,
+  confirming: confirmingBulk,
+  confirmation: bulkConfirm,
+  requestBulk,
+  cancelBulk,
+  startBulk,
+  startGroupChange,
+  startAttributeEdit,
+  startAccountChange,
+  continueJob,
+  retryFailed,
+  stopJob,
+  dismissJob,
+  restore: restoreBulkJob,
+} = bulk;
+const jobRevert = useBulkJobRevert({ bulk });
+
+function revertBulkJob(): void {
+  const job = bulkJob.value;
+  if (!job) return;
+  void jobRevert.open({
+    jobId: job.id,
+    title: bulkJobTitle(job, job.counts.total, job.actorDisplayName),
+    action: job.action,
+  });
+}
+const selectedRows = computed(() => rows.value.filter((r) => selectedIds.value.has(r.id)));
+
+const canBulkGroups = computed(() => auth.hasCapability('write:group.membership'));
+const groupChange = useBulkGroupMembership({
+  ids: () => Array.from(selectedIds.value),
+  start: startGroupChange,
+  canGrantRoles: () => auth.hasCapability('configure:security'),
+});
+const groupJobPending = computed(
+  () =>
+    pendingBulkAction.value === 'user.group.add' || pendingBulkAction.value === 'user.group.remove',
+);
+
+const canBulkEdit = computed(() => auth.hasCapability('write:user.attributes'));
+const attributeEdit = useBulkAttributeEdit({
+  ids: () => Array.from(selectedIds.value),
+  start: startAttributeEdit,
+});
+
+const allowedAccountOps = computed(() =>
+  BULK_ACCOUNT_OPS.filter((op) => auth.hasCapability(BULK_ACCOUNT_CAPABILITIES[op])),
+);
+const accountSettingOps = computed(() => allowedAccountOps.value.filter((op) => op !== 'move'));
+const canBulkMove = computed(() => allowedAccountOps.value.includes('move'));
+const accountChange = useBulkAccountChange({
+  ids: () => Array.from(selectedIds.value),
+  start: startAccountChange,
+  allowed: () => allowedAccountOps.value,
+});
+const accountJobPending = computed(
+  () =>
+    pendingBulkAction.value !== null &&
+    pendingBulkAction.value !== 'user.move' &&
+    (Object.values(BULK_ACCOUNT_ACTIONS) as string[]).includes(pendingBulkAction.value),
+);
+
+const BULK_ICONS: Record<BulkAction, string> = {
+  disable: 'pi pi-ban',
+  enable: 'pi pi-check',
+  unlock: 'pi pi-unlock',
+};
+
+function confirmBulk(): void {
+  const action = confirmingBulk.value;
+  if (action) startBulk(action);
+}
+
+// Delete runs in its own dialog (preflight, typed confirmation, progress)
+// rather than through startBulk. Only disabled accounts can be deleted, so
+// the button stays off until the selection has one.
+const MAX_DELETE_BATCH = 1000;
+const canBulkDelete = computed(() => auth.hasCapability('write:user.delete'));
+const deleteDialogOpen = ref(false);
+const deleteIds = ref<string[]>([]);
+const selectedDisabledCount = computed(
+  () => rows.value.filter((r) => selectedIds.value.has(r.id) && !r.enabled).length,
+);
+
+function openBulkDelete(): void {
+  const ids = rows.value.filter((r) => selectedIds.value.has(r.id)).map((r) => r.id);
+  if (ids.length > MAX_DELETE_BATCH) {
+    toast.add({
+      severity: 'warn',
+      summary: 'Too many accounts selected',
+      detail: `Select at most ${MAX_DELETE_BATCH.toLocaleString()} accounts to delete at a time.`,
+      life: 6000,
+    });
+    return;
+  }
+  deleteIds.value = ids;
+  deleteDialogOpen.value = true;
+}
+
+async function onBulkDeleted(deletedIds: string[]): Promise<void> {
+  // Reload even when nothing was deleted: accounts found already gone have
+  // left the cache too.
+  const next = new Set(selectedIds.value);
+  for (const id of deletedIds) next.delete(id);
+  selectedIds.value = next;
+  await load();
+}
+
+const canBulkAct = computed(
+  () =>
+    canBulkDisable.value ||
+    canBulkUnlock.value ||
+    canBulkDelete.value ||
+    canBulkGroups.value ||
+    canBulkEdit.value ||
+    allowedAccountOps.value.length > 0,
+);
+const pasteListOpen = ref(false);
 
 // ---- Display helpers ------------------------------------------------------
 type PwdTone = 'red' | 'amber' | 'violet' | 'muted';
@@ -553,7 +595,8 @@ function pwdExpiryLabel(u: UserSummary): string {
   if (!u.passwordExpiresAt) return '—';
   const ms = new Date(u.passwordExpiresAt).getTime() - Date.now();
   const days = Math.round(ms / (24 * 60 * 60 * 1000));
-  if (days < 0) return `Exp ${Math.abs(days)}d ago`;
+  // The column says what expired.
+  if (days < 0) return `${Math.abs(days)}d ago`;
   if (days === 0) return 'Today';
   return `${days}d`;
 }
@@ -568,9 +611,9 @@ onMounted(() => {
   applyQuery(route.query);
   suppressSync = false;
   void load();
-  void loadOus();
+  if (canBulkAct.value) void restoreBulkJob();
   if (!isActive(filters.value._searchBlob.value)) {
-    searchInput.value?.focus();
+    (searchField.value?.$el as HTMLElement | undefined)?.focus();
   }
 });
 </script>
@@ -578,15 +621,23 @@ onMounted(() => {
 <template>
   <Toast />
   <div class="page-inner page-fill users-page">
-    <PageHeader :title="`Users (${total.toLocaleString()})`">
+    <span class="sr-only" role="status">{{ listStatus }}</span>
+    <PageHeader :title="pageTitle">
       <template #actions>
+        <SyncFreshness :freshness="freshness" />
         <Button
-          v-if="canCreateUser"
+          v-if="canCreate"
           label="New user"
           icon="pi pi-user-plus"
+          @click="newUserOpen = true"
+        />
+        <Button
+          v-if="canCreate"
+          label="Import"
+          icon="pi pi-file-import"
           severity="secondary"
           outlined
-          @click="auth.requireEdit(openNewUser)"
+          @click="router.push({ name: 'user-import' })"
         />
         <Button
           :label="activeCount > 0 ? `Filter (${activeCount})` : 'Filter'"
@@ -594,6 +645,15 @@ onMounted(() => {
           :severity="activeCount > 0 ? 'primary' : 'secondary'"
           :outlined="activeCount === 0"
           @click="drawerOpen = true"
+        />
+        <Button
+          v-if="canBulkAct"
+          label="Paste a list"
+          icon="pi pi-list-check"
+          severity="secondary"
+          outlined
+          :disabled="bulkRunning"
+          @click="pasteListOpen = true"
         />
         <Button
           v-if="auth.hasCapability('export:user')"
@@ -611,7 +671,6 @@ onMounted(() => {
           outlined
           @click="router.push({ name: 'deleted-users' })"
         />
-        <SyncButton :task-keys="['users.full']" @done="load" />
         <Button
           label="Refresh"
           icon="pi pi-refresh"
@@ -624,6 +683,18 @@ onMounted(() => {
     </PageHeader>
 
     <Message v-if="error" severity="error" :closable="false">{{ error }}</Message>
+
+    <BulkJobPanel
+      v-if="bulkJob"
+      :job="bulkJob"
+      :failure="bulkJobFailure"
+      :busy="bulkJobBusy"
+      @stop="stopJob"
+      @continue="continueJob"
+      @retry="retryFailed"
+      @revert="revertBulkJob"
+      @dismiss="dismissJob"
+    />
 
     <div v-if="activeCount > 0" class="chip-strip">
       <button
@@ -639,29 +710,27 @@ onMounted(() => {
       <button type="button" class="filter-chip clear-all" @click="clearAll">Clear all</button>
     </div>
 
-    <UserBulkBar
-      :selected-ids="selectedIds"
-      @update:selected-ids="(v) => (selectedIds = v)"
-      @done="load"
-    />
-
     <DataTable
       v-model:filters="filters"
       :value="rows"
-      :loading="loading"
       data-key="id"
       removable-sort
       sort-field="displayName"
       :sort-order="1"
       scrollable
       scroll-height="flex"
-      :virtual-scroller-options="{ itemSize: 56 }"
+      v-bind="listTable"
       class="users-table"
       @value-change="(v: UserRow[]) => (filteredRows = v)"
       @row-click="(ev) => openDetail(ev.data as UserSummary)"
     >
       <template #empty>
+        <ListSkeleton
+          v-if="skeleton"
+          :columns="['check', 'avatar', 'badge', 'badge', 'text', 'text', 'text', 'text']"
+        />
         <EmptyState
+          v-else
           icon="pi pi-search"
           :title="activeCount > 0 ? 'No users match these filters' : 'No users yet'"
           :message="
@@ -704,7 +773,7 @@ onMounted(() => {
         </template>
       </Column>
 
-      <Column header="User" field="displayName" sortable :style="{ minWidth: '260px' }">
+      <Column header="User" field="displayName" sortable>
         <template #body="{ data }">
           <div class="user-cell">
             <Avatar
@@ -714,52 +783,64 @@ onMounted(() => {
               :photo-url="rowPhotoUrl(data)"
             />
             <div class="user-cell-stack">
-              <div class="user-name">{{ data.displayName ?? data.samAccountName }}</div>
-              <div class="user-meta">{{ data.userPrincipalName ?? data.samAccountName }}</div>
+              <div class="user-name" :title="data.displayName ?? data.samAccountName">
+                {{ data.displayName ?? data.samAccountName }}
+              </div>
+              <!-- A failed bulk action takes the second line, so the row
+                   keeps the list's row height. -->
+              <div
+                v-if="bulkErrors.has(data.id)"
+                class="user-bulk-error"
+                role="alert"
+                :title="bulkErrors.get(data.id)"
+              >
+                <i class="pi pi-exclamation-circle" aria-hidden="true" />
+                <span>{{ bulkErrors.get(data.id) }}</span>
+              </div>
+              <div v-else class="user-meta" :title="data.userPrincipalName ?? data.samAccountName">
+                {{ data.userPrincipalName ?? data.samAccountName }}
+              </div>
             </div>
           </div>
         </template>
       </Column>
-      <Column header="Status" field="_acctStatus" sortable :style="{ width: '140px' }">
+      <Column header="Status" field="_acctStatus" sortable :style="{ width: '200px' }">
         <template #body="{ data }">
           <StatusBadge :user="data" />
         </template>
       </Column>
-      <Column header="Pwd expires" field="passwordExpiresAt" sortable :style="{ width: '160px' }">
+      <Column header="Pwd expires" field="passwordExpiresAt" sortable :style="{ width: '130px' }">
         <template #body="{ data }">
           <span
             class="badge"
             :class="`badge-${pwdExpiryTone(data)}`"
-            :title="data.passwordNeverExpires ? 'DONT_EXPIRE_PASSWORD set' : undefined"
+            :title="data.passwordNeverExpires ? 'DONT_EXPIRE_PASSWORD set' : pwdExpiryLabel(data)"
           >
             <span v-if="pwdHasDot(data)" class="badge-dot" />
-            {{ pwdExpiryLabel(data) }}
+            <span>{{ pwdExpiryLabel(data) }}</span>
           </span>
         </template>
       </Column>
-      <Column field="department" header="Department" sortable :style="{ width: '180px' }">
+      <Column field="department" header="Department" sortable :style="{ width: '13%' }">
         <template #body="{ data }">
-          <span class="cell-muted">{{ data.department ?? '—' }}</span>
+          <span class="cell-muted" :title="data.department ?? undefined">{{
+            data.department ?? '—'
+          }}</span>
         </template>
       </Column>
-      <Column field="title" header="Title" sortable :style="{ width: '180px' }">
+      <Column field="title" header="Title" sortable :style="{ width: '13%' }">
         <template #body="{ data }">
-          <span class="cell-muted">{{ data.title ?? '—' }}</span>
+          <span class="cell-muted" :title="data.title ?? undefined">{{ data.title ?? '—' }}</span>
         </template>
       </Column>
-      <Column field="mobile" header="Mobile" sortable :style="{ width: '150px' }">
-        <template #body="{ data }">
-          <span class="cell-muted">{{ data.mobile ?? '—' }}</span>
-        </template>
-      </Column>
-      <Column header="Last logon" field="lastLogonAt" sortable :style="{ width: '140px' }">
+      <Column header="Last logon" field="lastLogonAt" sortable :style="{ width: '120px' }">
         <template #body="{ data }">
           <span class="cell-mono">{{
             data.lastLogonAt ? fmtRelative(data.lastLogonAt) : '—'
           }}</span>
         </template>
       </Column>
-      <Column header="Modified" field="modifiedAtSource" sortable :style="{ width: '140px' }">
+      <Column header="Modified" field="modifiedAtSource" sortable :style="{ width: '120px' }">
         <template #body="{ data }">
           <span class="cell-mono">{{
             data.modifiedAtSource ? fmtRelative(data.modifiedAtSource) : '—'
@@ -768,83 +849,160 @@ onMounted(() => {
       </Column>
     </DataTable>
 
-    <!-- New user dialog. Created disabled with no password; set a password
-         and enable it afterwards from the user's page. -->
-    <Dialog
-      :visible="newUserOpen"
-      modal
-      header="New user"
-      :style="{ width: '34rem' }"
-      :closable="!newUserSubmitting"
-      @update:visible="(v) => !v && (newUserOpen = false)"
-    >
-      <p style="font-size: 13px; color: var(--text-3); margin: 0 0 14px">
-        The account is created <strong>disabled with no password</strong>. Set a password and enable
-        it afterwards from the user's page.
-      </p>
-      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px">
-        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
-          <span style="font-size: 12px; color: var(--text-3)">Target OU</span>
-          <TreeSelect
-            v-model="newUserOuSel"
-            :options="ouNodes"
-            selection-mode="single"
-            placeholder="Select an OU"
-            fluid
-            filter
+    <transition name="bulk-fade">
+      <div v-if="selectedCount > 0" class="bulkbar" role="region" aria-label="Bulk actions">
+        <span class="bulkbar-count mono">
+          <strong>{{ selectedCount }}</strong> selected
+          <template v-if="hiddenSelectedCount > 0">
+            · {{ hiddenSelectedCount }} hidden by filters
+          </template>
+        </span>
+        <span class="bulkbar-divider" />
+        <div class="bulkbar-actions">
+          <Button
+            v-if="canBulkUnlock"
+            label="Unlock"
+            icon="pi pi-unlock"
+            severity="warn"
+            size="small"
+            :loading="bulkRunning && pendingBulkAction === 'user.unlock'"
+            :disabled="bulkRunning"
+            @click="requestBulk('unlock')"
           />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)">First name</span>
-          <InputText v-model="newUserDraft.givenName" fluid />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)">Last name</span>
-          <InputText v-model="newUserDraft.surname" fluid />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
-          <span style="font-size: 12px; color: var(--text-3)">Display name (optional)</span>
-          <InputText
-            v-model="newUserDraft.displayName"
-            placeholder="defaults to First Last"
-            fluid
+          <Button
+            v-if="canBulkDisable"
+            label="Disable"
+            icon="pi pi-ban"
+            severity="danger"
+            size="small"
+            :loading="bulkRunning && pendingBulkAction === 'user.disable'"
+            :disabled="bulkRunning"
+            @click="requestBulk('disable')"
           />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)"
-            >User logon name (sAMAccountName)</span
-          >
-          <InputText v-model="newUserDraft.samAccountName" fluid />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)">User principal name (optional)</span>
-          <InputText v-model="newUserDraft.userPrincipalName" placeholder="user@domain" fluid />
-        </div>
-        <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
-          <span style="font-size: 12px; color: var(--text-3)">Email (optional)</span>
-          <InputText v-model="newUserDraft.email" fluid />
+          <Button
+            v-if="canBulkDisable"
+            label="Enable"
+            icon="pi pi-check"
+            severity="secondary"
+            size="small"
+            :loading="bulkRunning && pendingBulkAction === 'user.enable'"
+            :disabled="bulkRunning"
+            @click="requestBulk('enable')"
+          />
+          <Button
+            v-if="canBulkGroups"
+            label="Groups…"
+            icon="pi pi-users"
+            severity="secondary"
+            size="small"
+            :loading="bulkRunning && groupJobPending"
+            :disabled="bulkRunning"
+            @click="groupChange.open()"
+          />
+          <Button
+            v-if="canBulkEdit"
+            label="Edit…"
+            icon="pi pi-pencil"
+            severity="secondary"
+            size="small"
+            :loading="bulkRunning && pendingBulkAction === 'user.update'"
+            :disabled="bulkRunning"
+            @click="attributeEdit.open()"
+          />
+          <Button
+            v-if="canBulkMove"
+            label="Move…"
+            icon="pi pi-folder-open"
+            severity="secondary"
+            size="small"
+            :loading="bulkRunning && pendingBulkAction === 'user.move'"
+            :disabled="bulkRunning"
+            @click="accountChange.open('move')"
+          />
+          <Button
+            v-if="accountSettingOps.length > 0"
+            label="Account…"
+            icon="pi pi-id-card"
+            severity="secondary"
+            size="small"
+            :loading="bulkRunning && accountJobPending"
+            :disabled="bulkRunning"
+            @click="accountChange.open(accountSettingOps[0]!)"
+          />
+          <Button
+            v-if="canBulkDelete"
+            label="Delete…"
+            icon="pi pi-trash"
+            severity="danger"
+            outlined
+            size="small"
+            :disabled="bulkRunning || selectedDisabledCount === 0"
+            :title="
+              selectedDisabledCount === 0 ? 'Only disabled accounts can be deleted' : undefined
+            "
+            @click="openBulkDelete"
+          />
+          <Button
+            label="Clear"
+            icon="pi pi-times"
+            text
+            severity="secondary"
+            size="small"
+            :disabled="bulkRunning"
+            @click="clearSelection"
+          />
         </div>
       </div>
-      <Message v-if="newUserError" severity="error" :closable="false" class="mt-2">{{
-        newUserError
-      }}</Message>
+    </transition>
+
+    <Dialog
+      :visible="confirmingBulk !== null"
+      modal
+      :header="bulkConfirm?.title"
+      :style="{ width: '28rem' }"
+      @update:visible="(v) => !v && cancelBulk()"
+    >
+      <p class="confirm-text">{{ bulkConfirm?.consequence }}</p>
+      <p v-if="hiddenSelectedCount > 0" class="confirm-text">
+        {{
+          hiddenSelectedCount === 1
+            ? '1 of them is hidden by the current filters.'
+            : `${hiddenSelectedCount} of them are hidden by the current filters.`
+        }}
+      </p>
+      <ul class="confirm-list">
+        <li v-for="r in selectedRows" :key="r.id">{{ r.displayName ?? r.samAccountName }}</li>
+      </ul>
       <template #footer>
+        <Button label="Cancel" severity="secondary" text @click="cancelBulk" />
         <Button
-          label="Cancel"
-          text
-          severity="secondary"
-          :disabled="newUserSubmitting"
-          @click="newUserOpen = false"
-        />
-        <Button
-          label="Create user"
-          icon="pi pi-user-plus"
-          :loading="newUserSubmitting"
-          :disabled="!newUserParentDn || !newUserSamValid"
-          @click="submitNewUser"
+          :label="bulkConfirm?.confirmLabel"
+          :icon="confirmingBulk ? BULK_ICONS[confirmingBulk] : undefined"
+          :severity="confirmingBulk === 'disable' ? 'danger' : undefined"
+          @click="confirmBulk"
         />
       </template>
     </Dialog>
+
+    <BulkGroupsDialog :workflow="groupChange" :hidden-count="hiddenSelectedCount" />
+    <BulkEditDialog :workflow="attributeEdit" :hidden-count="hiddenSelectedCount" />
+    <BulkAccountDialog :workflow="accountChange" :hidden-count="hiddenSelectedCount" />
+    <BulkRevertDialog :workflow="jobRevert" />
+
+    <PasteListDialog
+      v-model:visible="pasteListOpen"
+      v-model:selected="selectedIds"
+      :is-loaded="(id) => loadedIds.has(id)"
+    />
+
+    <NewUserDialog v-if="newUserOpen" v-model:visible="newUserOpen" @created="onUserCreated" />
+
+    <DeleteUsersDialog
+      v-if="deleteDialogOpen"
+      v-model:visible="deleteDialogOpen"
+      :ids="deleteIds"
+      @done="onBulkDeleted"
+    />
 
     <Drawer
       v-model:visible="drawerOpen"
@@ -856,28 +1014,11 @@ onMounted(() => {
         <div class="filter-field">
           <label class="filter-label">Search</label>
           <InputText
-            ref="searchInput"
+            ref="searchField"
             v-model="filters._searchBlob.value"
             placeholder="Name, username, UPN, email…"
             class="filter-input"
           />
-        </div>
-
-        <div class="filter-field">
-          <label class="filter-label">Organizational unit</label>
-          <TreeSelect
-            v-model="ouTreeSelection"
-            :options="ouNodes"
-            selection-mode="single"
-            placeholder="Any OU"
-            class="filter-input"
-            fluid
-            filter
-          />
-          <label class="filter-check">
-            <Checkbox v-model="includeSubOus" binary :disabled="!selectedOuDn" />
-            Include sub-OUs
-          </label>
         </div>
 
         <div v-if="showStatusFilter" class="filter-field">
@@ -976,6 +1117,18 @@ onMounted(() => {
   position: relative;
 }
 
+/* page-fill flexes whichever child comes last. The bulk bar is last while
+   rows are selected, so name the filler instead and keep the bar its own
+   height. */
+.users-page.page-fill > .users-table {
+  flex: 1;
+  min-height: 0;
+}
+
+.users-page.page-fill > .bulkbar {
+  flex: none;
+}
+
 .chip-strip {
   display: flex;
   flex-wrap: wrap;
@@ -1036,9 +1189,6 @@ onMounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .user-meta {
@@ -1084,6 +1234,39 @@ onMounted(() => {
   border: 1px solid var(--border);
 }
 
+/* Fixed column widths, so columns don't resize to fit whichever rows have
+   arrived or are scrolled into view. Narrower than this, the table scrolls
+   sideways rather than squeezing the User column away. */
+:deep(.users-table .p-datatable-table) {
+  table-layout: fixed;
+  width: 100%;
+  min-width: 1100px;
+}
+
+:deep(.users-table td) {
+  overflow: hidden;
+}
+
+:deep(.users-table td > .cell-muted),
+:deep(.users-table td > .cell-mono) {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Badges never cut off: one too long for its column ends in an ellipsis,
+   with the full text in its title. */
+:deep(.users-table td > .badge) {
+  max-width: 100%;
+}
+
+:deep(.users-table td > .badge > span:last-child) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Bulk action bar */
 .bulkbar {
   position: sticky;
@@ -1098,13 +1281,15 @@ onMounted(() => {
   padding: 8px 14px;
   background: var(--surface-2);
   border: 1px solid var(--border-strong);
-  border-radius: 999px;
+  /* A pill on one row; a rounded box once the actions wrap. */
+  border-radius: 26px;
   box-shadow: var(--shadow-lg);
   font-size: 12.5px;
   align-self: center;
 }
 
 .bulkbar-count {
+  flex-shrink: 0;
   color: var(--text-2);
   font-size: 12px;
 }
@@ -1115,6 +1300,7 @@ onMounted(() => {
 }
 
 .bulkbar-divider {
+  flex-shrink: 0;
   width: 1px;
   height: 16px;
   background: var(--border-strong);
@@ -1122,13 +1308,10 @@ onMounted(() => {
 
 .bulkbar-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px;
-}
-
-.bulkbar-progress {
-  font-size: 11.5px;
-  color: var(--text-3);
+  min-width: 0;
 }
 
 .bulk-fade-enter-active,
@@ -1165,16 +1348,6 @@ onMounted(() => {
   color: var(--text-3);
 }
 
-.filter-check {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--text-3);
-  cursor: pointer;
-}
-
 .filter-input {
   width: 100%;
 }
@@ -1183,5 +1356,30 @@ onMounted(() => {
   display: flex;
   justify-content: space-between;
   width: 100%;
+}
+.user-bulk-error {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 1px;
+  font-size: 11px;
+  color: var(--red, #dc2626);
+  white-space: nowrap;
+}
+
+.user-bulk-error > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.confirm-text {
+  margin: 0 0 8px;
+}
+.confirm-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  max-height: 12rem;
+  overflow-y: auto;
 }
 </style>

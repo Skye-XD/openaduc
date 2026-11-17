@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: BUSL-1.1
-import type { Kysely } from 'kysely';
+import {
+  DEFAULT_NAMING_PATTERN,
+  DEFAULT_NEW_USER_SETTINGS,
+  LDAP_TLS_MODES,
+  type LdapTlsMode,
+  type NamingSettings,
+  type NewUserSettings,
+  ldapTransportProblem,
+  newUserSettingsSchema,
+} from '@openaduc/shared';
+import { type Kysely, sql } from 'kysely';
 import type { Env } from '../config/env.js';
 import type { DB } from '../db/types.js';
 import { decryptSecret, encryptSecret } from '../lib/encryption.js';
@@ -19,7 +29,19 @@ export interface DirectoryProviderSummary {
   domain: string;
   baseDn: string;
   ldapUrls: string[];
-  tlsMode: string;
+  tlsMode: LdapTlsMode;
+  /**
+   * Why the URLs don't fit the TLS mode (e.g. ldap:// under LDAPS), or null.
+   * Saves are validated, so this flags rows from before that check. Such a
+   * directory still connects with TLS (see transportFor) but should be fixed.
+   */
+  transportProblem: string | null;
+  /**
+   * The DC's certificate isn't verified (per-directory setting, or the
+   * AD_TLS_REJECT_UNAUTHORIZED default), so the connection can be
+   * intercepted. Flagged to admins.
+   */
+  certificateCheckOff: boolean;
   /**
    * Per-directory TLS hardening setting. False = accept self-signed certs
    * (lab / on-prem dev DCs). The env var is the global default; this
@@ -32,6 +54,10 @@ export interface DirectoryProviderSummary {
   syncBindUpn: string | null;
   /** Whether a sync bind password is stored. Never returns the password. */
   hasSyncBindPassword: boolean;
+  /** How new accounts are named: the defaults until changed with configure:directory. */
+  naming: NamingSettings;
+  /** What a new user gets unless the operator changes it: the defaults until changed. */
+  newUsers: NewUserSettings;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,7 +69,7 @@ export interface DirectoryProviderInput {
   domain: string;
   baseDn: string;
   ldapUrls: string[];
-  tlsMode: 'ldaps' | 'starttls' | 'plain';
+  tlsMode: LdapTlsMode;
   tlsRejectUnauthorized?: boolean;
   operationTimeoutMs?: number;
   /** Background-sync service-account UPN. Optional. */
@@ -73,6 +99,7 @@ export function buildEphemeralProvider(
     name: input.name,
     baseDn: input.baseDn,
     ldapUrls: input.ldapUrls,
+    tlsMode: input.tlsMode,
     tlsRejectUnauthorized: input.tlsRejectUnauthorized ?? fallbacks.tlsRejectUnauthorized,
     tlsCaPath: fallbacks.tlsCaPath,
     operationTimeoutMs: input.operationTimeoutMs ?? fallbacks.operationTimeoutMs,
@@ -85,9 +112,8 @@ export function buildEphemeralProvider(
 export class DirectoryConfigService {
   constructor(
     private readonly db: Kysely<DB>,
-    // env is unused now that bind credentials aren't stored, but kept on the
-    // service for future per-directory env defaults (timeouts, etc.).
-    _env: Env,
+    // Global defaults a directory's own settings fall back to.
+    private readonly env: Env,
   ) {}
 
   /** True iff at least one configured directory_providers row exists. */
@@ -128,7 +154,7 @@ export class DirectoryConfigService {
       .selectAll()
       .where('id', '=', id)
       .executeTakeFirst();
-    return row ? rowToSummary(row) : null;
+    return row ? rowToSummary(row, this.env) : null;
   }
 
   /**
@@ -160,7 +186,7 @@ export class DirectoryConfigService {
       })
       .returningAll()
       .executeTakeFirstOrThrow();
-    return rowToSummary(row);
+    return rowToSummary(row, this.env);
   }
 
   /**
@@ -185,16 +211,7 @@ export class DirectoryConfigService {
     id: number,
     patch: Partial<DirectoryProviderInput>,
   ): Promise<DirectoryProviderSummary> {
-    const row = await this.db
-      .selectFrom('directory_providers')
-      .selectAll()
-      .where('id', '=', id)
-      .executeTakeFirst();
-    if (!row) throw new Error(`directory provider ${id} not found`);
-
-    const existingConfig = (row.config_json as Record<string, unknown> | null) ?? {};
-    const nextConfig = {
-      ...existingConfig,
+    const configPatch = {
       ...(patch.tlsRejectUnauthorized !== undefined
         ? { tlsRejectUnauthorized: patch.tlsRejectUnauthorized }
         : {}),
@@ -203,9 +220,11 @@ export class DirectoryConfigService {
         : {}),
     };
 
+    // Merged in the database, so a concurrent updateNaming or updateNewUsers
+    // isn't overwritten.
     const setClause: Record<string, unknown> = {
       updated_at: new Date(),
-      config_json: JSON.stringify(nextConfig),
+      config_json: sql`config_json || ${JSON.stringify(configPatch)}::jsonb`,
     };
     if (patch.name !== undefined) setClause.name = patch.name;
     if (patch.displayName !== undefined) setClause.display_name = patch.displayName;
@@ -228,9 +247,36 @@ export class DirectoryConfigService {
       .set(setClause)
       .where('id', '=', id)
       .returningAll()
-      .executeTakeFirstOrThrow();
+      .executeTakeFirst();
+    if (!updated) throw new Error(`directory provider ${id} not found`);
+    return rowToSummary(updated, this.env);
+  }
 
-    return rowToSummary(updated);
+  /** Replace the naming pattern and UPN suffix. Existing accounts keep their names. */
+  async updateNaming(id: number, naming: NamingSettings): Promise<DirectoryProviderSummary> {
+    const updated = await this.db
+      .updateTable('directory_providers')
+      .set({
+        updated_at: new Date(),
+        config_json: sql`config_json || ${JSON.stringify({ naming })}::jsonb`,
+      })
+      .where('id', '=', id)
+      .returningAll()
+      .executeTakeFirstOrThrow();
+    return rowToSummary(updated, this.env);
+  }
+
+  async updateNewUsers(id: number, newUsers: NewUserSettings): Promise<DirectoryProviderSummary> {
+    const updated = await this.db
+      .updateTable('directory_providers')
+      .set({
+        updated_at: new Date(),
+        config_json: sql`config_json || ${JSON.stringify({ newUsers })}::jsonb`,
+      })
+      .where('id', '=', id)
+      .returningAll()
+      .executeTakeFirstOrThrow();
+    return rowToSummary(updated, this.env);
   }
 
   async listAll(): Promise<DirectoryProviderSummary[]> {
@@ -240,7 +286,7 @@ export class DirectoryConfigService {
       .orderBy('configured', 'desc')
       .orderBy('id', 'asc')
       .execute();
-    return rows.map(rowToSummary);
+    return rows.map((r) => rowToSummary(r, this.env));
   }
 }
 
@@ -250,22 +296,42 @@ function parseTlsRejectUnauthorized(config: unknown): boolean | null {
   return typeof v === 'boolean' ? v : null;
 }
 
-function rowToSummary(row: {
-  id: number | string;
-  name: string;
-  display_name: string | null;
-  type: string;
-  domain_name: string;
-  base_dn: string;
-  ldap_urls: string[];
-  tls_mode: string;
-  config_json: unknown;
-  configured: boolean;
-  sync_bind_upn?: string | null;
-  sync_bind_secret_encrypted?: string | null;
-  created_at: Date | string;
-  updated_at: Date | string;
-}): DirectoryProviderSummary {
+function parseNaming(config: unknown, domain: string): NamingSettings {
+  const stored = (config as { naming?: Partial<NamingSettings> } | null)?.naming;
+  return {
+    pattern: typeof stored?.pattern === 'string' ? stored.pattern : DEFAULT_NAMING_PATTERN,
+    upnSuffix: typeof stored?.upnSuffix === 'string' ? stored.upnSuffix : domain.toLowerCase(),
+  };
+}
+
+function parseNewUsers(config: unknown): NewUserSettings {
+  const stored = (config as { newUsers?: unknown } | null)?.newUsers;
+  const parsed = newUserSettingsSchema.safeParse({
+    ...DEFAULT_NEW_USER_SETTINGS,
+    ...(stored ?? {}),
+  });
+  return parsed.success ? parsed.data : { ...DEFAULT_NEW_USER_SETTINGS };
+}
+
+function rowToSummary(
+  row: {
+    id: number | string;
+    name: string;
+    display_name: string | null;
+    type: string;
+    domain_name: string;
+    base_dn: string;
+    ldap_urls: string[];
+    tls_mode: string;
+    config_json: unknown;
+    configured: boolean;
+    sync_bind_upn?: string | null;
+    sync_bind_secret_encrypted?: string | null;
+    created_at: Date | string;
+    updated_at: Date | string;
+  },
+  env: Pick<Env, 'AD_TLS_REJECT_UNAUTHORIZED'>,
+): DirectoryProviderSummary {
   return {
     id: Number(row.id),
     name: row.name,
@@ -274,12 +340,23 @@ function rowToSummary(row: {
     domain: row.domain_name,
     baseDn: row.base_dn,
     ldapUrls: row.ldap_urls,
-    tlsMode: row.tls_mode,
+    tlsMode: parseTlsMode(row.tls_mode),
+    transportProblem: ldapTransportProblem(row.ldap_urls, parseTlsMode(row.tls_mode)),
     tlsRejectUnauthorized: parseTlsRejectUnauthorized(row.config_json),
+    certificateCheckOff:
+      (parseTlsRejectUnauthorized(row.config_json) ?? env.AD_TLS_REJECT_UNAUTHORIZED) === false,
     configured: row.configured,
     syncBindUpn: row.sync_bind_upn ?? null,
     hasSyncBindPassword: !!row.sync_bind_secret_encrypted,
+    naming: parseNaming(row.config_json, row.domain_name),
+    newUsers: parseNewUsers(row.config_json),
     createdAt: new Date(row.created_at),
     updatedAt: new Date(row.updated_at),
   };
+}
+
+// Unknown stored values are treated as LDAPS, the strictest mode: an
+// ldap:// URL then refuses to connect rather than binding in cleartext.
+function parseTlsMode(value: string): LdapTlsMode {
+  return (LDAP_TLS_MODES as readonly string[]).includes(value) ? (value as LdapTlsMode) : 'ldaps';
 }

@@ -3,9 +3,16 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { meResponseSchema, stepUpRequestSchema, type Capability } from '@openaduc/shared';
 import { loadEnv } from '../config/env.js';
-import { BadRequest, Unauthorized } from '../plugins/errorHandler.js';
+import {
+  AppError,
+  BadRequest,
+  DIRECTORY_UNAVAILABLE_MESSAGE,
+  SessionRequired,
+  Unauthorized,
+} from '../plugins/errorHandler.js';
 import { SESSION_COOKIE_NAME } from '../plugins/auth.js';
 import { composeBindUpn } from '../lib/usernameParser.js';
+import { elevatedState } from '../services/sessions.js';
 
 // Capability subset that step-up should grant. Step-up is "you proved you
 // can bind as yourself recently" — it doesn't elevate to capabilities you
@@ -36,11 +43,31 @@ function cookieOptions() {
   };
 }
 
+// One answer for every credential failure. AD's reasons (unknown user,
+// wrong password, locked, disabled, expired, must change, no OpenADUC role)
+// would tell an anonymous caller which usernames exist, and some are only
+// reported after AD has accepted the password. The audit row keeps the
+// real reason for administrators.
+const SignInFailed = () =>
+  Unauthorized(
+    'Sign-in failed. Check your username and password. If it keeps failing, your account may be locked, disabled or not set up for OpenADUC; contact your administrator.',
+  );
+
+// Directory errors carry hosts, ports and library text; keep those in the
+// logs and audit row.
+const DirectoryUnavailable = () =>
+  new AppError({
+    statusCode: 502,
+    code: 'directory_unavailable',
+    message: DIRECTORY_UNAVAILABLE_MESSAGE,
+  });
+
 export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   // ---- POST /api/auth/login --------------------------------------------
   app.post('/api/auth/login', {
     config: {
       rateLimit: { max: 5, timeWindow: '1 minute' },
+      policy: { public: true },
     },
     handler: async (req, reply) => {
       const body = loginRequestSchema.parse(req.body);
@@ -104,15 +131,8 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
             },
           })
           .catch((err) => req.log.error({ err }, 'audit insert failed for auth.login failure'));
-        // The caller is not signed in: the reason (no such user, wrong password, disabled,
-        // locked, expired) and the directory's own error text stay in the audit row above.
-        // Telling them apart here would let anyone enumerate accounts and probe the network.
-        if (result.reason === 'directory_error') {
-          throw app.httpErrors.badGateway('directory unreachable');
-        }
-        throw Unauthorized(
-          'sign-in failed: check the username and password, or ask an administrator',
-        );
+        if (result.reason === 'directory_error') throw DirectoryUnavailable();
+        throw SignInFailed();
       }
 
       // Auth succeeded — clear any backoff state for this (ip, username).
@@ -134,7 +154,7 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
             metadata: { username: bindUsername, directoryId: directory.id },
           })
           .catch((err) => req.log.error({ err }, 'audit insert failed for auth.login deny'));
-        throw Unauthorized('account is not authorized to use this application');
+        throw SignInFailed();
       }
 
       const { session, cookieToken } = await app.services.sessions.createAdminSession({
@@ -174,7 +194,7 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ---- POST /api/auth/logout -------------------------------------------
-  app.post('/api/auth/logout', async (req, reply) => {
+  app.post('/api/auth/logout', { config: { policy: { public: true } } }, async (req, reply) => {
     const actor = req.actor;
     if (actor) {
       const { revokedElevatedIds } = await app.services.sessions.revokeAdminSession(
@@ -205,12 +225,16 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // ---- GET /api/auth/me ------------------------------------------------
-  app.get('/api/auth/me', { preHandler: app.requireAuth }, async (req) => {
-    const directory = await app.services.directoryConfig.getById(req.actor!.session.directoryId);
-    return {
-      actor: meResponse(req.actor!.session, req.actor!.elevated, directory?.domain ?? null),
-    };
-  });
+  app.get(
+    '/api/auth/me',
+    { config: { policy: { capability: null, stepUp: false, directory: 'caller' } } },
+    async (req) => {
+      const directory = await app.services.directoryConfig.getById(req.actor!.session.directoryId);
+      return {
+        actor: meResponse(req.actor!.session, req.actor!.elevated, directory?.domain ?? null),
+      };
+    },
+  );
 
   // ---- POST /api/auth/step-up ------------------------------------------
   // Step-up rotates the admin session cookie. A fresh admin session is minted
@@ -219,8 +243,10 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   // ride along after elevation — the only token that names the elevated
   // session has been replaced.
   app.post('/api/auth/step-up', {
-    preHandler: app.requireAuth,
-    config: { rateLimit: { max: 5, timeWindow: '1 minute' } },
+    config: {
+      rateLimit: { max: 5, timeWindow: '1 minute' },
+      policy: { capability: null, stepUp: false, directory: 'caller' },
+    },
     handler: async (req, reply) => {
       const body = stepUpRequestSchema.parse(req.body);
       const actor = req.actor!;
@@ -273,32 +299,25 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
             metadata: { detail: result.errorMessage },
           })
           .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup failure'));
-        // Surface the real reason — same pattern as login. "step-up failed"
-        // alone is useless when the operator can't tell whether they
-        // mistyped, the directory's down, or their account just got
-        // disabled while they were sitting on the page.
-        const detail = result.errorMessage ?? 'step-up failed';
-        if (result.reason === 'directory_error') {
-          throw app.httpErrors.badGateway(detail);
-        }
-        throw Unauthorized(detail);
+        // Same generic answers as sign-in; the reason is in the audit row.
+        if (result.reason === 'directory_error') throw DirectoryUnavailable();
+        throw SignInFailed();
       }
 
       // Step-up succeeded — clear backoff state.
       app.services.loginBackoff.recordSuccess(req.ip ?? null, username);
 
-      // The step-up bind just read the operator's groups: take the rights from it, not from the
-      // snapshot made at login. Someone removed from a role since then stops having it here.
-      // (A provider that reports no groups on this bind leaves the snapshot as it is.)
-      const groupDns = result.groupDns ?? result.user?.memberOfDns;
-      const capabilities = groupDns
-        ? await app.services.authorization.resolveCapabilities(groupDns)
-        : actor.session.capabilities;
+      // Roles come from AD group membership, which may have changed since
+      // sign-in. Re-read them from this bind so a revoked role can't be kept
+      // alive by stepping up.
+      const capabilities = await app.services.authorization.resolveCapabilities(
+        result.groupDns ?? result.user?.memberOfDns ?? [],
+      );
       if (capabilities.length === 0) {
-        const { revokedElevatedIds: gone } = await app.services.sessions.revokeAdminSession(
+        const { revokedElevatedIds } = await app.services.sessions.revokeAdminSession(
           actor.session.id,
         );
-        app.services.credentialCache.deleteMany(gone);
+        app.services.credentialCache.deleteMany(revokedElevatedIds);
         await app.services.audit
           .recordEvent({
             ...baseAudit,
@@ -306,14 +325,16 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
             result: 'denied',
             errorCode: 'no_capabilities',
           })
-          .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup deny'));
+          .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup denial'));
         reply.clearCookie(SESSION_COOKIE_NAME, cookieOptions());
-        throw Unauthorized('account is no longer authorized to use this application');
+        // The session is gone: say so with the code that signs the client out.
+        throw SessionRequired('your account is no longer authorized to use this application');
       }
-
-      const writes = capabilities.filter((c): c is Capability =>
-        WRITE_CAPABILITIES.includes(c as Capability),
+      const removedCapabilities = actor.session.capabilities.filter(
+        (c) => !capabilities.includes(c as Capability),
       );
+
+      const writes = capabilities.filter((c) => WRITE_CAPABILITIES.includes(c));
 
       const {
         admin: rotated,
@@ -331,8 +352,7 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
           capabilities,
           sourceIp: req.ip,
           userAgent: req.headers['user-agent'] ?? null,
-          // rotation must not extend the absolute lifetime set at login
-          expiresAt: actor.session.expiresAt,
+          notAfter: actor.session.expiresAt,
         },
         elevatedCapabilities: writes,
       });
@@ -340,7 +360,7 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       // Old elevated sessions died with the old admin session — wipe their
       // cached passwords. Cache the bind password under the new id only.
       app.services.credentialCache.deleteMany(revokedElevatedIds);
-      app.services.credentialCache.set(elevated.id, body.password, elevated.expiresAt);
+      app.services.credentialCache.set(elevated.id, body.password, elevated.idleExpiresAt);
 
       await app.services.audit
         .recordEvent({
@@ -353,8 +373,10 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
           targetId: elevated.id,
           metadata: {
             capabilities: writes,
-            expiresAt: elevated.expiresAt.toISOString(),
+            idleExpiresAt: elevated.idleExpiresAt.toISOString(),
+            absoluteExpiresAt: elevated.absoluteExpiresAt.toISOString(),
             rotatedFromSessionId: actor.session.id,
+            ...(removedCapabilities.length > 0 ? { removedCapabilities } : {}),
           },
         })
         .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup success'));
@@ -364,35 +386,41 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
         expires: rotated.session.expiresAt,
       });
 
-      return { elevated: { active: true, expiresAt: elevated.expiresAt.toISOString() } };
+      return { elevated: elevatedState(elevated) };
     },
   });
 
   // ---- DELETE /api/auth/step-up ----------------------------------------
-  app.delete('/api/auth/step-up', { preHandler: app.requireAuth }, async (req) => {
-    const actor = req.actor!;
-    const revokedIds = await app.services.sessions.revokeElevatedSessionsForAdmin(actor.session.id);
-    app.services.credentialCache.deleteMany(revokedIds);
-    if (revokedIds.length > 0) {
-      await app.services.audit
-        .recordEvent({
-          action: 'auth.stepup.revoke',
-          result: 'success',
-          actorUserId: actor.session.actorUserId,
-          actorDisplayName: actor.session.actorDisplayName,
-          actorAuthMethod: 'ad-password',
-          sourceIp: req.ip,
-          userAgent: req.headers['user-agent'] ?? null,
-          sessionId: actor.session.id,
-          correlationId: req.correlationId,
-          providerId: actor.session.directoryId,
-          targetType: 'session',
-          metadata: { revokedCount: revokedIds.length },
-        })
-        .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup.revoke'));
-    }
-    return { ok: true };
-  });
+  app.delete(
+    '/api/auth/step-up',
+    { config: { policy: { capability: null, stepUp: false, directory: 'caller' } } },
+    async (req) => {
+      const actor = req.actor!;
+      const revokedIds = await app.services.sessions.revokeElevatedSessionsForAdmin(
+        actor.session.id,
+      );
+      app.services.credentialCache.deleteMany(revokedIds);
+      if (revokedIds.length > 0) {
+        await app.services.audit
+          .recordEvent({
+            action: 'auth.stepup.revoke',
+            result: 'success',
+            actorUserId: actor.session.actorUserId,
+            actorDisplayName: actor.session.actorDisplayName,
+            actorAuthMethod: 'ad-password',
+            sourceIp: req.ip,
+            userAgent: req.headers['user-agent'] ?? null,
+            sessionId: actor.session.id,
+            correlationId: req.correlationId,
+            providerId: actor.session.directoryId,
+            targetType: 'session',
+            metadata: { revokedCount: revokedIds.length },
+          })
+          .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup.revoke'));
+      }
+      return { ok: true };
+    },
+  );
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -410,10 +438,7 @@ function meResponse(
     capabilities: session.capabilities,
     directoryId: session.directoryId,
     directoryDomain: domainName,
-    elevated: {
-      active: !!elevated,
-      expiresAt: elevated ? elevated.expiresAt.toISOString() : null,
-    },
+    elevated: elevatedState(elevated),
   };
   return meResponseSchema.parse(payload);
 }

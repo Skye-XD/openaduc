@@ -22,8 +22,6 @@ services:
       dockerfile: docker/api.Dockerfile
     restart: unless-stopped
     env_file: .env
-    ports:
-      - '127.0.0.1:3000:3000'
 
   web:
     image: ${OPENADUC_WEB_IMAGE:-openaduc/web:latest}
@@ -34,4 +32,4 @@ services:
     depends_on:
       - api
     ports:
-      - '127.0.0.1:8080:80'
+      - '127.0.0.1:8080:80' # only the host's reverse proxy (Caddy) reaches the UI

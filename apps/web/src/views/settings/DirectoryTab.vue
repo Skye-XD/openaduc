@@ -1,6 +1,14 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
-import { onMounted, reactive, ref, watch } from 'vue';
+import { type LdapTlsMode, ldapTransportProblem, rebindRequiredReason } from '@openaduc/shared';
+import LdapTlsModeField from '../../design/primitives/LdapTlsModeField.vue';
+import { defaultLdapPort, ldapUrlFor } from '../../design/lib/ldap.js';
+
+const TLS_MODE_LABEL: Record<LdapTlsMode, string> = {
+  ldaps: 'LDAPS',
+  starttls: 'StartTLS',
+};
+import { computed, onMounted, reactive, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import Button from 'primevue/button';
 import Dialog from 'primevue/dialog';
@@ -21,6 +29,9 @@ import { useAuthStore } from '../../stores/auth.js';
 import Card from '../../design/primitives/Card.vue';
 import EmptyState from '../../design/primitives/EmptyState.vue';
 import StepUpDialog from '../../design/feedback/StepUpDialog.vue';
+import NamingPatternDialog from './NamingPatternDialog.vue';
+import NewUserSettingsDialog from './NewUserSettingsDialog.vue';
+import { PASSWORD_MODE_LABEL } from '../../design/lib/newUser.js';
 import { fmtRelative } from '../../design/lib/format.js';
 
 const route = useRoute();
@@ -43,7 +54,7 @@ const addForm = reactive({
   domain: '',
   baseDn: '',
   baseDnTouched: false,
-  useTls: true,
+  tlsMode: 'ldaps' as LdapTlsMode,
   port: 636,
   rejectUntrusted: true,
   dcs: [{ host: '' }] as { host: string }[],
@@ -67,19 +78,14 @@ watch(
 );
 
 watch(
-  () => addForm.useTls,
-  (useTls) => {
-    if (addForm.port === 389 || addForm.port === 636) {
-      addForm.port = useTls ? 636 : 389;
-    }
+  () => addForm.tlsMode,
+  (mode) => {
+    if (addForm.port === 389 || addForm.port === 636) addForm.port = defaultLdapPort(mode);
   },
 );
 
 function addLdapUrl(host: string): string {
-  const h = host.trim();
-  if (!h) return '';
-  if (/^ldaps?:\/\//i.test(h)) return h;
-  return `${addForm.useTls ? 'ldaps' : 'ldap'}://${h}:${addForm.port}`;
+  return ldapUrlFor(host, addForm.tlsMode, addForm.port);
 }
 
 function addAddDc(): void {
@@ -95,7 +101,7 @@ function openAddDialog(): void {
     domain: '',
     baseDn: '',
     baseDnTouched: false,
-    useTls: true,
+    tlsMode: 'ldaps',
     port: 636,
     rejectUntrusted: true,
     dcs: [{ host: '' }],
@@ -130,6 +136,11 @@ async function submitAdd(): Promise<void> {
     addError.value = 'At least one DC is required';
     return;
   }
+  const addTransportProblem = ldapTransportProblem(cleanedUrls, addForm.tlsMode);
+  if (addTransportProblem) {
+    addError.value = addTransportProblem;
+    return;
+  }
   addSubmitting.value = true;
   try {
     const body: DirectoryAdminBody = {
@@ -137,7 +148,7 @@ async function submitAdd(): Promise<void> {
       domain: addForm.domain.trim(),
       baseDn: addForm.baseDn.trim(),
       ldapUrls: cleanedUrls,
-      tlsMode: addForm.useTls ? 'ldaps' : 'plain',
+      tlsMode: addForm.tlsMode,
       tlsRejectUnauthorized: addForm.rejectUntrusted,
       adminUsername: addForm.adminUsername.trim(),
       adminPassword: addForm.adminPassword,
@@ -147,6 +158,7 @@ async function submitAdd(): Promise<void> {
     addOpen.value = false;
     await load();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, submitAdd)) return;
     addError.value = err instanceof ApiError ? err.message : 'Add failed';
   } finally {
     addSubmitting.value = false;
@@ -164,7 +176,7 @@ const editForm = reactive({
   displayName: '',
   name: '',
   baseDn: '',
-  useTls: true,
+  tlsMode: 'ldaps' as LdapTlsMode,
   port: 636,
   rejectUntrusted: true,
   dcs: [] as { host: string }[],
@@ -223,8 +235,7 @@ function openEditDialog(d: DirectorySummary): void {
   // bare-hostname form can round-trip cleanly. Mixed schemes get flattened
   // — rare, and editing through this UI normalizes them.
   const first = d.ldapUrls[0] ? parseLdapUrl(d.ldapUrls[0]) : null;
-  const useTls = first ? first.scheme === 'ldaps' : d.tlsMode !== 'plain';
-  const port = first?.port ?? (useTls ? 636 : 389);
+  const port = first?.port ?? defaultLdapPort(d.tlsMode);
   const dcs = (d.ldapUrls.length ? d.ldapUrls : ['']).map((u) => {
     const p = parseLdapUrl(u);
     return { host: p?.host ?? u };
@@ -234,7 +245,7 @@ function openEditDialog(d: DirectorySummary): void {
     displayName: d.displayName ?? '',
     name: d.name,
     baseDn: d.baseDn,
-    useTls,
+    tlsMode: d.tlsMode,
     port,
     rejectUntrusted: d.tlsRejectUnauthorized ?? true,
     dcs: dcs.length ? dcs : [{ host: '' }],
@@ -245,19 +256,37 @@ function openEditDialog(d: DirectorySummary): void {
 }
 
 watch(
-  () => editForm.useTls,
-  (useTls) => {
-    if (editForm.port === 389 || editForm.port === 636) {
-      editForm.port = useTls ? 636 : 389;
-    }
+  () => editForm.tlsMode,
+  (mode) => {
+    if (editForm.port === 389 || editForm.port === 636) editForm.port = defaultLdapPort(mode);
   },
 );
 
+// Changing where or how the domain is reached needs the service-account
+// password re-entered: the API binds with it before saving.
+// Why the stored service-account password can't be reused for this edit
+// (null when it can); the API applies the same rule.
+const editRebindReason = computed(() => {
+  const before = editTarget.value;
+  if (!before) return null;
+  return rebindRequiredReason(
+    {
+      ldapUrls: before.ldapUrls,
+      tlsMode: before.tlsMode,
+      tlsRejectUnauthorized: before.tlsRejectUnauthorized ?? true,
+      syncBindUpn: before.syncBindUpn,
+    },
+    {
+      ldapUrls: editForm.dcs.map((d) => editLdapUrl(d.host)).filter(Boolean),
+      tlsMode: editForm.tlsMode,
+      tlsRejectUnauthorized: editForm.rejectUntrusted,
+      syncBindUpn: composeSyncUpn(editForm.syncBindUsername, before.domain) || null,
+    },
+  );
+});
+
 function editLdapUrl(host: string): string {
-  const h = host.trim();
-  if (!h) return '';
-  if (/^ldaps?:\/\//i.test(h)) return h;
-  return `${editForm.useTls ? 'ldaps' : 'ldap'}://${h}:${editForm.port}`;
+  return ldapUrlFor(host, editForm.tlsMode, editForm.port);
 }
 
 function editAddDc(): void {
@@ -285,6 +314,11 @@ async function submitEdit(): Promise<void> {
     editError.value = 'At least one DC is required';
     return;
   }
+  const editTransportProblem = ldapTransportProblem(cleanedUrls, editForm.tlsMode);
+  if (editTransportProblem) {
+    editError.value = editTransportProblem;
+    return;
+  }
 
   const patch: DirectoryPatch = {};
   if (editForm.name.trim() && editForm.name.trim() !== before.name) {
@@ -300,9 +334,8 @@ async function submitEdit(): Promise<void> {
   if (JSON.stringify(cleanedUrls) !== JSON.stringify(before.ldapUrls)) {
     patch.ldapUrls = cleanedUrls;
   }
-  const desiredTlsMode: 'ldaps' | 'plain' = editForm.useTls ? 'ldaps' : 'plain';
-  if (desiredTlsMode !== before.tlsMode) {
-    patch.tlsMode = desiredTlsMode;
+  if (editForm.tlsMode !== before.tlsMode) {
+    patch.tlsMode = editForm.tlsMode;
   }
   if (editForm.rejectUntrusted !== (before.tlsRejectUnauthorized ?? true)) {
     patch.tlsRejectUnauthorized = editForm.rejectUntrusted;
@@ -318,6 +351,11 @@ async function submitEdit(): Promise<void> {
     patch.syncBindPassword = editForm.syncBindPassword;
   }
 
+  if (editRebindReason.value && !editForm.syncBindPassword) {
+    editError.value = editRebindReason.value;
+    return;
+  }
+
   if (Object.keys(patch).length === 0) {
     toast.add({ severity: 'info', summary: 'Nothing to save', life: 2500 });
     editOpen.value = false;
@@ -330,6 +368,7 @@ async function submitEdit(): Promise<void> {
     editOpen.value = false;
     await load();
   } catch (err) {
+    if (auth.retryAfterStepUp(err, submitEdit)) return;
     editError.value = err instanceof ApiError ? err.message : 'Save failed';
   } finally {
     editSubmitting.value = false;
@@ -366,6 +405,7 @@ async function runSyncBindTest(): Promise<void> {
     const r = await api.directories.testSyncBind(editTarget.value.id, body);
     testResult.value = { ok: r.ok, message: r.message };
   } catch (err) {
+    if (auth.retryAfterStepUp(err, runSyncBindTest)) return;
     testResult.value = {
       ok: false,
       message: err instanceof ApiError ? err.message : 'Test failed',
@@ -373,6 +413,36 @@ async function runSyncBindTest(): Promise<void> {
   } finally {
     testRunning.value = false;
   }
+}
+
+// ---- Naming pattern ----
+// Edited for the directory the operator is signed in to: its UPN suffixes
+// are read with that directory's service account.
+const namingTarget = ref<number | null>(null);
+const namingOpen = ref(false);
+
+function openNamingDialog(id: number): void {
+  namingTarget.value = id;
+  namingOpen.value = true;
+}
+
+async function onNamingSaved(): Promise<void> {
+  toast.add({ severity: 'success', summary: 'Naming pattern saved', life: 3000 });
+  await load();
+}
+
+// ---- New users ----
+const newUsersTarget = ref<number | null>(null);
+const newUsersOpen = ref(false);
+
+function openNewUsersDialog(id: number): void {
+  newUsersTarget.value = id;
+  newUsersOpen.value = true;
+}
+
+async function onNewUsersSaved(): Promise<void> {
+  toast.add({ severity: 'success', summary: 'Defaults for new users saved', life: 3000 });
+  await load();
 }
 
 // ---- Load directories ----
@@ -461,10 +531,56 @@ onMounted(load);
         <dd class="mono">{{ d.baseDn }}</dd>
         <dt class="fld-label">TLS</dt>
         <dd class="mono">
-          {{ d.tlsMode }} ·
+          {{ TLS_MODE_LABEL[d.tlsMode] }} ·
           {{
             d.tlsRejectUnauthorized === false ? 'reject untrusted = off' : 'reject untrusted = on'
           }}
+        </dd>
+        <template v-if="d.certificateCheckOff">
+          <dt class="fld-label">Needs attention</dt>
+          <dd class="needs-attention" role="alert">
+            Certificate checks are off, so anyone on the network path could impersonate this domain
+            controller and collect every password sent to it. Give OpenADUC the CA that issued its
+            certificate (AD_TLS_CA_PATH) and turn “Reject untrusted TLS certificates” back on.
+          </dd>
+        </template>
+        <template v-if="d.transportProblem">
+          <dt class="fld-label">Needs attention</dt>
+          <dd class="needs-attention" role="alert">
+            {{ d.transportProblem }} Edit the domain controllers to fix it.
+          </dd>
+        </template>
+        <dt class="fld-label">Naming pattern</dt>
+        <dd class="naming-row">
+          <span class="mono">{{ d.naming.pattern }} · @{{ d.naming.upnSuffix }}</span>
+          <Button
+            v-if="canEdit && d.id === auth.actor?.directoryId"
+            label="Change"
+            size="small"
+            text
+            :aria-label="`Change the naming pattern for ${d.displayName ?? d.domain}`"
+            @click="openNamingDialog(d.id)"
+          />
+        </dd>
+        <dt class="fld-label">New users</dt>
+        <dd class="naming-row">
+          <span
+            >Password {{ PASSWORD_MODE_LABEL[d.newUsers.passwordMode].toLowerCase() }} ·
+            {{ d.newUsers.mailFromUpn ? 'email is the UPN' : 'no email' }} ·
+            {{
+              d.newUsers.phoneCountry
+                ? `phone numbers in ${d.newUsers.phoneCountry}`
+                : 'no phone country'
+            }}</span
+          >
+          <Button
+            v-if="canEdit && d.id === auth.actor?.directoryId"
+            label="Change"
+            size="small"
+            text
+            :aria-label="`Change the defaults for new users in ${d.displayName ?? d.domain}`"
+            @click="openNewUsersDialog(d.id)"
+          />
         </dd>
         <dt class="fld-label">Domain controllers</dt>
         <dd>
@@ -511,10 +627,7 @@ onMounted(load);
         />
       </div>
       <div class="tls-row">
-        <label class="check-row tls-toggle">
-          <input v-model="addForm.useTls" type="checkbox" />
-          <span><strong>Use TLS (LDAPS)</strong></span>
-        </label>
+        <LdapTlsModeField v-model="addForm.tlsMode" class="tls-toggle" />
         <div class="port-field">
           <span class="fld-label">Port</span>
           <InputNumber
@@ -567,9 +680,10 @@ onMounted(load);
           </p>
         </div>
         <div class="form-row">
-          <label class="fld-label">Admin password</label>
+          <label for="dir-add-admin-password" class="fld-label">Admin password</label>
           <Password
             v-model="addForm.adminPassword"
+            input-id="dir-add-admin-password"
             :feedback="false"
             toggle-mask
             input-class="w-full"
@@ -623,10 +737,7 @@ onMounted(load);
         <InputText v-model="editForm.baseDn" class="w-full" />
       </div>
       <div class="tls-row">
-        <label class="check-row tls-toggle">
-          <input v-model="editForm.useTls" type="checkbox" />
-          <span><strong>Use TLS (LDAPS)</strong></span>
-        </label>
+        <LdapTlsModeField v-model="editForm.tlsMode" class="tls-toggle" />
         <div class="port-field">
           <span class="fld-label">Port</span>
           <InputNumber
@@ -679,15 +790,20 @@ onMounted(load);
           <InputText v-model="editForm.syncBindUsername" class="w-full" placeholder="sync-svc" />
         </div>
         <div class="form-row">
-          <label class="fld-label">Service account password</label>
+          <label for="dir-edit-sync-password" class="fld-label">Service account password</label>
           <Password
             v-model="editForm.syncBindPassword"
+            input-id="dir-edit-sync-password"
             :feedback="false"
             toggle-mask
             input-class="w-full"
             class="w-full"
             :placeholder="
-              editTarget?.hasSyncBindPassword ? 'Leave blank to keep stored password' : ''
+              editRebindReason
+                ? 'Required for this change'
+                : editTarget?.hasSyncBindPassword
+                  ? 'Leave blank to keep stored password'
+                  : ''
             "
           />
         </div>
@@ -729,6 +845,19 @@ onMounted(load);
   </Dialog>
 
   <StepUpDialog v-model:visible="editStepUpOpen" @ok="submitEdit" />
+
+  <NewUserSettingsDialog
+    v-if="newUsersOpen && newUsersTarget !== null"
+    v-model:visible="newUsersOpen"
+    :directory-id="newUsersTarget"
+    @saved="onNewUsersSaved"
+  />
+  <NamingPatternDialog
+    v-if="namingOpen && namingTarget !== null"
+    v-model:visible="namingOpen"
+    :directory-id="namingTarget"
+    @saved="onNamingSaved"
+  />
 </template>
 
 <style scoped>
@@ -752,6 +881,18 @@ onMounted(load);
 .dir-grid dd {
   margin: 0;
   color: var(--text);
+}
+
+.naming-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Inline with the value, so the row keeps the others' height. */
+.naming-row :deep(.p-button) {
+  padding-block: 0;
 }
 
 .dc-list {
@@ -813,7 +954,7 @@ onMounted(load);
 
 .tls-row {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 16px;
   flex-wrap: wrap;
 }
@@ -861,5 +1002,9 @@ onMounted(load);
 
 :deep(.p-password .p-password-input) {
   width: 100%;
+}
+.needs-attention {
+  color: var(--red);
+  font-size: 13px;
 }
 </style>

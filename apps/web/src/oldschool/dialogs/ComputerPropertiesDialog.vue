@@ -3,37 +3,19 @@
      System, Member Of, Delegation, Location, Managed By). Read-only:
      no computer-object write endpoint in the API today. -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import WinDialog from './WinDialog.vue';
 import WinTabs from '../primitives/WinTabs.vue';
 import WinIcon from '../primitives/WinIcon.vue';
-import { api } from '../../api/index.js';
-import { ApiError } from '../../api/client.js';
 import { useOldSchool } from '../stores/useOldSchool.js';
-import type { ComputerDetail } from '@openaduc/shared';
+import { useComputerRecord } from '../../design/composables/useDirectoryRecords.js';
 
 const props = defineProps<{ windowId: number; id: string }>();
 defineEmits<{ (e: 'close'): void }>();
 const store = useOldSchool();
 
-const computer = ref<ComputerDetail | null>(null);
-const loading = ref(true);
-const err = ref<string | null>(null);
-
-async function load(): Promise<void> {
-  loading.value = true;
-  err.value = null;
-  try {
-    const resp = await api.computers.get(props.id);
-    computer.value = resp.computer;
-  } catch (e) {
-    err.value = e instanceof ApiError ? e.message : (e as Error).message;
-  } finally {
-    loading.value = false;
-  }
-}
-onMounted(load);
-watch(() => store.dataVersion, load);
+const { record: computer, loading, error: err, load } = useComputerRecord({ id: () => props.id });
+watch(() => store.dataVersion, load, { immediate: true });
 
 type TabId = 'general' | 'os' | 'memberOf' | 'delegation' | 'location' | 'managedBy';
 const tabs: { id: TabId; label: string }[] = [
@@ -47,10 +29,6 @@ const tabs: { id: TabId; label: string }[] = [
 const tab = ref<TabId>('general');
 
 const title = computed(() => `${computer.value?.name ?? 'Computer'} Properties`);
-function rawAttr(c: ComputerDetail, k: string): string {
-  const v = (c.rawAttributes as Record<string, unknown>)[k];
-  return Array.isArray(v) ? v.join(', ') : v == null ? '' : String(v);
-}
 </script>
 
 <template>
@@ -88,11 +66,11 @@ function rawAttr(c: ComputerDetail, k: string): string {
           <label class="label">DC Type:</label>
           <input
             class="os-input"
-            :value="rawAttr(computer, 'machineRole') || 'Workstation or server'"
+            :value="computer.machineRole || 'Workstation or server'"
             disabled
           />
           <label class="label">Site:</label>
-          <input class="os-input" :value="rawAttr(computer, 'msDS-SiteName')" disabled />
+          <input class="os-input" :value="computer.siteName ?? ''" disabled />
           <label class="label">Description:</label>
           <input class="os-input" :value="computer.description ?? ''" disabled />
         </div>
@@ -109,11 +87,7 @@ function rawAttr(c: ComputerDetail, k: string): string {
           <label class="label">Version:</label>
           <input class="os-input" :value="computer.operatingSystemVersion ?? ''" disabled />
           <label class="label">Service pack:</label>
-          <input
-            class="os-input"
-            :value="rawAttr(computer, 'operatingSystemServicePack')"
-            disabled
-          />
+          <input class="os-input" :value="computer.operatingSystemServicePack ?? ''" disabled />
         </div>
       </template>
 
@@ -175,7 +149,7 @@ function rawAttr(c: ComputerDetail, k: string): string {
         <div class="os-form" style="grid-template-columns: 80px minmax(0, 1fr)">
           <label class="label">Location:</label>
           <div style="display: flex; gap: 6px">
-            <input class="os-input" :value="rawAttr(computer, 'location')" disabled />
+            <input class="os-input" :value="computer.location ?? ''" disabled />
             <button class="os-btn" disabled>Browse…</button>
           </div>
         </div>

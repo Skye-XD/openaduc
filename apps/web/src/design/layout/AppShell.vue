@@ -5,10 +5,10 @@ import { useRoute } from 'vue-router';
 import Sidebar from './Sidebar.vue';
 import Topbar from './Topbar.vue';
 import StepUpDialog from '../feedback/StepUpDialog.vue';
-import EditModeFab from '../primitives/EditModeFab.vue';
-import EditModeStatusPill from '../primitives/EditModeStatusPill.vue';
 import OldSchoolMmc from '../../oldschool/OldSchoolMmc.vue';
+import ShortcutSheet from './ShortcutSheet.vue';
 import { useAuthStore } from '../../stores/auth.js';
+import { useVisualViewport } from '../composables/useVisualViewport.js';
 import { useResponsive } from '../composables/useResponsive.js';
 import { useThemeStore } from '../stores/useTheme.js';
 
@@ -17,6 +17,7 @@ const showShell = computed(() => route.meta.layout !== 'bare');
 const auth = useAuthStore();
 const theme = useThemeStore();
 const { isMobile } = useResponsive();
+useVisualViewport();
 
 // Old School takes over the entire browser window — sidebar, topbar, and
 // page content all hide behind the MMC overlay. The operator returns to
@@ -55,19 +56,13 @@ watch(
 // Global StepUpDialog. Mounted once at the shell level so any view (or
 // the API client itself, on a 'step_up_required' response) can flip
 // `auth.stepUpRequested` to open the dialog without each view needing
-// to own its own copy. The reason field is populated when the dialog
-// opened automatically (e.g. cached step-up password expired); the
-// EditModeFab leaves it null for a normal user-initiated open.
+// to own its own copy. The auth store supplies the reason, if any.
 function onDialogVisibility(open: boolean): void {
-  auth.stepUpRequested = open;
-  if (!open) {
-    auth.stepUpReason = null;
-    // Clear any retry callback queued by the action that opened this dialog.
-    // The success path already cleared it inside `auth.stepUp(...)`; this
-    // covers the cancel/X-close case so a stale callback doesn't fire on
-    // an unrelated future step-up.
-    auth.stepUpPendingAction = null;
-  }
+  // Closing after a successful step-up finds nothing left to cancel; the
+  // cancel/X-close case drops the queued action so it can't fire on an
+  // unrelated future step-up, and tells its caller.
+  if (open) auth.stepUpRequested = true;
+  else auth.cancelStepUp();
 }
 </script>
 
@@ -86,19 +81,21 @@ function onDialogVisibility(open: boolean): void {
         <slot />
       </div>
     </main>
-    <StepUpDialog
-      :visible="auth.stepUpRequested"
-      :reason="auth.stepUpReason"
-      @update:visible="onDialogVisibility"
-    />
-    <EditModeFab />
-    <EditModeStatusPill />
 
     <!-- Old School: full-viewport overlay covering sidebar, topbar, and
          page. Mounted at the shell level so it lives on top of every
          non-bare route. -->
     <OldSchoolMmc v-if="oldSchoolActive" />
+    <!-- The Old School view has ADUC's own keys instead. -->
+    <ShortcutSheet v-if="!oldSchoolActive" />
   </div>
+
+  <!-- In both layouts: the setup wizard's later steps need step-up too. -->
+  <StepUpDialog
+    :visible="auth.stepUpRequested"
+    :reason="auth.stepUpReason"
+    @update:visible="onDialogVisibility"
+  />
 </template>
 
 <style scoped>

@@ -2,6 +2,8 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import type { AuditEventRow } from '../../api/index.js';
+import { lifetimeLabel } from '@openaduc/shared';
+import { expiryText } from '../lib/accountExpiry.js';
 import { fmtAbsolute, fmtRelative } from '../lib/format.js';
 import EmptyState from './EmptyState.vue';
 
@@ -22,6 +24,13 @@ interface FeedItem {
 
 const FRIENDLY_ACTION: Record<string, { title: string; iconClass: string; tone: string }> = {
   'user.view': { title: 'Account viewed', iconClass: 'pi pi-eye', tone: 'tone-muted' },
+  'user.create': { title: 'Account created', iconClass: 'pi pi-user-plus', tone: 'tone-green' },
+  'user.copied': { title: 'Copied to a new user', iconClass: 'pi pi-copy', tone: 'tone-blue' },
+  'user.create.finish': {
+    title: 'Account creation finished',
+    iconClass: 'pi pi-user-plus',
+    tone: 'tone-green',
+  },
   'user.update': { title: 'Attributes updated', iconClass: 'pi pi-pencil', tone: 'tone-blue' },
   'user.unlock': { title: 'Account unlocked', iconClass: 'pi pi-lock-open', tone: 'tone-green' },
   'user.disable': { title: 'Account disabled', iconClass: 'pi pi-ban', tone: 'tone-amber' },
@@ -31,9 +40,55 @@ const FRIENDLY_ACTION: Record<string, { title: string; iconClass: string; tone: 
     iconClass: 'pi pi-key',
     tone: 'tone-amber',
   },
+  'user.tap.issue': {
+    title: 'Temporary Access Pass issued',
+    iconClass: 'pi pi-ticket',
+    tone: 'tone-amber',
+  },
+  'user.accountExpiry.set': {
+    title: 'Account expiry changed',
+    iconClass: 'pi pi-calendar',
+    tone: 'tone-blue',
+  },
+  'user.passwordMustChange.set': {
+    title: 'Must change password at next sign-in',
+    iconClass: 'pi pi-key',
+    tone: 'tone-amber',
+  },
+  'user.passwordMustChange.clear': {
+    title: 'No longer must change password',
+    iconClass: 'pi pi-key',
+    tone: 'tone-blue',
+  },
+  'user.passwordNeverExpires.clear': {
+    title: 'Password set to expire',
+    iconClass: 'pi pi-key',
+    tone: 'tone-blue',
+  },
+  'user.passwordNeverExpires.set': {
+    title: 'Password set never to expire',
+    iconClass: 'pi pi-key',
+    tone: 'tone-amber',
+  },
   'user.group.add': { title: 'Added to group', iconClass: 'pi pi-plus', tone: 'tone-blue' },
   'user.group.remove': { title: 'Removed from group', iconClass: 'pi pi-minus', tone: 'tone-blue' },
   'user.move': { title: 'Moved to OU', iconClass: 'pi pi-folder', tone: 'tone-blue' },
+  'user.rename': { title: 'Renamed', iconClass: 'pi pi-id-card', tone: 'tone-blue' },
+  'user.delete': { title: 'Account deleted', iconClass: 'pi pi-trash', tone: 'tone-red' },
+  'user.restore': { title: 'Account restored', iconClass: 'pi pi-replay', tone: 'tone-green' },
+  'computer.view': { title: 'Computer viewed', iconClass: 'pi pi-eye', tone: 'tone-muted' },
+  'computer.disable': { title: 'Computer disabled', iconClass: 'pi pi-ban', tone: 'tone-amber' },
+  'computer.enable': {
+    title: 'Computer enabled',
+    iconClass: 'pi pi-check-circle',
+    tone: 'tone-green',
+  },
+  'computer.account.reset': {
+    title: 'Computer account reset',
+    iconClass: 'pi pi-refresh',
+    tone: 'tone-amber',
+  },
+  'computer.move': { title: 'Moved to OU', iconClass: 'pi pi-folder', tone: 'tone-blue' },
 };
 
 const items = computed<FeedItem[]>(() =>
@@ -59,17 +114,34 @@ const items = computed<FeedItem[]>(() =>
 
 function detailFor(e: AuditEventRow): string {
   const md = (e.metadata ?? {}) as Record<string, unknown>;
-  if (e.action === 'user.update' && md.fields) {
-    return `Fields: ${Array.isArray(md.fields) ? md.fields.join(', ') : String(md.fields)}`;
+  if (md.unchanged === true) return 'Already as asked; nothing changed';
+  if (e.action === 'user.update' || e.action === 'user.rename') {
+    const fields = Array.isArray(md.fields) ? md.fields : md.fields ? [md.fields] : [];
+    if (fields.length > 0) return `Fields: ${fields.map(String).join(', ')}`;
   }
   if (e.action === 'user.group.add' || e.action === 'user.group.remove') {
     if (md.groupName) return `Group: ${String(md.groupName)}`;
   }
-  if (e.action === 'user.move' && md.targetOu) {
-    return `To: ${String(md.targetOu)}`;
+  if (e.action === 'user.move' || e.action === 'computer.move') {
+    const to = md.targetOuName ?? md.targetOuDn;
+    if (to) return `To: ${String(to)}`;
   }
   if (e.result !== 'success') {
     return e.errorCode ? `Failed (${e.errorCode})` : 'Failed';
+  }
+  if (e.action === 'user.create' && md.copiedFrom && typeof md.copiedFrom === 'object') {
+    const from = md.copiedFrom as { samAccountName?: unknown; distinguishedName?: unknown };
+    return `Copied from ${String(from.samAccountName ?? from.distinguishedName)}`;
+  }
+  if (e.action === 'user.copied' && md.copySamAccountName) {
+    return `To: ${String(md.copySamAccountName)}`;
+  }
+  if (e.action === 'user.password.reset' && md.unlock === true) return 'Account unlocked too';
+  if (e.action === 'user.tap.issue' && typeof md.lifetimeMinutes === 'number') {
+    return `${lifetimeLabel(md.lifetimeMinutes)}, ${md.isUsableOnce ? 'single-use' : 'multi-use'}`;
+  }
+  if (e.action === 'user.accountExpiry.set' && 'expiresAt' in md) {
+    return expiryText(md.expiresAt ? String(md.expiresAt) : null, true);
   }
   return '';
 }

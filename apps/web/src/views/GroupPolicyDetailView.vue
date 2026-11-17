@@ -14,6 +14,7 @@ import Avatar from '../design/primitives/Avatar.vue';
 import { fmtRelative } from '../design/lib/format.js';
 import { CSE_NAMES } from '../design/lib/gpoCseNames.js';
 import { useStickyHeader } from './_detail/useStickyHeader';
+import { useRecordCrumb } from '../design/layout/recordCrumb.js';
 
 const props = defineProps<{ id: string }>();
 const router = useRouter();
@@ -42,6 +43,11 @@ async function load(): Promise<void> {
 
 watch(() => props.id, load);
 onMounted(load);
+// `policy` lingers while the next one loads; only name the one on screen.
+useRecordCrumb(
+  () => props.id,
+  () => (policy.value?.id === props.id ? (policy.value.displayName ?? policy.value.gpoGuid) : null),
+);
 
 const { setHero, compact } = useStickyHeader();
 
@@ -79,7 +85,7 @@ async function copy(kind: 'guid' | 'dn'): Promise<void> {
 // Sort raw attributes alphabetically and render values as JSON for the dump.
 const rawEntries = computed<Array<[string, string]>>(() => {
   const p = policy.value;
-  if (!p) return [];
+  if (!p?.rawAttributes) return [];
   const out: Array<[string, string]> = [];
   for (const [k, v] of Object.entries(p.rawAttributes)) {
     out.push([k, formatAttr(v)]);
@@ -349,18 +355,18 @@ function formatAttr(v: unknown): string {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  /* Disable browser scroll anchoring inside the detail page — see the
-     User detail page for rationale (compact-on-scroll flicker fix). */
+  /* Disable browser scroll anchoring — see ObjectPageLayout for the
+     rationale (compact-on-scroll flicker fix). */
   overflow-anchor: none;
 }
 
-/* Hero — same shape as User / Group / Computer detail heros so the
-   four detail surfaces feel like a family. See UserDetailView for
-   the layout rationale. */
+/* Hero — same shape as the object pages' header (ObjectPageLayout) so
+   the detail surfaces feel like a family. */
 .detail-hero {
   padding: 14px 16px;
   border: 1px solid var(--border);
   border-radius: 10px;
+  box-shadow: var(--shadow-sm);
   background: linear-gradient(
     180deg,
     color-mix(in oklab, var(--accent) 5%, var(--surface)),
@@ -546,6 +552,7 @@ function formatAttr(v: unknown): string {
   .detail-hero-aside {
     grid-column: 1 / -1;
     align-items: flex-start;
+    width: 100%;
   }
 }
 

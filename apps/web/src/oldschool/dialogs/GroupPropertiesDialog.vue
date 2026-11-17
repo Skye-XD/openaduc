@@ -1,40 +1,23 @@
 <!-- SPDX-License-Identifier: BUSL-1.1
      Group Properties — classic 4-tab layout (General, Members, Member Of,
-     Managed By). Read-only: there is no group write endpoint in the API
-     today, so editable fields are disabled. Selection and view actions
+     Managed By). Read-only: there's no API to edit a group's attributes,
+     and this dialog doesn't render the shared membership workflows yet, so
+     editable fields and Add/Remove are disabled. Selection and view actions
      still feel right. -->
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, ref, watch } from 'vue';
 import WinDialog from './WinDialog.vue';
 import WinTabs from '../primitives/WinTabs.vue';
 import WinIcon from '../primitives/WinIcon.vue';
-import { api } from '../../api/index.js';
-import { ApiError } from '../../api/client.js';
 import { useOldSchool } from '../stores/useOldSchool.js';
-import type { GroupDetail } from '@openaduc/shared';
+import { useGroupRecord } from '../../design/composables/useDirectoryRecords.js';
 
 const props = defineProps<{ windowId: number; id: string }>();
 defineEmits<{ (e: 'close'): void }>();
 const store = useOldSchool();
 
-const group = ref<GroupDetail | null>(null);
-const loading = ref(true);
-const err = ref<string | null>(null);
-
-async function load(): Promise<void> {
-  loading.value = true;
-  err.value = null;
-  try {
-    const resp = await api.groups.get(props.id);
-    group.value = resp.group;
-  } catch (e) {
-    err.value = e instanceof ApiError ? e.message : (e as Error).message;
-  } finally {
-    loading.value = false;
-  }
-}
-onMounted(load);
-watch(() => store.dataVersion, load);
+const { record: group, loading, error: err, load } = useGroupRecord({ id: () => props.id });
+watch(() => store.dataVersion, load, { immediate: true });
 
 type TabId = 'general' | 'members' | 'memberOf' | 'managedBy';
 const tabs: { id: TabId; label: string }[] = [
@@ -124,11 +107,17 @@ const scope = computed(() => (group.value?.groupScope ?? '').toLowerCase());
             This group has no members.
           </div>
           <div v-for="m in group.members" :key="m.id" class="os-listbox-row">
-            <WinIcon :name="m.enabled ? 'user' : 'user-disabled'" :size="14" />
-            <span style="flex: 1">{{ m.displayName ?? m.samAccountName }}</span>
-            <span style="color: var(--os-window-text-muted)">{{
-              m.userPrincipalName ?? m.email ?? ''
-            }}</span>
+            <template v-if="m.kind === 'user'">
+              <WinIcon :name="m.enabled ? 'user' : 'user-disabled'" :size="14" />
+              <span style="flex: 1">{{ m.displayName ?? m.samAccountName }}</span>
+              <span style="color: var(--os-window-text-muted)">{{
+                m.userPrincipalName ?? m.email ?? ''
+              }}</span>
+            </template>
+            <template v-else>
+              <WinIcon name="group" :size="14" />
+              <span style="flex: 1">{{ m.name ?? m.samAccountName }}</span>
+            </template>
           </div>
         </div>
         <div style="display: flex; gap: 6px; margin-top: 8px">
@@ -138,7 +127,7 @@ const scope = computed(() => (group.value?.groupScope ?? '').toLowerCase());
       </template>
 
       <template v-else-if="tab === 'memberOf'">
-        <div class="os-info">Nested-of relationships are not surfaced by the directory cache.</div>
+        <div class="os-info">The groups this group belongs to aren’t shown here yet.</div>
         <div class="os-listbox" style="min-height: 220px; max-height: 320px">
           <div class="os-listbox-empty">(no data)</div>
         </div>

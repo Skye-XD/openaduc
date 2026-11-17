@@ -2,6 +2,11 @@
 // Small formatting helpers used across the design layer. Kept dependency-free
 // so they can be unit-tested without DOM/PrimeVue overhead.
 
+/** The text with its first letter upper-cased: "user" reads "User". */
+export function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export function fmtRelative(
   input: string | Date | null | undefined,
   now: Date = new Date(),
@@ -74,49 +79,21 @@ export function avatarGradientFor(seed: string | null | undefined): string {
   return AVATAR_GRADIENTS[idx]!;
 }
 
-export type UserStatusKind =
-  | 'active'
-  | 'disabled'
-  | 'locked'
-  | 'pwd-expired'
-  | 'pwd-expiring'
-  | 'expired';
-
-export interface UserStatusInput {
-  enabled?: boolean | null;
-  locked?: boolean | null;
-  accountExpiresAt?: string | null;
-  passwordExpiresAt?: string | null;
-  passwordNeverExpires?: boolean | null;
-}
-
-export function userStatus(u: UserStatusInput, now: Date = new Date()): UserStatusKind {
-  if (u.locked) return 'locked';
-  if (u.enabled === false) return 'disabled';
-  if (u.accountExpiresAt && new Date(u.accountExpiresAt).getTime() < now.getTime())
-    return 'expired';
-  if (!u.passwordNeverExpires && u.passwordExpiresAt) {
-    const expiresMs = new Date(u.passwordExpiresAt).getTime() - now.getTime();
-    const days = expiresMs / (24 * 60 * 60 * 1000);
-    if (days <= 0) return 'pwd-expired';
-    if (days <= 14) return 'pwd-expiring';
-  }
-  return 'active';
-}
-
-export function userStatusLabel(kind: UserStatusKind): string {
-  return {
-    active: 'Active',
-    disabled: 'Disabled',
-    locked: 'Locked',
-    'pwd-expired': 'Password expired',
-    'pwd-expiring': 'Expires soon',
-    expired: 'Expired',
-  }[kind];
-}
-
 // Truncate a long string in the middle, keeping head and tail. Useful for DNs.
 export function truncMid(input: string, head = 24, tail = 18): string {
   if (input.length <= head + tail + 1) return input;
   return `${input.slice(0, head)}…${input.slice(-tail)}`;
+}
+
+/** What to call a user: their display name, else their logon name. */
+export const nameOf = (u: { displayName: string | null; samAccountName: string }): string =>
+  u.displayName ?? u.samAccountName;
+
+/** What to call a computer: its name, else its pre-Windows 2000 name, else its DN. */
+export function computerName(c: {
+  name: string | null;
+  samAccountName: string | null;
+  distinguishedName: string;
+}): string {
+  return c.name ?? c.samAccountName ?? c.distinguishedName;
 }

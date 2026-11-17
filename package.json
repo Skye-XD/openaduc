@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "OpenADUC — modern web-based Active Directory administration",
+  "description": "OpenADUC \u2014 modern web-based Active Directory administration",
   "license": "BUSL-1.1",
   "author": "Jeff Kramp",
   "homepage": "https://openaduc.com",
@@ -15,32 +15,42 @@
     "url": "https://github.com/OpenADUC/openaduc/issues"
   },
   "engines": {
-    "node": ">=22",
+    "node": ">=22.18.0",
     "pnpm": ">=9"
   },
-  "packageManager": "pnpm@10.33.2",
+  "packageManager": "pnpm@10.34.7",
   "scripts": {
     "dev": "pnpm -r --parallel --stream dev",
     "dev:kill": "node scripts/dev-kill.mjs",
     "dev:reset": "node scripts/dev-kill.mjs && pnpm dev",
+    "dc:up": "node dev/samba-dc/dc.mjs up",
+    "dc:seed": "node dev/samba-dc/dc.mjs seed",
+    "dc:down": "node dev/samba-dc/dc.mjs down",
+    "dc:status": "node dev/samba-dc/dc.mjs status",
     "build": "pnpm -r build",
     "test": "pnpm -r test",
+    "test:integration": "pnpm --filter @openaduc/shared build && pnpm --filter @openaduc/api test:integration",
     "lint": "pnpm -r lint",
     "format": "prettier --write \"**/*.{ts,tsx,vue,js,json,md,yml,yaml}\"",
     "format:check": "prettier --check \"**/*.{ts,tsx,vue,js,json,md,yml,yaml}\"",
+    "check:control-chars": "node scripts/check-control-chars.mjs",
+    "check": "pnpm format:check && pnpm check:control-chars && pnpm typecheck && pnpm lint && pnpm test && pnpm build",
     "typecheck": "pnpm -r typecheck",
     "migrate:latest": "pnpm --filter @openaduc/api migrate:latest",
     "migrate:rollback": "pnpm --filter @openaduc/api migrate:rollback",
-    "migrate:make": "pnpm --filter @openaduc/api migrate:make"
+    "migrate:make": "pnpm --filter @openaduc/api migrate:make",
+    "prepare": "husky"
   },
   "devDependencies": {
-    "@eslint/js": "^9.18.0",
-    "@types/node": "^22.10.0",
-    "eslint": "^9.18.0",
-    "eslint-plugin-vue": "^10.9.1",
-    "globals": "^15.14.0",
-    "prettier": "^3.4.2",
-    "typescript": "^5.7.3",
-    "typescript-eslint": "^8.59.2"
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "eslint": "^10.13.0",
+    "eslint-plugin-vue": "^10.11.1",
+    "globals": "^17.13.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.0"
   }
 }

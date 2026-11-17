@@ -3,7 +3,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import Button from 'primevue/button';
-import Toast from 'primevue/toast';
+import { useToast } from 'primevue/usetoast';
 import {
   api,
   type AuditEventRow,
@@ -17,20 +17,45 @@ import Avatar from '../design/primitives/Avatar.vue';
 import StatusBadge from '../design/primitives/StatusBadge.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
 import AuditEventDialog from '../design/feedback/AuditEventDialog.vue';
-import { fmtRelative } from '../design/lib/format.js';
-import { userStatus } from '../design/lib/format.js';
+import AppToast from '../design/feedback/AppToast.vue';
+import InlineFailure from '../design/feedback/InlineFailure.vue';
+import ResetPasswordDialog from '../design/feedback/ResetPasswordDialog.vue';
+import AccountExpiryDialog from '../design/feedback/AccountExpiryDialog.vue';
+import { undoable } from '../design/feedback/undoToast.js';
+import {
+  accountActionToast,
+  expiryFailedSummary,
+  expirySetSummary,
+  passwordResetToast,
+} from '../design/feedback/userToasts.js';
+import { useAccountActions } from '../design/composables/useAccountActions.js';
+import { useAccountExpiry } from '../design/composables/useAccountExpiry.js';
+import { useAttentionQueue } from '../design/composables/useAttentionQueue.js';
+import { useSignInFixes } from '../design/composables/useSignInFixes.js';
+import type { ResetOutcome } from '../design/composables/usePasswordReset.js';
+import type { ActionFailure } from '../design/lib/actionFailure.js';
+import { fmtRelative, nameOf } from '../design/lib/format.js';
+import { userStatus } from '../design/lib/signIn.js';
 import type { UserSummary } from '@openaduc/shared';
 
 const router = useRouter();
 const auth = useAuthStore();
+const toast = useToast();
 
-// "Issues" window — only the most urgent accounts: locked, account/password
-// already expired, or password expiring within the next 24h. The broader
-// "expiring this fortnight" view lives on /users via the saved view.
+// "Issues" window — only the most urgent accounts: locked, made to change
+// their password, or with an account or password expired or expiring within
+// the next 24h. The broader "expiring this fortnight" view lives on /users
+// via the saved view.
 const ISSUES_DAYS = 1;
 
-const issueUsers = ref<UserSummary[]>([]);
-const issueTotal = ref(0);
+// A row that left stays while something failed on it, such as an Undo.
+const queue = useAttentionQueue({
+  withinDays: ISSUES_DAYS,
+  pageSize: 10,
+  keep: (u) => failureOn(u) !== null,
+});
+// Set when the issues list couldn't load: show that, never "Nothing on fire".
+const { rows: issueRows, total: issueTotal, error: issuesError, load: loadIssues } = queue;
 const recentEvents = ref<AuditEventRow[]>([]);
 const loading = ref(true);
 const directory = ref<DirectorySummary | null>(null);
@@ -87,37 +112,26 @@ const syncStatusLabel = computed(() => {
   return 'All tasks healthy';
 });
 
-async function loadIssues(): Promise<void> {
-  try {
-    const issues = await api.users.search({
-      page: 1,
-      pageSize: 10,
-      issues: true,
-      issuesWithinDays: ISSUES_DAYS,
-      // Sort by status priority so the worst-off accounts come first.
-      sort: 'status',
-      sortDir: 'asc',
-    });
-    issueUsers.value = issues.rows;
-    issueTotal.value = issues.total;
-  } catch {
-    /* best-effort — list just stays empty */
-  }
-}
+// Set when a panel couldn't load: show that and a retry, never an empty
+// state that reads as "nothing happened" or "all fine".
+const activityError = ref<string | null>(null);
+const healthError = ref<string | null>(null);
 
 async function loadActivity(): Promise<void> {
-  if (canViewAudit.value) {
-    try {
-      const r = await api.audit.list({ pageSize: 8 });
-      recentEvents.value = r.rows;
-    } catch {
-      /* best-effort */
-    }
+  if (!canViewAudit.value) return;
+  activityError.value = null;
+  try {
+    const r = await api.audit.list({ pageSize: 8 });
+    recentEvents.value = r.rows;
+  } catch (err) {
+    recentEvents.value = [];
+    activityError.value = err instanceof Error ? err.message : 'Failed to load';
   }
 }
 
 async function loadDirectoryHealth(): Promise<void> {
   if (!canConfigure.value) return;
+  healthError.value = null;
   try {
     const r = await api.directories.list();
     // The actor's session is bound to one directory at a time. Pick that
@@ -131,8 +145,8 @@ async function loadDirectoryHealth(): Promise<void> {
     } else {
       directoryTasks.value = [];
     }
-  } catch {
-    /* best-effort — card just won't render */
+  } catch (err) {
+    healthError.value = err instanceof Error ? err.message : 'Failed to load';
   }
 }
 
@@ -144,6 +158,96 @@ async function load(): Promise<void> {
 
 function openUser(u: UserSummary): void {
   void router.push({ name: 'user-detail', params: { id: u.id } });
+}
+
+// Each row offers the fix its user's page leads with, made through the same
+// workflow, so it prompts step-up and is audited the same way.
+
+const accountActions = useAccountActions<UserSummary>({
+  failuresPerAccount: true,
+  onDone: async (action, u, offer) => {
+    toast.add(accountActionToast(action, u, offer));
+    await queue.reread(u.id);
+  },
+});
+
+const resetTarget = ref<UserSummary | null>(null);
+const resetOpen = ref(false);
+
+// The reset asks for a change at next sign-in by default, which keeps the
+// account on the list; the operator has dealt with it either way.
+function onPasswordReset(outcome: ResetOutcome): void {
+  toast.add(passwordResetToast(outcome));
+  if (resetTarget.value) queue.handled(resetTarget.value.id);
+}
+
+const expiryOpen = ref(false);
+const expiry = useAccountExpiry({
+  failuresPerAccount: true,
+  onSet: async (account, expiresAt, offer) => {
+    toast.add(
+      undoable(
+        { severity: 'success', summary: expirySetSummary(account.name, expiresAt), life: 4000 },
+        offer,
+      ),
+    );
+    // An Undo (no offer) lands from its toast, maybe while the dialog is
+    // open for another account.
+    if (offer) expiryOpen.value = false;
+    await queue.reread(account.id);
+  },
+});
+
+// A failed expiry change shows in the dialog that made it while that's
+// open, else (an Undo's failure) on its row.
+const expiryDialogFailure = computed(() => {
+  const id = expiry.account.value?.id;
+  const f = expiryOpen.value && id ? expiry.failureOn(id) : null;
+  return f && !f.undo ? f : null;
+});
+
+function closeExpiry(): void {
+  expiryOpen.value = false;
+  const f = expiryDialogFailure.value;
+  if (f) expiry.dismissOn(f.op.account.id);
+}
+
+const fixes = useSignInFixes<UserSummary>({
+  actions: accountActions,
+  resetPassword: (u) => {
+    resetTarget.value = u;
+    resetOpen.value = true;
+  },
+  extendExpiry: (u) => {
+    expiry.load({ id: u.id, name: nameOf(u), accountExpiresAt: u.accountExpiresAt });
+    expiryOpen.value = true;
+  },
+  extendingExpiry: (u) => expiry.submitting.value && expiry.account.value?.id === u.id,
+});
+
+/** What failed on a row: a fix, an Undo, or reading the account back. */
+function failureOn(u: UserSummary): ActionFailure | null {
+  const action = fixes.actionFailureOn(u.id);
+  if (action) return action;
+  const exp = expiry.failureOn(u.id);
+  if (exp && exp !== expiryDialogFailure.value) {
+    return {
+      summary: expiryFailedSummary(exp.op.account.name),
+      message: exp.message,
+      retry: () => expiry.retryOn(u.id),
+      dismiss: () => expiry.dismissOn(u.id),
+    };
+  }
+  const reread = queue.rereadFailureOn(u.id);
+  if (reread) {
+    return {
+      summary: `Couldn’t read ${nameOf(u)} back`,
+      message: reread,
+      retry: () => void queue.reread(u.id),
+      dismiss: () => queue.dismissRereadFailure(u.id),
+    };
+  }
+  return null;
 }
 
 function openEventDetail(ev: AuditEventRow): void {
@@ -159,6 +263,7 @@ function issueReason(u: UserSummary): string {
   if (status === 'disabled') return 'Disabled';
   if (status === 'expired') return 'Account expired';
   if (status === 'pwd-expired') return 'Password expired';
+  if (status === 'pwd-must-change') return 'Must change password at next sign-in';
   if (status === 'pwd-expiring') {
     if (!u.passwordExpiresAt) return 'Password expiring soon';
     const days = Math.ceil(
@@ -193,13 +298,23 @@ onMounted(load);
 </script>
 
 <template>
-  <Toast />
+  <AppToast />
   <div class="page-inner dashboard">
     <PageHeader title="Dashboard">
       <template #actions>
         <!-- Directory health rolled up into one pill; /tasks has the detail. -->
         <button
-          v-if="canConfigure && directory"
+          v-if="canConfigure && healthError"
+          type="button"
+          class="dir-pill"
+          :title="healthError"
+          @click="loadDirectoryHealth"
+        >
+          <span class="dir-pill-dot dir-pill-dot-red" />
+          <span class="dir-pill-label">Couldn't load directory status · Retry</span>
+        </button>
+        <button
+          v-else-if="canConfigure && directory"
           type="button"
           class="dir-pill"
           :title="firstFailingTask?.lastError ?? syncStatusLabel"
@@ -224,25 +339,59 @@ onMounted(load);
     <Card
       title="Accounts needing attention"
       :sub="
-        issueTotal > 0
-          ? `${issueTotal} total · locked, account expired, or password expiring within 24h`
-          : 'all clear'
+        issuesError
+          ? 'unavailable'
+          : issueTotal > 0
+            ? `${issueTotal} total · locked, must change password, or account or password expiring within 24h`
+            : 'all clear'
       "
     >
       <EmptyState
-        v-if="!loading && issueUsers.length === 0"
+        v-if="issuesError"
+        icon="pi pi-exclamation-triangle"
+        title="Couldn't load accounts needing attention"
+        :message="issuesError"
+      >
+        <template #actions>
+          <Button label="Retry" icon="pi pi-refresh" size="small" @click="loadIssues" />
+        </template>
+      </EmptyState>
+      <EmptyState
+        v-else-if="!loading && issueRows.length === 0"
         icon="pi pi-check-circle"
         title="Nothing on fire"
-        message="No active accounts are locked, expired, or expiring in the next 24 hours."
+        message="No enabled accounts are locked, must change their password, or have an account or password expiring in the next 24 hours."
       />
       <ul v-else class="user-list">
-        <li v-for="u in issueUsers" :key="u.id" class="user-list-row" @click="openUser(u)">
-          <Avatar :name="u.displayName ?? u.samAccountName" :seed="u.samAccountName" />
-          <div class="user-list-meta">
-            <div class="user-list-name">{{ u.displayName ?? u.samAccountName }}</div>
-            <div class="user-list-sub mono">{{ issueReason(u) }}</div>
+        <li v-for="u in issueRows" :key="u.id" class="user-list-item">
+          <div class="user-list-row" @click="openUser(u)">
+            <Avatar :name="nameOf(u)" :seed="u.samAccountName" />
+            <div class="user-list-meta">
+              <div class="user-list-name">{{ nameOf(u) }}</div>
+              <div class="user-list-sub mono">{{ issueReason(u) }}</div>
+            </div>
+            <StatusBadge :user="u" />
+            <Button
+              v-if="fixes.fixOf(u)"
+              class="user-list-fix"
+              :label="fixes.fixOf(u)!.label"
+              :icon="`pi ${fixes.fixOf(u)!.icon}`"
+              size="small"
+              severity="secondary"
+              outlined
+              :loading="fixes.running(fixes.fixOf(u)!, u)"
+              @click.stop="fixes.run(fixes.fixOf(u)!, u)"
+            />
           </div>
-          <StatusBadge :user="u" />
+          <InlineFailure
+            v-if="failureOn(u)"
+            class="user-list-failure"
+            :summary="failureOn(u)!.summary"
+            :message="failureOn(u)!.message"
+            :busy="accountActions.runningOn(u.id) !== null"
+            @retry="failureOn(u)!.retry"
+            @dismiss="failureOn(u)!.dismiss"
+          />
         </li>
       </ul>
     </Card>
@@ -253,13 +402,24 @@ onMounted(load);
         <Button label="View all" text size="small" @click="router.push('/audit')" />
       </template>
       <EmptyState
-        v-if="!loading && recentEvents.length === 0"
+        v-if="activityError"
+        icon="pi pi-exclamation-triangle"
+        title="Couldn't load recent activity"
+        :message="activityError"
+      >
+        <template #actions>
+          <Button label="Retry" icon="pi pi-refresh" size="small" @click="loadActivity" />
+        </template>
+      </EmptyState>
+      <EmptyState
+        v-else-if="!loading && recentEvents.length === 0"
         icon="pi pi-shield"
         title="No audit events yet"
         message="Activity will appear here as operators sign in and act."
       />
-      <ul v-else class="feed">
-        <li
+      <!-- Rows are buttons, so this is a plain container rather than a list. -->
+      <div v-else class="feed">
+        <div
           v-for="ev in recentEvents"
           :key="ev.id"
           class="feed-row clickable"
@@ -288,11 +448,18 @@ onMounted(load);
             </span>
           </div>
           <span class="feed-time mono">{{ fmtRelative(ev.timestamp) }}</span>
-        </li>
-      </ul>
+        </div>
+      </div>
     </Card>
 
     <AuditEventDialog v-model:visible="detailOpen" :event="detailEvent" />
+    <ResetPasswordDialog v-model:visible="resetOpen" :user="resetTarget" @reset="onPasswordReset" />
+    <AccountExpiryDialog
+      :visible="expiryOpen"
+      :expiry="expiry"
+      :failure="expiryDialogFailure"
+      @close="closeExpiry"
+    />
   </div>
 </template>
 
@@ -360,17 +527,20 @@ onMounted(load);
   flex-direction: column;
 }
 
+.user-list-item {
+  border-bottom: 1px solid var(--border);
+}
+
+.user-list-item:last-child {
+  border-bottom: 0;
+}
+
 .user-list-row {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 10px 0;
-  border-bottom: 1px solid var(--border);
   cursor: pointer;
-}
-
-.user-list-row:last-child {
-  border-bottom: 0;
 }
 
 .user-list-row:hover {
@@ -389,6 +559,10 @@ onMounted(load);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.user-list-failure {
+  margin: 0 0 10px;
 }
 
 .user-list-sub {

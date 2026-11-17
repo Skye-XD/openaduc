@@ -16,7 +16,7 @@ const candidates = [
 ];
 for (const p of candidates) {
   if (existsSync(p)) {
-    dotenv.config({ path: p });
+    dotenv.config({ path: p, quiet: true });
     break;
   }
 }
@@ -33,16 +33,16 @@ const envSchema = z.object({
 
   API_HOST: z.string().default('0.0.0.0'),
   API_PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  API_CORS_ORIGIN: z.string().transform(csv).default('http://localhost:5173'),
+  API_CORS_ORIGIN: z.string().transform(csv).prefault('http://localhost:5173'),
+  // Reverse proxies in front of the API whose X-Forwarded-For entries are
+  // trusted, counted from the API outwards. 1 = the bundled nginx. Set 2 if
+  // another proxy or load balancer sits in front of nginx, 0 if clients
+  // reach the API directly. Too high lets clients choose their own IP.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(1),
 
   SESSION_COOKIE_SECRET: z.string().min(32),
-  // Reverse proxies in front of the API whose X-Forwarded-For entries are believed (Caddy on
-  // the host, nginx in the web container). The client address is the entry beyond them; a
-  // client cannot pick its own address to dodge rate limits or forge the audit trail.
-  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(2),
   SESSION_IDLE_TIMEOUT_MINUTES: z.coerce.number().int().min(1).default(60),
   SESSION_ABSOLUTE_TIMEOUT_HOURS: z.coerce.number().int().min(1).default(12),
-  STEP_UP_TTL_MINUTES: z.coerce.number().int().min(1).default(60),
 
   DATABASE_URL: z.string().url().or(z.string().startsWith('postgres://')),
   DATABASE_POOL_MIN: z.coerce.number().int().min(0).default(2),
@@ -73,6 +73,13 @@ const envSchema = z.object({
   AD_OPERATION_TIMEOUT_MS: z.coerce.number().int().min(1000).default(15000),
 
   BOOTSTRAP_ADMIN_GROUP_DN: z.string().optional(),
+
+  // Run scheduled directory sync tasks. Integration tests turn it off so
+  // background syncs don't race the requests under test.
+  SYNC_SCHEDULER_ENABLED: z
+    .union([z.literal('0'), z.literal('1')])
+    .default('1')
+    .transform((v) => v === '1'),
 });
 
 export type Env = z.infer<typeof envSchema>;

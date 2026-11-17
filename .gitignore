@@ -54,5 +54,5 @@ docs/superpowers/
 *.vscode
 
 
-# operational backups (never commit — may contain secrets)
-*.bak-*
+# Dev Samba DC: generated CA certificate
+dev/samba-dc/.generated/

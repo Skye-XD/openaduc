@@ -4,14 +4,14 @@ import { computed } from 'vue';
 import {
   userStatus,
   userStatusLabel,
+  type SignInInput,
   type UserStatusKind,
-  type UserStatusInput,
-} from '../lib/format.js';
+} from '../lib/signIn.js';
 
 const props = withDefaults(
   defineProps<{
     /** Pass either a user-shaped object … */
-    user?: UserStatusInput | null;
+    user?: SignInInput | null;
     /** … or an explicit kind. */
     kind?: UserStatusKind;
     /** Custom label; defaults to the kind label. */
@@ -37,6 +37,7 @@ const tone = computed(() => {
     case 'pwd-expired':
       return 'red';
     case 'pwd-expiring':
+    case 'pwd-must-change':
       return 'amber';
     case 'disabled':
       return 'muted';
@@ -54,8 +55,8 @@ const text = computed(() => props.label ?? userStatusLabel(resolvedKind.value));
   <!-- The size suffix targets the global .badge.badge-lg modifier in
        theme.css so the styling is shared with inline `<span class="badge
        badge-amber badge-lg">…</span>` chips used in the user-detail hero. -->
-  <span class="badge" :class="[`badge-${tone}`, `badge-${size}`]">
+  <span class="badge" :class="[`badge-${tone}`, `badge-${size}`]" :title="text">
     <span v-if="dot" class="badge-dot" />
-    {{ text }}
+    <span>{{ text }}</span>
   </span>
 </template>

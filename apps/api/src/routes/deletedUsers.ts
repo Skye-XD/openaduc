@@ -36,14 +36,14 @@ import {
 import { StepUpBindFailedError, type WriteContext } from '../providers/types.js';
 import { NotFound, StepUpRequired, Unauthorized } from '../plugins/errorHandler.js';
 import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
-import { visibleRawAttributes } from '../lib/rawAttributes.js';
+import { rawAttributesFor } from '../lib/rawAttributes.js';
 
-const guidParamSchema = z.object({ guid: z.string().uuid() });
+const guidParamSchema = z.object({ guid: z.guid() });
 
 /**
  * Build the operator WriteContext from the authenticated request. The
- * non-null assertions are safe because requireStepUp gates every handler
- * that calls this — without an elevated session + cached password we
+ * non-null assertions are safe because every route that calls this requires
+ * step-up — without an elevated session + cached password we
  * never reach the body.
  */
 function ctxFromReq(req: FastifyRequest): WriteContext {
@@ -59,7 +59,7 @@ function ctxFromReq(req: FastifyRequest): WriteContext {
 export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<void> {
   // ---- GET /api/deleted-users ------------------------------------------
   app.get('/api/deleted-users', {
-    preHandler: [app.requireCapability('read:user.deleted'), app.requireStepUp],
+    config: { policy: { capability: 'read:user.deleted', stepUp: true, directory: 'caller' } },
     handler: async (req): Promise<DeletedUserSearchResponse> => {
       const q = deletedUserSearchQuerySchema.parse(req.query);
       const provider = await app.services.providers.buildForRequest(req);
@@ -78,10 +78,8 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
         if (err instanceof StepUpBindFailedError) {
           // Cached step-up password is stale (operator's AD password
           // changed, or the credential was wiped). 403 prompts the UI
-          // to drop edit mode and ask for re-elevation.
-          throw StepUpRequired(
-            'the directory rejected your editing session — please re-authenticate',
-          );
+          // to end the elevated session and ask for step-up again.
+          throw StepUpRequired('password_rejected');
         }
         throw err;
       }
@@ -127,7 +125,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
 
   // ---- GET /api/deleted-users/:guid ------------------------------------
   app.get('/api/deleted-users/:guid', {
-    preHandler: [app.requireCapability('read:user.deleted'), app.requireStepUp],
+    config: { policy: { capability: 'read:user.deleted', stepUp: true, directory: 'caller' } },
     handler: async (req): Promise<{ user: DeletedUserDetail }> => {
       const { guid } = guidParamSchema.parse(req.params);
       const provider = await app.services.providers.buildForRequest(req);
@@ -139,9 +137,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
         user = await provider.getDeletedUser(guid, ctxFromReq(req));
       } catch (err) {
         if (err instanceof StepUpBindFailedError) {
-          throw StepUpRequired(
-            'the directory rejected your editing session — please re-authenticate',
-          );
+          throw StepUpRequired('password_rejected');
         }
         throw err;
       }
@@ -157,7 +153,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
         lastKnownParent: user.lastKnownParent,
         deletedAt: user.deletedAt ? user.deletedAt.toISOString() : null,
         recycled: user.recycled,
-        rawAttributes: visibleRawAttributes(user.rawAttributes, req.actor?.session.capabilities),
+        rawAttributes: rawAttributesFor(req.actor?.session.capabilities, user.rawAttributes),
       };
       return { user: deletedUserDetailSchema.parse(detail) };
     },
@@ -165,7 +161,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
 
   // ---- POST /api/deleted-users/:guid/restore ---------------------------
   app.post('/api/deleted-users/:guid/restore', {
-    preHandler: [app.requireCapability('write:user.restore'), app.requireStepUp],
+    config: { policy: { capability: 'write:user.restore', stepUp: true, directory: 'caller' } },
     handler: async (req): Promise<RestoreUserResponse> => {
       const { guid } = guidParamSchema.parse(req.params);
       const body = restoreUserRequestSchema.parse(req.body ?? {});
@@ -182,9 +178,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
         before = await provider.getDeletedUser(guid, ctx);
       } catch (err) {
         if (err instanceof StepUpBindFailedError) {
-          throw StepUpRequired(
-            'the directory rejected your editing session — please re-authenticate',
-          );
+          throw StepUpRequired('password_rejected');
         }
         throw err;
       }

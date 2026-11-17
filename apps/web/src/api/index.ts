@@ -3,6 +3,29 @@
 // shape are handled in one place.
 
 import type {
+  ClassPassReissue,
+  ClassPassReveal,
+  ClassReschedule,
+  ClassRescheduleRequest,
+  ClassRoster,
+  ClassTapOptions,
+  AccountExpiryRequest,
+  AuditBulkSummary,
+  BulkAccountPreview,
+  BulkAccountPreviewRequest,
+  BulkAccountRequest,
+  BulkGroupMembershipPreview,
+  BulkGroupMembershipPreviewRequest,
+  BulkGroupMembershipRequest,
+  BulkJob,
+  BulkJobRow,
+  BulkJobRevertPreview,
+  BulkJobRevertRequest,
+  BulkJobRowStatus,
+  BulkMembershipOp,
+  BulkUserAttributesPreview,
+  BulkUserAttributesPreviewRequest,
+  BulkUserAttributesRequest,
   ComputerDetail,
   ComputerSearchQuery,
   ComputerSearchResponse,
@@ -13,38 +36,79 @@ import type {
   DeletedUserSearchQuery,
   DeletedUserSearchResponse,
   DirectoryOu,
+  ElevatedSessionState,
   GroupCreateRequest,
   GroupCreateResponse,
+  GroupDeletePreflightResponse,
+  GroupDeleteRequest,
   GroupDetail,
+  GroupNameCheckQuery,
+  GroupNameCheckResponse,
   GroupPolicyDetail,
   GroupPolicyListResponse,
   GroupSearchQuery,
   GroupSearchResponse,
+  LdapTlsMode,
   LoginRequest,
   MeResponse,
+  MoveRequest,
+  NamingCheckRequest,
+  NamingCheckResponse,
+  NamingSettings,
+  NamingSettingsResponse,
+  NewUserSettings,
+  NewUserSettingsResponse,
+  UserCopySource,
+  UserCreateFinishRequest,
+  UserCreateRequest,
+  UserCreateResponse,
   OuContentsResponse,
   OuCreateRequest,
   OuDeleteRequest,
   OuListResponse,
   OuUpdateRequest,
   ResetPasswordRequest,
+  EntraFeatureKey,
+  EntraTestResponse,
+  TapIssueRequest,
+  TapIssueResponse,
+  TapPreflight,
+  UserLicenses,
+  GroupLicenses,
+  LicensedGroups,
   RestoreUserRequest,
   MfaRegistrationResponse,
   MfaRegistrationStatus,
   RestoreUserResponse,
+  RolesResponse,
+  RolesUpdateRequest,
   SignInEventApp,
   SignInEventDetail,
   SignInEventsResponse,
   StepUpRequest,
-  UserCreateRequest,
-  UserCreateResponse,
+  UserDeletePreflightResponse,
+  UserMatchResponse,
+  UserDeleteRequest,
   UserDetail,
-  UserMoveRequest,
+  UserRenameRequest,
   UserSearchQuery,
   UserSearchResponse,
   UserUpdateRequest,
+  ImportCheckResponse,
+  ImportLookupRequest,
+  ImportLookupResponse,
+  ImportRequest,
+  ImportRunRequest,
+  ImportUsageLocation,
+  ImportJobResponse,
+  BulkJobResultsDownload,
+  BulkPasswordResetRequest,
+  PlacementRulesResponse,
+  PlacementRulesSave,
+  PlacementRulesSaveResponse,
 } from '@openaduc/shared';
-import { apiFetch } from './client.js';
+import { BULK_ACCOUNT_ACTIONS, bulkJobPath } from '@openaduc/shared';
+import { apiFetch, type ApiFetchInit } from './client.js';
 
 export interface AuditEventRow {
   id: string;
@@ -66,6 +130,10 @@ export interface AuditEventRow {
   before: unknown;
   after: unknown;
   metadata: unknown;
+  /** The bulk job the event belongs to. */
+  bulkJobId: string | null;
+  /** On the `bulk.create` event that heads a bulk job, the job. */
+  bulk: AuditBulkSummary | null;
 }
 
 export interface DirectorySummary {
@@ -76,7 +144,11 @@ export interface DirectorySummary {
   domain: string;
   baseDn: string;
   ldapUrls: string[];
-  tlsMode: string;
+  tlsMode: LdapTlsMode;
+  /** Why the URLs don't fit the TLS mode (saved before that was checked), or null. */
+  transportProblem: string | null;
+  /** The DC's certificate isn't verified, so the connection can be intercepted. */
+  certificateCheckOff: boolean;
   tlsRejectUnauthorized: boolean | null;
   configured: boolean;
   // Sync service-account credentials — nullable when sync hasn't been
@@ -84,6 +156,8 @@ export interface DirectorySummary {
   // endpoint, not here.
   syncBindUpn: string | null;
   hasSyncBindPassword: boolean;
+  naming: NamingSettings;
+  newUsers: NewUserSettings;
   createdAt: string;
   updatedAt: string;
 }
@@ -101,7 +175,7 @@ export interface DirectoryPatch {
   domain?: string;
   baseDn?: string;
   ldapUrls?: string[];
-  tlsMode?: 'ldaps' | 'starttls' | 'plain';
+  tlsMode?: LdapTlsMode;
   tlsRejectUnauthorized?: boolean;
   operationTimeoutMs?: number;
   // Sync service-account credentials. `syncBindUpn = null` clears the
@@ -128,15 +202,8 @@ export type SyncTaskKey =
   | 'entra.signin.activity'
   | 'entra.signins.events'
   | 'entra.mfa.registration'
-  | 'entra.password-expiry.notify';
-
-export type EntraFeatureKey =
-  | 'photos'
-  | 'signInActivity'
-  | 'signInEvents'
-  | 'mfaRegistration'
-  | 'teamsAdminWebhook'
-  | 'passwordExpiryNotifications';
+  | 'entra.password-expiry.notify'
+  | 'entra.licenses.groups';
 
 export interface EntraIntegrationSummary {
   id: number;
@@ -228,14 +295,16 @@ export interface SetupExistingDirectory {
   domain: string;
   baseDn: string;
   ldapUrls: string[];
-  tlsMode: string;
+  tlsMode: LdapTlsMode;
   tlsRejectUnauthorized: boolean | null;
   syncBindUpn: string | null;
 }
 
 export interface SetupStatus {
   configured: boolean;
+  onboardingComplete: boolean;
   hasServiceAccount: boolean;
+  /** Only for the admin finishing setup; null for everyone else. */
   onboardingCompletedAt: string | null;
   existingDirectory: SetupExistingDirectory | null;
 }
@@ -289,7 +358,7 @@ export interface DirectoryAdminBody {
   domain: string;
   baseDn: string;
   ldapUrls: string[];
-  tlsMode: 'ldaps' | 'starttls' | 'plain';
+  tlsMode: LdapTlsMode;
   adminUsername: string;
   adminPassword: string;
   tlsRejectUnauthorized?: boolean;
@@ -318,6 +387,9 @@ export interface IdentityCardData {
   memberOfDns: string[];
 }
 
+/** For reads the SPA polls; see ApiFetchInit.background. */
+export type Background = Pick<ApiFetchInit, 'background'>;
+
 export const api = {
   auth: {
     login(body: LoginRequest): Promise<{ actor: MeResponse }> {
@@ -329,9 +401,7 @@ export const api = {
     me(): Promise<{ actor: MeResponse }> {
       return apiFetch('/auth/me');
     },
-    stepUp(
-      body: StepUpRequest,
-    ): Promise<{ elevated: { active: boolean; expiresAt: string | null } }> {
+    stepUp(body: StepUpRequest): Promise<{ elevated: ElevatedSessionState }> {
       return apiFetch('/auth/step-up', { method: 'POST', body: JSON.stringify(body) });
     },
     revokeStepUp(): Promise<{ ok: boolean }> {
@@ -359,26 +429,14 @@ export const api = {
     runInitialSync(): Promise<{ job: InitialSyncJob }> {
       return apiFetch('/setup/run-initial-sync', { method: 'POST' });
     },
-    initialSyncStatus(): Promise<{ job: InitialSyncJob | null }> {
-      return apiFetch('/setup/initial-sync-status');
+    initialSyncStatus(opts: Background = {}): Promise<{ job: InitialSyncJob | null }> {
+      return apiFetch('/setup/initial-sync-status', opts);
     },
     retryTask(): Promise<{ job: InitialSyncJob }> {
       return apiFetch('/setup/retry-task', { method: 'POST' });
     },
   },
   users: {
-    // Provision a new (disabled, password-less) account. Admin-only +
-    // step-up server-side.
-    create(body: UserCreateRequest): Promise<UserCreateResponse> {
-      return apiFetch('/users', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      });
-    },
-    // Permanently delete a user. Admin-only + step-up server-side.
-    remove(id: string): Promise<{ ok: boolean }> {
-      return apiFetch(`/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    },
     search(query: Partial<UserSearchQuery> = {}): Promise<UserSearchResponse> {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) {
@@ -402,6 +460,72 @@ export const api = {
     },
     get(id: string): Promise<{ user: UserDetail }> {
       return apiFetch(`/users/${encodeURIComponent(id)}`);
+    },
+    create(body: UserCreateRequest): Promise<UserCreateResponse> {
+      return apiFetch('/users', { method: 'POST', body: JSON.stringify(body) });
+    },
+    import: {
+      /** Who in the directory holds an import's employee IDs, emails and managers. */
+      lookup(body: ImportLookupRequest): Promise<ImportLookupResponse> {
+        return apiFetch('/users/import/lookup', { method: 'POST', body: JSON.stringify(body) });
+      },
+      /** The final check: nothing is written. */
+      check(body: ImportRequest): Promise<ImportCheckResponse> {
+        return apiFetch('/users/import/check', { method: 'POST', body: JSON.stringify(body) });
+      },
+      /** Check the import once more and run it as a job. */
+      run(body: ImportRunRequest): Promise<{ job: BulkJob }> {
+        return apiFetch('/users/import/run', { method: 'POST', body: JSON.stringify(body) });
+      },
+      /** An import's job, row by row, and whether its results CSV still holds the passwords. */
+      job(id: string, init: Background = {}): Promise<ImportJobResponse> {
+        return apiFetch(`/users/import/jobs/${encodeURIComponent(id)}`, init);
+      },
+      /** Whether the directory's schema takes the usage location an import maps. */
+      usageLocation(): Promise<ImportUsageLocation> {
+        return apiFetch('/users/import/usage-location');
+      },
+      /** Whether an import can issue TAPs for class, and within what limits. */
+      classTaps(): Promise<ClassTapOptions> {
+        return apiFetch('/users/import/class-taps');
+      },
+      /** An import's class roster, each pass's status read from Entra. */
+      classRoster(id: string, init: Background = {}): Promise<ClassRoster> {
+        return apiFetch(`/users/import/jobs/${encodeURIComponent(id)}/class-roster`, init);
+      },
+      revealClassPass(id: string, rowId: string): Promise<ClassPassReveal> {
+        return apiFetch(
+          `/users/import/jobs/${encodeURIComponent(id)}/class-roster/${encodeURIComponent(rowId)}/reveal`,
+          { method: 'POST', body: JSON.stringify({}) },
+        );
+      },
+      reissueClassPass(id: string, rowId: string): Promise<ClassPassReissue> {
+        return apiFetch(
+          `/users/import/jobs/${encodeURIComponent(id)}/class-roster/${encodeURIComponent(rowId)}/reissue`,
+          { method: 'POST', body: JSON.stringify({}) },
+        );
+      },
+      rescheduleClass(id: string, body: ClassRescheduleRequest): Promise<ClassReschedule> {
+        return apiFetch(`/users/import/jobs/${encodeURIComponent(id)}/class-roster/reschedule`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+      },
+      takeOverClass(id: string): Promise<void> {
+        return apiFetch(`/users/import/jobs/${encodeURIComponent(id)}/class-roster/take-over`, {
+          method: 'POST',
+          body: JSON.stringify({}),
+        });
+      },
+    },
+    copySource(id: string): Promise<UserCopySource> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/copy`);
+    },
+    finishCreate(id: string, body: UserCreateFinishRequest): Promise<UserCreateResponse> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/finish-create`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
     },
     unlock(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
       return apiFetch(`/users/${encodeURIComponent(id)}/unlock`, {
@@ -430,25 +554,33 @@ export const api = {
         body: JSON.stringify({}),
       });
     },
+    setAccountExpiry(
+      id: string,
+      body: AccountExpiryRequest,
+    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/account-expiry`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
     resetPassword(id: string, body: ResetPasswordRequest): Promise<{ ok: boolean }> {
       return apiFetch(`/users/${encodeURIComponent(id)}/reset-password`, {
         method: 'POST',
         body: JSON.stringify(body),
       });
     },
-    setPasswordNeverExpires(
-      id: string,
-      neverExpires: boolean,
-    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
-      return apiFetch(`/users/${encodeURIComponent(id)}/password-never-expires`, {
-        method: 'POST',
-        body: JSON.stringify({ neverExpires }),
-      });
+    /** Whether a Temporary Access Pass can be issued to the user, and within what limits. */
+    tapPreflight(id: string): Promise<TapPreflight> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/temporary-access-pass`);
     },
-    expirePassword(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
-      return apiFetch(`/users/${encodeURIComponent(id)}/expire-password`, {
+    /** The user's Microsoft licenses, read live from Entra. */
+    licenses(id: string): Promise<UserLicenses> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/licenses`);
+    },
+    issueTap(id: string, body: TapIssueRequest): Promise<TapIssueResponse> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/temporary-access-pass`, {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify(body),
       });
     },
     addGroup(id: string, body: { groupId: string }): Promise<{ ok: boolean }> {
@@ -463,12 +595,61 @@ export const api = {
         body: JSON.stringify(body),
       });
     },
-    move(
-      id: string,
-      body: UserMoveRequest,
-    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+    move(id: string, body: MoveRequest): Promise<{ ok: boolean; before: unknown; after: unknown }> {
       return apiFetch(`/users/${encodeURIComponent(id)}/move`, {
         method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    rename(
+      id: string,
+      body: UserRenameRequest,
+    ): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}/rename`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    /** What adding these users to groups, or removing them, would change; nothing is written. */
+    previewGroupChange(
+      body: BulkGroupMembershipPreviewRequest,
+    ): Promise<BulkGroupMembershipPreview> {
+      return apiFetch('/users/bulk-groups/preview', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    /** What moving these users or changing their account settings would change; nothing is written. */
+    previewAccountChange(body: BulkAccountPreviewRequest): Promise<BulkAccountPreview> {
+      return apiFetch('/users/bulk-account/preview', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    /** What editing these users' attributes would change, and their current values; nothing is written. */
+    previewAttributeEdit(
+      body: BulkUserAttributesPreviewRequest,
+    ): Promise<BulkUserAttributesPreview> {
+      return apiFetch('/users/bulk-update/preview', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    match(entries: string[]): Promise<UserMatchResponse> {
+      return apiFetch('/users/match', {
+        method: 'POST',
+        body: JSON.stringify({ entries }),
+      });
+    },
+    deletePreflight(ids: string[]): Promise<UserDeletePreflightResponse> {
+      return apiFetch('/users/delete-preflight', {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+    },
+    remove(id: string, body: UserDeleteRequest): Promise<{ ok: boolean; treeDelete: boolean }> {
+      return apiFetch(`/users/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
         body: JSON.stringify(body),
       });
     },
@@ -503,12 +684,6 @@ export const api = {
     },
   },
   groups: {
-    create(body: GroupCreateRequest): Promise<GroupCreateResponse> {
-      return apiFetch('/groups', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      });
-    },
     search(query: Partial<GroupSearchQuery> = {}): Promise<GroupSearchResponse> {
       const params = new URLSearchParams();
       for (const [k, v] of Object.entries(query)) {
@@ -519,6 +694,44 @@ export const api = {
     },
     get(id: string): Promise<{ group: GroupDetail }> {
       return apiFetch(`/groups/${encodeURIComponent(id)}`);
+    },
+    /** The licenses the group grants, read live from Entra. */
+    licenses(id: string): Promise<GroupLicenses> {
+      return apiFetch(`/groups/${encodeURIComponent(id)}/licenses`);
+    },
+    /** Every group that grants a license, from the server's cache. */
+    licensed(): Promise<LicensedGroups> {
+      return apiFetch('/groups/licensed');
+    },
+    /** Nest group `id` in `groupId`: the group counterpart of `users.addGroup`. */
+    addGroup(id: string, body: { groupId: string }): Promise<{ ok: boolean }> {
+      return apiFetch(`/groups/${encodeURIComponent(id)}/groups`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    removeGroup(id: string, body: { groupId: string }): Promise<{ ok: boolean }> {
+      return apiFetch(`/groups/${encodeURIComponent(id)}/groups`, {
+        method: 'DELETE',
+        body: JSON.stringify(body),
+      });
+    },
+    nameCheck(query: GroupNameCheckQuery): Promise<GroupNameCheckResponse> {
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) if (v) params.set(k, v);
+      return apiFetch(`/groups/name-check?${params.toString()}`);
+    },
+    create(body: GroupCreateRequest): Promise<GroupCreateResponse> {
+      return apiFetch('/groups', { method: 'POST', body: JSON.stringify(body) });
+    },
+    deletePreflight(id: string): Promise<GroupDeletePreflightResponse> {
+      return apiFetch(`/groups/${encodeURIComponent(id)}/delete-preflight`);
+    },
+    remove(id: string, body: GroupDeleteRequest): Promise<{ ok: boolean }> {
+      return apiFetch(`/groups/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        body: JSON.stringify(body),
+      });
     },
   },
   groupPolicies: {
@@ -541,6 +754,30 @@ export const api = {
     get(id: string): Promise<{ computer: ComputerDetail }> {
       return apiFetch(`/computers/${encodeURIComponent(id)}`);
     },
+    disable(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/computers/${encodeURIComponent(id)}/disable`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    },
+    enable(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/computers/${encodeURIComponent(id)}/enable`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    },
+    resetAccount(id: string): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/computers/${encodeURIComponent(id)}/reset-account`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+    },
+    move(id: string, body: MoveRequest): Promise<{ ok: boolean; before: unknown; after: unknown }> {
+      return apiFetch(`/computers/${encodeURIComponent(id)}/move`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
   },
   deletedComputers: {
     search(
@@ -555,6 +792,80 @@ export const api = {
     },
     get(guid: string): Promise<{ computer: DeletedComputerDetail }> {
       return apiFetch(`/deleted-computers/${encodeURIComponent(guid)}`);
+    },
+  },
+  bulkJobs: {
+    start(
+      action: 'user.disable' | 'user.enable' | 'user.unlock',
+      ids: string[],
+    ): Promise<{ job: BulkJob }> {
+      return apiFetch(bulkJobPath(action), {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      });
+    },
+    startGroupChange({
+      op,
+      ...body
+    }: { op: BulkMembershipOp } & BulkGroupMembershipRequest): Promise<{ job: BulkJob }> {
+      return apiFetch(bulkJobPath(`user.group.${op}`), {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    startAttributeEdit(body: BulkUserAttributesRequest): Promise<{ job: BulkJob }> {
+      return apiFetch(bulkJobPath('user.update'), {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    startAccountChange(body: BulkAccountRequest): Promise<{ job: BulkJob }> {
+      return apiFetch(bulkJobPath(BULK_ACCOUNT_ACTIONS[body.change.op]), {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+    },
+    /** Reset the passwords of the accounts an import of the operator's created. */
+    startPasswordReset(importJobId: string): Promise<{ job: BulkJob }> {
+      return apiFetch(bulkJobPath('user.password.reset'), {
+        method: 'POST',
+        body: JSON.stringify({ importJobId } satisfies BulkPasswordResetRequest),
+      });
+    },
+    /** A job's results CSV; with passwords, only once. */
+    results(id: string): Promise<BulkJobResultsDownload> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/results`, { method: 'POST' });
+    },
+    /** The operator's own jobs in this directory, newest first. */
+    list(limit = 10): Promise<{ jobs: BulkJob[] }> {
+      return apiFetch(`/bulk-jobs?limit=${limit}`);
+    },
+    get(id: string, init: Background = {}): Promise<{ job: BulkJob }> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}`, init);
+    },
+    rows(id: string, status?: BulkJobRowStatus): Promise<{ rows: BulkJobRow[] }> {
+      const qs = status ? `?status=${status}` : '';
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/rows${qs}`);
+    },
+    resume(id: string): Promise<{ job: BulkJob }> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/resume`, { method: 'POST' });
+    },
+    retry(id: string): Promise<{ job: BulkJob }> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+    },
+    cancel(id: string): Promise<{ job: BulkJob }> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+    },
+    /** What reverting the job would do: who it puts back, who's changed since, who it can't. */
+    revertPreview(id: string): Promise<BulkJobRevertPreview> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/revert/preview`);
+    },
+    /** Start reverting the job, as previewed; the revert is a job of its own. */
+    revert(id: string, body: BulkJobRevertRequest): Promise<{ job: BulkJob }> {
+      return apiFetch(`/bulk-jobs/${encodeURIComponent(id)}/revert`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
     },
   },
   audit: {
@@ -579,6 +890,42 @@ export const api = {
     update(id: number, body: DirectoryPatch): Promise<{ directory: DirectorySummary }> {
       return apiFetch(`/directories/${id}`, { method: 'PATCH', body: JSON.stringify(body) });
     },
+    naming: {
+      get(id: number): Promise<NamingSettingsResponse> {
+        return apiFetch(`/directories/${id}/naming`);
+      },
+      update(id: number, body: NamingSettings): Promise<NamingSettingsResponse> {
+        return apiFetch(`/directories/${id}/naming`, { method: 'PUT', body: JSON.stringify(body) });
+      },
+      check(id: number, body: NamingCheckRequest): Promise<NamingCheckResponse> {
+        return apiFetch(`/directories/${id}/naming/check`, {
+          method: 'POST',
+          body: JSON.stringify(body),
+        });
+      },
+    },
+    placementRules: {
+      get(id: number): Promise<PlacementRulesResponse> {
+        return apiFetch(`/directories/${id}/placement-rules`);
+      },
+      save(id: number, body: PlacementRulesSave): Promise<PlacementRulesSaveResponse> {
+        return apiFetch(`/directories/${id}/placement-rules`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        });
+      },
+    },
+    newUsers: {
+      get(id: number): Promise<NewUserSettingsResponse> {
+        return apiFetch(`/directories/${id}/new-users`);
+      },
+      update(id: number, body: NewUserSettings): Promise<NewUserSettingsResponse> {
+        return apiFetch(`/directories/${id}/new-users`, {
+          method: 'PUT',
+          body: JSON.stringify(body),
+        });
+      },
+    },
     sync(id: number): Promise<{ started: boolean; reason?: string }> {
       return apiFetch(`/directories/${id}/sync`, { method: 'POST' });
     },
@@ -586,8 +933,8 @@ export const api = {
       return apiFetch(`/directories/${id}/sync/reset`, { method: 'POST' });
     },
     syncTasks: {
-      list(id: number): Promise<{ tasks: SyncTaskSummary[] }> {
-        return apiFetch(`/directories/${id}/sync-tasks`);
+      list(id: number, opts: Background = {}): Promise<{ tasks: SyncTaskSummary[] }> {
+        return apiFetch(`/directories/${id}/sync-tasks`, opts);
       },
       update(
         id: number,
@@ -617,8 +964,11 @@ export const api = {
         const qs = opts?.limit ? `?limit=${opts.limit}` : '';
         return apiFetch(`/directories/${id}/sync-tasks/${encodeURIComponent(key)}/history${qs}`);
       },
-      queue(id: number): Promise<{ inFlight: SyncTaskKey[]; queued: SyncTaskKey[] }> {
-        return apiFetch(`/directories/${id}/sync-tasks/queue`);
+      queue(
+        id: number,
+        opts: Background = {},
+      ): Promise<{ inFlight: SyncTaskKey[]; queued: SyncTaskKey[] }> {
+        return apiFetch(`/directories/${id}/sync-tasks/queue`, opts);
       },
     },
     testSyncBind(
@@ -649,9 +999,7 @@ export const api = {
       remove(id: number): Promise<{ ok: boolean }> {
         return apiFetch(`/directories/${id}/entra`, { method: 'DELETE' });
       },
-      test(
-        id: number,
-      ): Promise<{ ok: boolean; message: string; tenantDisplayName: string | null }> {
+      test(id: number): Promise<EntraTestResponse> {
         return apiFetch(`/directories/${id}/entra/test`, { method: 'POST' });
       },
       /**
@@ -763,6 +1111,12 @@ export const api = {
     },
     update(body: Record<string, unknown>): Promise<{ ok: boolean; updated: string[] }> {
       return apiFetch('/settings', { method: 'PATCH', body: JSON.stringify(body) });
+    },
+    roles(): Promise<RolesResponse> {
+      return apiFetch('/settings/roles');
+    },
+    updateRoles(body: RolesUpdateRequest): Promise<{ ok: boolean }> {
+      return apiFetch('/settings/roles', { method: 'PUT', body: JSON.stringify(body) });
     },
   },
 };

@@ -1,5 +1,7 @@
 <!-- SPDX-License-Identifier: BUSL-1.1 -->
 <script setup lang="ts">
+import type { ListFreshness } from '@openaduc/shared';
+import SyncFreshness from '../design/primitives/SyncFreshness.vue';
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import DataTable from 'primevue/datatable';
@@ -17,6 +19,8 @@ import type { ComputerSummary } from '@openaduc/shared';
 import PageHeader from '../design/primitives/PageHeader.vue';
 import SyncButton from '../design/primitives/SyncButton.vue';
 import EmptyState from '../design/primitives/EmptyState.vue';
+import ListSkeleton from '../design/primitives/ListSkeleton.vue';
+import { useListLoading } from '../design/composables/useListLoading.js';
 import Avatar from '../design/primitives/Avatar.vue';
 import { fmtRelative } from '../design/lib/format.js';
 
@@ -35,9 +39,28 @@ interface FilterEntry<T> {
 }
 
 const rows = ref<CmpRow[]>([]);
+const freshness = ref<ListFreshness | null>(null);
 const loading = ref(false);
 const error = ref<string | null>(null);
 const drawerOpen = ref(false);
+const {
+  skeleton,
+  table: listTable,
+  title: pageTitle,
+  status: listStatus,
+  searchField,
+} = useListLoading<ComputerSummary>({
+  rows,
+  loading,
+  error,
+  total: () => total.value,
+  title: 'Computers',
+  noun: ['computer', 'computers'],
+  open: openDetail,
+  showSearch: () => {
+    drawerOpen.value = true;
+  },
+});
 
 const filters = ref<{
   name: FilterEntry<string>;
@@ -90,6 +113,7 @@ async function load(): Promise<void> {
   error.value = null;
   try {
     const resp = await api.computers.search({ pageSize: 50_000, sort: 'name', sortDir: 'asc' });
+    freshness.value = resp.freshness;
     rows.value = resp.rows.map(decorate);
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Failed to load computers';
@@ -153,8 +177,10 @@ onMounted(load);
 
 <template>
   <div class="page-inner page-fill computers-page">
-    <PageHeader :title="`Computers (${total.toLocaleString()})`">
+    <span class="sr-only" role="status">{{ listStatus }}</span>
+    <PageHeader :title="pageTitle">
       <template #actions>
+        <SyncFreshness :freshness="freshness" />
         <Button
           :label="activeCount > 0 ? `Filter (${activeCount})` : 'Filter'"
           icon="pi pi-filter"
@@ -200,19 +226,20 @@ onMounted(load);
     <DataTable
       v-model:filters="filters"
       :value="rows"
-      :loading="loading"
       data-key="id"
       removable-sort
       sort-field="name"
       :sort-order="1"
       scrollable
       scroll-height="flex"
-      :virtual-scroller-options="{ itemSize: 56 }"
       @row-click="(ev) => openDetail(ev.data as ComputerSummary)"
+      v-bind="listTable"
       class="computers-table"
     >
       <template #empty>
+        <ListSkeleton v-if="skeleton" :columns="['avatar-rounded', 'text', 'badge', 'text']" />
         <EmptyState
+          v-else
           icon="pi pi-desktop"
           :title="activeCount > 0 ? 'No computers match these filters' : 'No computers yet'"
           :message="
@@ -297,6 +324,7 @@ onMounted(load);
         <div class="filter-field">
           <label class="filter-label">Name</label>
           <InputText
+            ref="searchField"
             v-model="filters.name.value"
             placeholder="Hostname, sAM, or FQDN…"
             class="filter-input"
