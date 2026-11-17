@@ -11,7 +11,9 @@ declare module 'fastify' {
 export default fp(async (app) => {
   app.addHook('onRequest', async (req, reply) => {
     const incoming = req.headers['x-correlation-id'];
-    const id = typeof incoming === 'string' && incoming.length > 0 ? incoming : uuid();
+    // Taken from the client only when it looks like an id: it is stored in every audit row.
+    const id =
+      typeof incoming === 'string' && /^[A-Za-z0-9._:-]{1,100}$/.test(incoming) ? incoming : uuid();
     req.correlationId = id;
     reply.header('x-correlation-id', id);
   });

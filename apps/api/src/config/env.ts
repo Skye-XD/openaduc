@@ -36,6 +36,10 @@ const envSchema = z.object({
   API_CORS_ORIGIN: z.string().transform(csv).default('http://localhost:5173'),
 
   SESSION_COOKIE_SECRET: z.string().min(32),
+  // Reverse proxies in front of the API whose X-Forwarded-For entries are believed (Caddy on
+  // the host, nginx in the web container). The client address is the entry beyond them; a
+  // client cannot pick its own address to dodge rate limits or forge the audit trail.
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(10).default(2),
   SESSION_IDLE_TIMEOUT_MINUTES: z.coerce.number().int().min(1).default(60),
   SESSION_ABSOLUTE_TIMEOUT_HOURS: z.coerce.number().int().min(1).default(12),
   STEP_UP_TTL_MINUTES: z.coerce.number().int().min(1).default(60),

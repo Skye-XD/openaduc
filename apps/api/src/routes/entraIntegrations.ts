@@ -43,7 +43,14 @@ const putSchema = z
      * Validated as a URL so a typo doesn't get stored as the trigger.
      */
     teamsWebhookUrl: z
-      .union([z.string().url({ message: 'teamsWebhookUrl must be a valid URL' }), z.literal('')])
+      .union([
+        z
+          .string()
+          .url({ message: 'teamsWebhookUrl must be a valid URL' })
+          // the server posts to it: plain http or an internal address is not a Teams webhook
+          .refine((u) => u.startsWith('https://'), { message: 'teamsWebhookUrl must use https' }),
+        z.literal(''),
+      ])
       .optional(),
   })
   .refine(

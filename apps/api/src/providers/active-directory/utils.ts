@@ -266,6 +266,7 @@ export function escapeDnValue(input: string): string {
   for (let i = 0; i < input.length; i++) {
     const ch = input[i]!;
     if (SPECIAL.has(ch)) out += '\\' + ch;
+    else if (ch === '\0') out += '\\00';
     else out += ch;
   }
   if (out.startsWith('#') || out.startsWith(' ')) out = '\\' + out;

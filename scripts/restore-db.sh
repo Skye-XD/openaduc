@@ -30,8 +30,17 @@ echo "    with the contents of ${SNAP_FILE}."
 read -r -p "Continue? [y/N] " ans
 [[ "${ans}" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
 
-echo "==> stopping api/worker so they release their DB connections..."
-docker compose stop api worker || true
+# A copy of what is there now, first: if the restore fails half-way the database is gone.
+umask 077
+mkdir -p "${REPO_ROOT}/snapshots"
+BEFORE="${REPO_ROOT}/snapshots/pre-restore-$(date +%Y%m%d-%H%M%S).dump"
+echo "==> saving the current database to ${BEFORE}..."
+docker compose exec -T postgres pg_dump -U openaduc -d openaduc -Fc > "${BEFORE}"
+[[ -s "${BEFORE}" ]] || { echo "could not save the current database; nothing was changed" >&2; exit 1; }
+trap 'echo >&2; echo "restore FAILED. The database as it was is in ${BEFORE}:" >&2; echo "  scripts/restore-db.sh $(basename "${BEFORE}" .dump)" >&2' ERR
+
+echo "==> stopping the api so it releases its DB connections..."
+docker compose stop api
 
 echo "==> copying dump into postgres container..."
 docker compose cp "${SNAP_FILE}" postgres:/tmp/restore.dump
@@ -44,8 +53,9 @@ echo "==> restoring..."
 docker compose exec -T postgres pg_restore -U openaduc -d openaduc --no-owner /tmp/restore.dump
 docker compose exec -T postgres rm -f /tmp/restore.dump
 
-echo "==> restarting api/worker..."
-docker compose start api worker || true
+trap - ERR
+echo "==> starting the api..."
+docker compose start api
 
 echo
 echo "restore complete from ${SNAP_FILE}."

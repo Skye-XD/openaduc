@@ -27,13 +27,16 @@ import { registerComputerRoutes } from './routes/computers.js';
 import { registerDeletedComputerRoutes } from './routes/deletedComputers.js';
 import { registerOuRoutes } from './routes/ous.js';
 import { registerPolicyRoutes } from './routes/policies.js';
+import { Crypter } from './lib/encryption.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const env = loadEnv();
+  // A wrong ENCRYPTION_KEY should stop the start, not the first sign-in that needs a secret.
+  new Crypter(env.ENCRYPTION_KEY);
   const app = Fastify({
     logger: buildLoggerOptions(env),
     disableRequestLogging: false,
-    trustProxy: true,
+    trustProxy: env.TRUST_PROXY_HOPS,
     bodyLimit: 1024 * 1024,
   });
 

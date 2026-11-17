@@ -59,6 +59,7 @@ These variables only matter on **first boot before the setup wizard has run**. I
 | `AD_SERVICE_ACCOUNT_PASSWORD` | —       | Password for the service account. Stored encrypted in the DB once seeded.                                                                                   |
 | `AD_TLS_REJECT_UNAUTHORIZED`  | `1`     | Set to `0` only for local dev with self-signed Samba. **Never** set to `0` in production.                                                                   |
 | `AD_TLS_CA_PATH`              | —       | Path inside the API container to a custom CA bundle (PEM) used to validate the LDAPS certificate.                                                           |
+| `TRUST_PROXY_HOPS`            | `2`     | Reverse proxies in front of the API whose `X-Forwarded-For` entries are believed (Caddy on the host and the web container's nginx).                         |
 | `AD_OPERATION_TIMEOUT_MS`     | `15000` | Timeout (in ms) for individual LDAP operations. Increase if your DCs are slow or far away.                                                                  |
 
 ## Authorization bootstrap

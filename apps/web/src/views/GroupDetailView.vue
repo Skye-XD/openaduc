@@ -55,20 +55,34 @@ const busyMemberId = ref<string | null>(null);
 const canManage = computed(() => auth.hasCapability('write:group.membership'));
 const memberCount = computed(() => group.value?.members.length ?? 0);
 
+// As on the user page: every action targets `group.value`, so a record from the previous URL
+// or a late response for it must never stay live under the next one.
+let loadSeq = 0;
+let shownFor: string | null = null;
+
 async function load(): Promise<void> {
+  const seq = ++loadSeq;
+  const wanted = props.id;
+  if (shownFor !== wanted) {
+    group.value = null;
+    shownFor = null;
+  }
   loading.value = true;
   error.value = null;
   try {
-    const r = await api.groups.get(props.id);
+    const r = await api.groups.get(wanted);
+    if (seq !== loadSeq) return;
     group.value = r.group;
+    shownFor = wanted;
   } catch (err) {
+    if (seq !== loadSeq) return;
     if (err instanceof ApiError && err.status === 404) {
       error.value = 'Group not found';
     } else {
       error.value = err instanceof Error ? err.message : 'Failed to load group';
     }
   } finally {
-    loading.value = false;
+    if (seq === loadSeq) loading.value = false;
   }
 }
 
@@ -77,7 +91,7 @@ async function refreshFromAd(): Promise<void> {
   refreshing.value = true;
   try {
     await load();
-    toast.add({ severity: 'success', summary: 'Refreshed', life: 2000 });
+    if (!error.value) toast.add({ severity: 'success', summary: 'Refreshed', life: 2000 });
   } finally {
     refreshing.value = false;
   }
@@ -153,6 +167,12 @@ async function confirmAdd(): Promise<void> {
   } finally {
     writeRunning.value = false;
   }
+}
+
+function confirmRemove(member: GroupMember): void {
+  const who = member.displayName || member.samAccountName;
+  if (!window.confirm(`Remove ${who} from ${group.value?.name ?? 'this group'}?`)) return;
+  auth.requireEdit(() => startRemove(member));
 }
 
 async function startRemove(member: GroupMember): Promise<void> {
@@ -410,7 +430,7 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
                 size="small"
                 text
                 :loading="busyMemberId === (data as GroupMember).id"
-                @click.stop="auth.requireEdit(() => startRemove(data as GroupMember))"
+                @click.stop="confirmRemove(data as GroupMember)"
               />
             </template>
           </Column>

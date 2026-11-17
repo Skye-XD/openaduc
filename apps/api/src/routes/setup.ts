@@ -135,7 +135,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // which step is done, what the operator already typed (no secrets), and
   // whether the whole flow has finished. The router consults this to
   // decide whether to keep forcing the operator into /setup.
-  app.get('/api/setup/status', async () => {
+  app.get('/api/setup/status', async (req) => {
     const directories = await app.services.directoryConfig.listAll();
     const firstConfigured = directories.find((d) => d.configured) ?? null;
     const onboardingCompletedAt = await readOnboardingCompletedAt();
@@ -145,18 +145,21 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
         ? !!firstConfigured.syncBindUpn && firstConfigured.hasSyncBindPassword
         : false,
       onboardingCompletedAt,
-      existingDirectory: firstConfigured
-        ? {
-            id: firstConfigured.id,
-            name: firstConfigured.name,
-            domain: firstConfigured.domain,
-            baseDn: firstConfigured.baseDn,
-            ldapUrls: firstConfigured.ldapUrls,
-            tlsMode: firstConfigured.tlsMode,
-            tlsRejectUnauthorized: firstConfigured.tlsRejectUnauthorized,
-            syncBindUpn: firstConfigured.syncBindUpn,
-          }
-        : null,
+      // What was typed in step 1 (base DN, DC addresses, service account) is for the wizard
+      // resuming in a signed-in browser: it is not handed to anyone who asks.
+      existingDirectory:
+        firstConfigured && req.actor && !onboardingCompletedAt
+          ? {
+              id: firstConfigured.id,
+              name: firstConfigured.name,
+              domain: firstConfigured.domain,
+              baseDn: firstConfigured.baseDn,
+              ldapUrls: firstConfigured.ldapUrls,
+              tlsMode: firstConfigured.tlsMode,
+              tlsRejectUnauthorized: firstConfigured.tlsRejectUnauthorized,
+              syncBindUpn: firstConfigured.syncBindUpn,
+            }
+          : null,
     };
   });
 
@@ -220,8 +223,9 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
         throw Unauthorized(detail);
       }
 
-      const created = await app.services.directoryConfig.create(toProviderInput(body));
-
+      // Whoever sets the instance up becomes its first administrator, so that has to be someone
+      // the directory already trusts: a member of the configured admin group (Domain Admins
+      // unless one was configured). Any domain account that can bind is not enough.
       const groupDns = auth.groupDns ?? auth.user.memberOfDns;
       let capabilities = await app.services.authorization.resolveCapabilities(groupDns);
       if (capabilities.length === 0) {
@@ -235,9 +239,22 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
         capabilities = await app.services.authorization.resolveCapabilities(groupDns);
       }
       if (capabilities.length === 0) {
-        const { ROLE_CAPABILITIES } = await import('@openaduc/shared');
-        capabilities = [...ROLE_CAPABILITIES.admin];
+        await app.services.audit
+          .recordEvent({
+            ...baseAudit,
+            result: 'denied',
+            errorCode: 'not_an_admin',
+            actorUserId: auth.user.objectGuid,
+            actorDisplayName: auth.user.displayName,
+            metadata: { domain: body.domain, adminUsername: body.adminUsername },
+          })
+          .catch(() => undefined);
+        throw app.httpErrors.forbidden(
+          'this account is not in the directory administrators group; sign in as a Domain Admin to set up OpenADUC',
+        );
       }
+
+      const created = await app.services.directoryConfig.create(toProviderInput(body));
 
       const { session, cookieToken } = await app.services.sessions.createAdminSession({
         directoryId: created.id,
@@ -314,7 +331,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // The same-account warning is computed and returned (non-blocking) —
   // the wizard surfaces it inline so the operator can choose.
   app.post('/api/setup/service-account', {
-    preHandler: app.requireAuth,
+    preHandler: app.requireCapability('configure:directory'),
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
     handler: async (req) => {
       await ensureOnboardingActive();
@@ -407,7 +424,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // session — making them step up again to set defaults would be
   // theatre.
   app.post('/api/setup/policy', {
-    preHandler: app.requireAuth,
+    preHandler: app.requireCapability('configure:directory'),
     handler: async (req) => {
       await ensureOnboardingActive();
       const body = policySchema.parse(req.body);
@@ -481,7 +498,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // it — even on failure — so a partial onboarding doesn't leave sync
   // permanently disabled.
   app.post('/api/setup/run-initial-sync', {
-    preHandler: app.requireAuth,
+    preHandler: app.requireCapability('configure:directory'),
     handler: async (req) => {
       await ensureOnboardingActive();
       const directoryId = await firstConfiguredDirectoryId();
@@ -539,7 +556,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // response is `{ job: null }` — the wizard treats that as "needs to
   // start" and will POST run-initial-sync.
   app.get('/api/setup/initial-sync-status', {
-    preHandler: app.requireAuth,
+    preHandler: app.requireCapability('configure:directory'),
     handler: async () => {
       const directoryId = await firstConfiguredDirectoryId();
       if (!directoryId) return { job: null };
@@ -554,7 +571,7 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
   // earlier-succeeded tasks untouched, then resume the sequence from the
   // next pending task.
   app.post('/api/setup/retry-task', {
-    preHandler: app.requireAuth,
+    preHandler: app.requireCapability('configure:directory'),
     handler: async (req) => {
       await ensureOnboardingActive();
       const directoryId = await firstConfiguredDirectoryId();

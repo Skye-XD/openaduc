@@ -50,9 +50,11 @@ const canBulkEdit = computed(() => auth.hasCapability('write:user.attributes'));
 type BulkAction = 'disable' | 'enable' | 'unlock' | 'move' | 'edit';
 const pendingBulkAction = ref<BulkAction | null>(null);
 const bulkRunning = ref(false);
-const bulkProgress = ref<{ done: number; total: number; failures: { id: string; error: string }[] }>(
-  { done: 0, total: 0, failures: [] },
-);
+const bulkProgress = ref<{
+  done: number;
+  total: number;
+  failures: { id: string; error: string }[];
+}>({ done: 0, total: 0, failures: [] });
 const bulkBusyMessage = computed(() =>
   bulkRunning.value ? `${bulkProgress.value.done} of ${bulkProgress.value.total} done` : null,
 );
@@ -114,6 +116,16 @@ function startBulk(action: 'disable' | 'enable' | 'unlock'): void {
         ? async (id: string) => void (await api.users.enable(id))
         : async (id: string) => void (await api.users.unlock(id));
   const verb = action === 'disable' ? 'Disabled' : action === 'enable' ? 'Enabled' : 'Unlocked';
+  // The selection survives filter changes, so it can hold accounts the list no longer shows.
+  const n = props.selectedIds.size;
+  if (
+    !window.confirm(
+      `${action === 'disable' ? 'Disable' : action === 'enable' ? 'Enable' : 'Unlock'} ${n} ` +
+        `${n === 1 ? 'account' : 'accounts'}? The selection may include accounts hidden by the current filter.`,
+    )
+  ) {
+    return;
+  }
   auth.requireEdit(() => execBulk(action, op, verb));
 }
 
@@ -131,7 +143,11 @@ function buildOuTree(
 ): TreeNode[] {
   const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
   for (const o of ous) {
-    byDn.set(o.distinguishedName.toLowerCase(), { key: o.distinguishedName, label: o.name, children: [] });
+    byDn.set(o.distinguishedName.toLowerCase(), {
+      key: o.distinguishedName,
+      label: o.name,
+      children: [],
+    });
   }
   const roots: TreeNode[] = [];
   for (const o of ous) {
@@ -181,7 +197,16 @@ function confirmBulkMove(): void {
 // ---- Edit common attributes ----------------------------------------------
 const bulkEditOpen = ref(false);
 function blankDraft() {
-  return { department: '', title: '', company: '', description: '', l: '', st: '', co: '', postalCode: '' };
+  return {
+    department: '',
+    title: '',
+    company: '',
+    description: '',
+    l: '',
+    st: '',
+    co: '',
+    postalCode: '',
+  };
 }
 const bulkEditDraft = ref(blankDraft());
 
@@ -217,7 +242,9 @@ function confirmBulkEdit(): void {
 
 <template>
   <div v-if="selectedCount > 0" class="ubulk" role="region" aria-label="Bulk actions">
-    <span class="ubulk-count"><strong>{{ selectedCount }}</strong> selected</span>
+    <span class="ubulk-count"
+      ><strong>{{ selectedCount }}</strong> selected</span
+    >
     <div class="ubulk-actions">
       <Button
         v-if="canBulkEdit"
