@@ -523,6 +523,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
           lastLogonAt: dateOrNull(r.last_logon_at),
           modifiedAtSource: dateOrNull(r.modified_at_source),
           hasPhoto: photoGuids.has(r.object_guid),
+          mobile: r.mobile,
         })),
         total: Number(totalRow?.total ?? 0),
         page: q.page,

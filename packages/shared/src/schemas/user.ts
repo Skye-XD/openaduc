@@ -43,6 +43,8 @@ export const userSummarySchema = z.object({
   // fire a 404 photo request when no photos are cached. Always present;
   // false when no Entra integration is configured for the directory.
   hasPhoto: z.boolean(),
+  // Mobile number from AD, shown as a column in the user list.
+  mobile: z.string().nullable(),
 });
 export type UserSummary = z.infer<typeof userSummarySchema>;
 

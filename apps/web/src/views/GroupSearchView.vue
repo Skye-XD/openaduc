@@ -2,6 +2,7 @@
 <script setup lang="ts">
 import type { ListFreshness } from '@openaduc/shared';
 import SyncFreshness from '../design/primitives/SyncFreshness.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import DataTable from 'primevue/datatable';
@@ -209,6 +210,7 @@ onMounted(load);
     <PageHeader :title="pageTitle">
       <template #actions>
         <SyncFreshness :freshness="freshness" />
+        <SyncButton :task-keys="['groups.full']" @done="load" />
         <Button v-if="canCreate" label="New group" icon="pi pi-plus" @click="newGroupOpen = true" />
         <Button
           :label="activeCount > 0 ? `Filter (${activeCount})` : 'Filter'"

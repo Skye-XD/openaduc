@@ -25,6 +25,7 @@ import type { DirectoryOu, GroupCreateResponse, UserCreateResponse } from '@open
 import NewGroupDialog from '../design/feedback/NewGroupDialog.vue';
 import { groupCreatedToast } from '../design/feedback/groupToasts.js';
 import NewUserDialog from '../design/feedback/NewUserDialog.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
 import { announceUserCreated } from '../design/feedback/userToasts.js';
 
 const auth = useAuthStore();
@@ -224,6 +225,12 @@ watch(
 );
 
 watch(selectedDn, (dn) => setRouteOu(dn));
+
+// After a sync of the OUs from AD: reload the tree and the open OU's contents.
+function onSynced(): void {
+  void loadTree();
+  if (selectedDn.value) void loadContents(selectedDn.value);
+}
 
 onMounted(loadTree);
 
@@ -569,7 +576,11 @@ async function onDeleteSubmit(): Promise<void> {
 
 <template>
   <div class="page-inner page-fill ou-browser">
-    <PageHeader title="Directory structure" />
+    <PageHeader title="Directory structure">
+      <template #actions>
+        <SyncButton :task-keys="['ous.full']" @done="onSynced" />
+      </template>
+    </PageHeader>
 
     <div class="ou-grid">
       <!-- Left: OU tree. Right-click anywhere inside the pane is intercepted

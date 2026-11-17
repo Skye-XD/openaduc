@@ -35,6 +35,7 @@ const summary = (id: string, displayName: string): UserSummary => ({
   lastLogonAt: null,
   modifiedAtSource: null,
   hasPhoto: false,
+  mobile: null,
 });
 const candidate = (u: UserSummary): UserMatchCandidate => ({
   id: u.id,

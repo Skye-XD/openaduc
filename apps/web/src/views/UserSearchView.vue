@@ -7,6 +7,10 @@ import { useBulkGroupMembership } from '../design/composables/useBulkGroupMember
 import Dialog from 'primevue/dialog';
 import type { ListFreshness } from '@openaduc/shared';
 import SyncFreshness from '../design/primitives/SyncFreshness.vue';
+import SyncButton from '../design/primitives/SyncButton.vue';
+import Checkbox from 'primevue/checkbox';
+import TreeSelect from 'primevue/treeselect';
+import type { TreeNode } from 'primevue/treenode';
 import { computed, onMounted, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import DataTable from 'primevue/datatable';
@@ -195,6 +199,54 @@ function decorate(u: UserSummary): UserRow {
   };
 }
 
+// ---- OU filter -------------------------------------------------------------
+// The other filters run over the loaded rows; list rows carry no DN, so the OU
+// filter is resolved by the server (?ou=<dn>&includeSubOus) and the list reloads.
+const ouNodes = ref<TreeNode[]>([]);
+const ouNameByDn = ref<Map<string, string>>(new Map());
+const ouTreeSelection = ref<Record<string, boolean>>({});
+const includeSubOus = ref(true);
+const selectedOuDn = computed<string | null>(
+  () => Object.keys(ouTreeSelection.value).find((k) => ouTreeSelection.value[k]) ?? null,
+);
+
+async function loadOus(): Promise<void> {
+  try {
+    const resp = await api.ous.list();
+    const byDn = new Map<string, TreeNode & { children: TreeNode[] }>();
+    const names = new Map<string, string>();
+    for (const o of resp.ous) {
+      byDn.set(o.distinguishedName.toLowerCase(), {
+        key: o.distinguishedName,
+        label: o.name,
+        children: [],
+      });
+      names.set(o.distinguishedName, o.name);
+    }
+    const roots: TreeNode[] = [];
+    for (const o of resp.ous) {
+      const node = byDn.get(o.distinguishedName.toLowerCase())!;
+      const parent = o.parentDn ? byDn.get(o.parentDn.toLowerCase()) : undefined;
+      if (parent) parent.children!.push(node);
+      else roots.push(node);
+    }
+    const sortTree = (nodes: TreeNode[]): void => {
+      nodes.sort((a, b) => (a.label ?? '').localeCompare(b.label ?? ''));
+      for (const n of nodes) if (n.children) sortTree(n.children);
+    };
+    sortTree(roots);
+    ouNodes.value = roots;
+    ouNameByDn.value = names;
+  } catch {
+    // Non-fatal: the OU filter just has no options.
+  }
+}
+
+watch(selectedOuDn, () => void load());
+watch(includeSubOus, () => {
+  if (selectedOuDn.value) void load();
+});
+
 async function load(): Promise<void> {
   loading.value = true;
   error.value = null;
@@ -203,6 +255,7 @@ async function load(): Promise<void> {
       pageSize: 50_000,
       sort: 'displayName',
       sortDir: 'asc',
+      ...(selectedOuDn.value ? { ou: selectedOuDn.value, includeSubOus: includeSubOus.value } : {}),
     });
     rows.value = resp.rows.map(decorate);
     filteredRows.value = rows.value;
@@ -282,7 +335,7 @@ function isActive(value: unknown): boolean {
 }
 
 interface Chip {
-  key: FilterKey;
+  key: FilterKey | 'ou';
   label: string;
 }
 
@@ -324,12 +377,20 @@ const activeChips = computed<Chip[]>(() => {
   if (isActive(f.title.value)) {
     out.push({ key: 'title', label: `Title: "${f.title.value}"` });
   }
+  if (selectedOuDn.value) {
+    const name = ouNameByDn.value.get(selectedOuDn.value) ?? selectedOuDn.value;
+    out.push({ key: 'ou', label: `OU: ${name}${includeSubOus.value ? ' (+sub)' : ''}` });
+  }
   return out;
 });
 
 const activeCount = computed(() => activeChips.value.length);
 
-function clearFilter(key: FilterKey): void {
+function clearFilter(key: FilterKey | 'ou'): void {
+  if (key === 'ou') {
+    ouTreeSelection.value = {};
+    return;
+  }
   filters.value[key].value = null;
 }
 
@@ -337,6 +398,8 @@ function clearAll(): void {
   for (const k of Object.keys(filters.value) as FilterKey[]) {
     filters.value[k].value = null;
   }
+  ouTreeSelection.value = {};
+  includeSubOus.value = true;
 }
 
 // ---- Deep-link / URL sync -------------------------------------------------
@@ -625,6 +688,7 @@ onMounted(() => {
     <PageHeader :title="pageTitle">
       <template #actions>
         <SyncFreshness :freshness="freshness" />
+        <SyncButton :task-keys="['users.full']" @done="load" />
         <Button
           v-if="canCreate"
           label="New user"
@@ -831,6 +895,11 @@ onMounted(() => {
       <Column field="title" header="Title" sortable :style="{ width: '13%' }">
         <template #body="{ data }">
           <span class="cell-muted" :title="data.title ?? undefined">{{ data.title ?? '—' }}</span>
+        </template>
+      </Column>
+      <Column field="mobile" header="Mobile" sortable :style="{ width: '140px' }">
+        <template #body="{ data }">
+          <span class="cell-muted">{{ data.mobile ?? '—' }}</span>
         </template>
       </Column>
       <Column header="Last logon" field="lastLogonAt" sortable :style="{ width: '120px' }">
@@ -1091,6 +1160,24 @@ onMounted(() => {
           <label class="filter-label">Title</label>
           <InputText v-model="filters.title.value" placeholder="Contains…" class="filter-input" />
         </div>
+
+        <div class="filter-field">
+          <label class="filter-label">Organizational unit</label>
+          <TreeSelect
+            v-model="ouTreeSelection"
+            :options="ouNodes"
+            selection-mode="single"
+            placeholder="Any OU"
+            class="filter-input"
+            fluid
+            filter
+            @show="ouNodes.length === 0 && loadOus()"
+          />
+          <label class="filter-check">
+            <Checkbox v-model="includeSubOus" binary :disabled="!selectedOuDn" />
+            Include sub-OUs
+          </label>
+        </div>
       </div>
 
       <template #footer>
@@ -1338,6 +1425,16 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.filter-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-3);
+  cursor: pointer;
 }
 
 .filter-label {
