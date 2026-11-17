@@ -18,6 +18,7 @@ import { z } from 'zod';
 import { NotFound, Unauthorized } from '../plugins/errorHandler.js';
 import type { DirectoryProvider } from '../providers/types.js';
 import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
+import { visibleRawAttributes } from '../lib/rawAttributes.js';
 
 const idParamSchema = z.object({ id: z.string().uuid() });
 
@@ -28,7 +29,10 @@ const idParamSchema = z.object({ id: z.string().uuid() });
 // empty.
 function csvCell(value: unknown): string {
   if (value === null || value === undefined) return '';
-  const s = value instanceof Date ? value.toISOString() : String(value);
+  let s = value instanceof Date ? value.toISOString() : String(value);
+  // A value from the directory that starts like a formula would run in the spreadsheet
+  // that opens the export; a leading apostrophe makes it text.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
@@ -713,7 +717,10 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
                     : null,
               }
             : null,
-        rawAttributes: refreshed.user.rawAttributes,
+        rawAttributes: visibleRawAttributes(
+          refreshed.user.rawAttributes,
+          req.actor?.session.capabilities,
+        ),
       };
 
       // Account view audit (configurable). Deduped per session+target on a

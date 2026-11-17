@@ -470,7 +470,19 @@ function onSignInSelect(id: string): void {
   signInDialogOpen.value = true;
 }
 
+// Which user the page holds, and which load is the latest. Every action on this page targets
+// `user.value`: a record left over from the previous URL, or a slow response for it arriving
+// after the next one, would send a reset or a disable to the wrong person.
+let loadSeq = 0;
+let shownFor: string | null = null;
+
 async function load(): Promise<void> {
+  const seq = ++loadSeq;
+  const wanted = props.id;
+  if (shownFor !== wanted) {
+    user.value = null;
+    shownFor = null;
+  }
   loading.value = true;
   error.value = null;
   // Stale activity cache from a previous user — clear so the Overview card
@@ -478,17 +490,20 @@ async function load(): Promise<void> {
   activityLoaded.value = false;
   activityEvents.value = [];
   try {
-    const resp = await api.users.get(props.id);
+    const resp = await api.users.get(wanted);
+    if (seq !== loadSeq) return; // a newer load has started: this answer is for another page
     user.value = resp.user;
+    shownFor = wanted;
     resetForm();
   } catch (err) {
+    if (seq !== loadSeq) return;
     if (err instanceof ApiError && err.status === 404) {
       error.value = 'User not found';
     } else {
       error.value = err instanceof Error ? err.message : 'Failed to load user';
     }
   } finally {
-    loading.value = false;
+    if (seq === loadSeq) loading.value = false;
   }
 }
 
@@ -498,7 +513,9 @@ async function refreshFromAd(): Promise<void> {
   refreshing.value = true;
   try {
     await load();
-    toast.add({ severity: 'success', summary: 'Refreshed from directory', life: 2500 });
+    if (!error.value) {
+      toast.add({ severity: 'success', summary: 'Refreshed from directory', life: 2500 });
+    }
   } finally {
     refreshing.value = false;
   }
@@ -1019,7 +1036,9 @@ function openPwdExpiryDialog(): void {
   pwdExpiryOpen.value = true;
 }
 
-const pwdNeverDirty = computed(() => pwdNever.value !== (user.value?.passwordNeverExpires ?? false));
+const pwdNeverDirty = computed(
+  () => pwdNever.value !== (user.value?.passwordNeverExpires ?? false),
+);
 
 async function savePwdNeverExpires(): Promise<void> {
   if (!user.value || !pwdNeverDirty.value) return;
@@ -2283,8 +2302,9 @@ async function copy(kind: 'email' | 'dn'): Promise<void> {
           <span class="save-bar-summary">
             <i class="pi pi-pencil" />
             <template v-if="isDirty">
-              Editing · <strong>{{ dirtyFields.length }}</strong>
-              unsaved change{{ dirtyFields.length === 1 ? '' : 's' }}
+              Editing · <strong>{{ dirtyFields.length }}</strong> unsaved change{{
+                dirtyFields.length === 1 ? '' : 's'
+              }}
             </template>
             <template v-else>Editing · no changes yet</template>
           </span>

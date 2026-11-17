@@ -261,7 +261,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // pass/fail message so the operator finds out about a typo at the
   // moment of typing instead of after waiting for the next scheduled run.
   app.post('/api/directories/:id/test-sync-bind', {
-    preHandler: app.requireCapability('configure:directory'),
+    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
@@ -542,7 +542,7 @@ export async function registerDirectoryRoutes(app: FastifyInstance): Promise<voi
   // resetting every stuck task for the directory. Removed in a future
   // release once the UI fully migrates.
   app.post('/api/directories/:id/sync/reset', {
-    preHandler: app.requireCapability('configure:directory'),
+    preHandler: [app.requireCapability('configure:directory'), app.requireStepUp],
     handler: async (req) => {
       const { id } = idParamSchema.parse(req.params);
       const directory = await app.services.directoryConfig.getById(id);

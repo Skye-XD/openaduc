@@ -104,13 +104,15 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
             },
           })
           .catch((err) => req.log.error({ err }, 'audit insert failed for auth.login failure'));
+        // The caller is not signed in: the reason (no such user, wrong password, disabled,
+        // locked, expired) and the directory's own error text stay in the audit row above.
+        // Telling them apart here would let anyone enumerate accounts and probe the network.
         if (result.reason === 'directory_error') {
-          throw app.httpErrors.badGateway(result.errorMessage ?? 'directory unreachable');
+          throw app.httpErrors.badGateway('directory unreachable');
         }
-        if (result.reason === 'account_disabled' || result.reason === 'account_locked') {
-          throw Unauthorized(result.errorMessage ?? 'account is not allowed to sign in');
-        }
-        throw Unauthorized(result.errorMessage ?? 'invalid username or password');
+        throw Unauthorized(
+          'sign-in failed: check the username and password, or ask an administrator',
+        );
       }
 
       // Auth succeeded — clear any backoff state for this (ip, username).
@@ -285,7 +287,31 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       // Step-up succeeded — clear backoff state.
       app.services.loginBackoff.recordSuccess(req.ip ?? null, username);
 
-      const writes = actor.session.capabilities.filter((c): c is Capability =>
+      // The step-up bind just read the operator's groups: take the rights from it, not from the
+      // snapshot made at login. Someone removed from a role since then stops having it here.
+      // (A provider that reports no groups on this bind leaves the snapshot as it is.)
+      const groupDns = result.groupDns ?? result.user?.memberOfDns;
+      const capabilities = groupDns
+        ? await app.services.authorization.resolveCapabilities(groupDns)
+        : actor.session.capabilities;
+      if (capabilities.length === 0) {
+        const { revokedElevatedIds: gone } = await app.services.sessions.revokeAdminSession(
+          actor.session.id,
+        );
+        app.services.credentialCache.deleteMany(gone);
+        await app.services.audit
+          .recordEvent({
+            ...baseAudit,
+            action: 'auth.stepup',
+            result: 'denied',
+            errorCode: 'no_capabilities',
+          })
+          .catch((err) => req.log.error({ err }, 'audit insert failed for auth.stepup deny'));
+        reply.clearCookie(SESSION_COOKIE_NAME, cookieOptions());
+        throw Unauthorized('account is no longer authorized to use this application');
+      }
+
+      const writes = capabilities.filter((c): c is Capability =>
         WRITE_CAPABILITIES.includes(c as Capability),
       );
 
@@ -302,9 +328,11 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
           actorUsername: actor.session.actorUsername,
           actorEmail: actor.session.actorEmail,
           actorDn: actor.session.actorDn,
-          capabilities: actor.session.capabilities,
+          capabilities,
           sourceIp: req.ip,
           userAgent: req.headers['user-agent'] ?? null,
+          // rotation must not extend the absolute lifetime set at login
+          expiresAt: actor.session.expiresAt,
         },
         elevatedCapabilities: writes,
       });

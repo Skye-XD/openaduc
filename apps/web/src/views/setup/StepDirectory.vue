@@ -45,10 +45,11 @@ const form = reactive({
   baseDnTouched: !!initial,
   useTls: inferred.useTls,
   port: inferred.port,
-  // Default OFF: most first-time setups happen against lab DCs with
-  // self-signed certs. Operators can flip it back on once their CA
-  // chain is trusted.
-  rejectUntrusted: initial?.tlsRejectUnauthorized ?? false,
+  // Default ON: with verification off anyone between this server and the DC can
+  // impersonate it and read every password that is typed here. A lab with a
+  // self-signed DC certificate turns it off knowingly, or supplies its CA
+  // (AD_TLS_CA_PATH).
+  rejectUntrusted: initial?.tlsRejectUnauthorized ?? true,
   dcs: initial ? dcsFromUrls(initial.ldapUrls) : ([{ host: '' }] as DcEntry[]),
 });
 

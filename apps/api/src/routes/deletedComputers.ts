@@ -26,6 +26,7 @@ import {
 } from '@openaduc/shared';
 import { StepUpBindFailedError, type WriteContext } from '../providers/types.js';
 import { NotFound, StepUpRequired, Unauthorized } from '../plugins/errorHandler.js';
+import { visibleRawAttributes } from '../lib/rawAttributes.js';
 
 const guidParamSchema = z.object({ guid: z.string().uuid() });
 
@@ -128,7 +129,10 @@ export async function registerDeletedComputerRoutes(app: FastifyInstance): Promi
         lastKnownParent: computer.lastKnownParent,
         deletedAt: computer.deletedAt ? computer.deletedAt.toISOString() : null,
         recycled: computer.recycled,
-        rawAttributes: computer.rawAttributes,
+        rawAttributes: visibleRawAttributes(
+          computer.rawAttributes,
+          req.actor?.session.capabilities,
+        ),
       };
       return { computer: deletedComputerDetailSchema.parse(detail) };
     },

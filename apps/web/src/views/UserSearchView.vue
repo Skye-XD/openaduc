@@ -194,9 +194,7 @@ async function load(): Promise<void> {
       pageSize: 50_000,
       sort: 'displayName',
       sortDir: 'asc',
-      ...(selectedOuDn.value
-        ? { ou: selectedOuDn.value, includeSubOus: includeSubOus.value }
-        : {}),
+      ...(selectedOuDn.value ? { ou: selectedOuDn.value, includeSubOus: includeSubOus.value } : {}),
     });
     rows.value = resp.rows.map(decorate);
     filteredRows.value = rows.value;
@@ -257,8 +255,7 @@ async function submitNewUser(): Promise<void> {
     return;
   }
   if (!newUserSamValid.value) {
-    newUserError.value =
-      'Logon name is required, ≤20 chars, no spaces or reserved characters.';
+    newUserError.value = 'Logon name is required, ≤20 chars, no spaces or reserved characters.';
     return;
   }
   newUserError.value = null;
@@ -490,7 +487,10 @@ watch(
 // path; with all rows already in memory there's no reason to re-query.
 function csvEscape(v: unknown): string {
   if (v == null) return '';
-  const s = String(v);
+  let s = String(v);
+  // A value from the directory that starts like a formula would run in the spreadsheet
+  // that opens the export; a leading apostrophe makes it text.
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
@@ -779,8 +779,8 @@ onMounted(() => {
       @update:visible="(v) => !v && (newUserOpen = false)"
     >
       <p style="font-size: 13px; color: var(--text-3); margin: 0 0 14px">
-        The account is created <strong>disabled with no password</strong>. Set a password and
-        enable it afterwards from the user's page.
+        The account is created <strong>disabled with no password</strong>. Set a password and enable
+        it afterwards from the user's page.
       </p>
       <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px">
         <div style="display: flex; flex-direction: column; gap: 4px; grid-column: 1 / -1">
@@ -811,7 +811,9 @@ onMounted(() => {
           />
         </div>
         <div style="display: flex; flex-direction: column; gap: 4px">
-          <span style="font-size: 12px; color: var(--text-3)">User logon name (sAMAccountName)</span>
+          <span style="font-size: 12px; color: var(--text-3)"
+            >User logon name (sAMAccountName)</span
+          >
           <InputText v-model="newUserDraft.samAccountName" fluid />
         </div>
         <div style="display: flex; flex-direction: column; gap: 4px">

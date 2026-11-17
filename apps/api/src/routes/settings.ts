@@ -97,7 +97,8 @@ export async function registerSettingsRoutes(app: FastifyInstance): Promise<void
   // ALLOWED_SETTINGS or the whole patch is rejected. Capability gated and
   // audited per key.
   app.patch('/api/settings', {
-    preHandler: app.requireCapability('configure:security'),
+    // session lifetimes and audit switches: changing them needs a fresh password, like any write
+    preHandler: [app.requireCapability('configure:security'), app.requireStepUp],
     handler: async (req) => {
       const body = patchBodySchema.parse(req.body);
       const updates = Object.entries(body);

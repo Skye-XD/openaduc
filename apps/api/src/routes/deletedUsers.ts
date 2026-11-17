@@ -36,6 +36,7 @@ import {
 import { StepUpBindFailedError, type WriteContext } from '../providers/types.js';
 import { NotFound, StepUpRequired, Unauthorized } from '../plugins/errorHandler.js';
 import { auditContextFromRequest, withAudit } from '../services/auditContext.js';
+import { visibleRawAttributes } from '../lib/rawAttributes.js';
 
 const guidParamSchema = z.object({ guid: z.string().uuid() });
 
@@ -156,7 +157,7 @@ export async function registerDeletedUserRoutes(app: FastifyInstance): Promise<v
         lastKnownParent: user.lastKnownParent,
         deletedAt: user.deletedAt ? user.deletedAt.toISOString() : null,
         recycled: user.recycled,
-        rawAttributes: user.rawAttributes,
+        rawAttributes: visibleRawAttributes(user.rawAttributes, req.actor?.session.capabilities),
       };
       return { user: deletedUserDetailSchema.parse(detail) };
     },

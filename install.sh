@@ -249,7 +249,10 @@ fetch_source() {
     cp "$INSTALL_DIR/.env" "$tmpdir/.env.preserved"
   fi
   # Replace contents (but keep the directory itself, in case it's a mount point).
-  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' -exec rm -rf {} +
+  # Kept besides .env: database snapshots, the .env backups, and what the operator added for
+  # this server (a compose override, certificates).
+  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name '.env' ! -name '.env.bak.*' ! -name 'snapshots' \
+    ! -name 'docker-compose.override.yml' ! -name 'certs' -exec rm -rf {} +
   cp -a "$extracted"/. "$INSTALL_DIR"/
   ok "extracted to $INSTALL_DIR"
 }

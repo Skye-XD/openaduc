@@ -46,6 +46,11 @@ export interface CreateSessionInput {
   capabilities: string[];
   sourceIp: string | null;
   userAgent: string | null;
+  /**
+   * Absolute expiry to carry over when a session is rotated (step-up). Without it the
+   * rotation would start a fresh absolute window and the cap could be extended forever.
+   */
+  expiresAt?: Date;
 }
 
 export interface CreatedSession {
@@ -67,7 +72,7 @@ export class SessionsService {
   async createAdminSession(input: CreateSessionInput): Promise<CreatedSession> {
     const absoluteHours = await this.settings.get<number>('session.absolute_timeout_hours', 12);
     const now = new Date();
-    const expiresAt = new Date(now.getTime() + absoluteHours * 60 * 60 * 1000);
+    const expiresAt = input.expiresAt ?? new Date(now.getTime() + absoluteHours * 60 * 60 * 1000);
     const cookieToken = generateToken();
     const tokenHash = hashToken(cookieToken);
 

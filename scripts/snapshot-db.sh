@@ -13,7 +13,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SNAP_DIR="${REPO_ROOT}/snapshots"
 SNAP_FILE="${SNAP_DIR}/${NAME}.dump"
 
+# The dump holds sessions, the audit trail, the directory cache and the encrypted bind secret.
+umask 077
 mkdir -p "${SNAP_DIR}"
+chmod 700 "${SNAP_DIR}"
 
 if [[ -f "${SNAP_FILE}" ]]; then
   read -r -p "snapshots/${NAME}.dump exists. Overwrite? [y/N] " ans
